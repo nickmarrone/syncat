@@ -120,7 +120,7 @@ func reconcileOne(relpath string, l protocol.FileInfo, hasLocal bool, r protocol
 				Reason: "remote-only tombstone"}
 		}
 		return Action{Kind: ActionPull, RelPath: relpath, Resolved: r, Source: SourceRemote,
-			Reason: "remote-only file"}
+			SourceVersion: r.Version, Reason: "remote-only file"}
 	}
 
 	switch {
@@ -133,7 +133,7 @@ func reconcileOne(relpath string, l protocol.FileInfo, hasLocal bool, r protocol
 				Reason: "remote dominates: delete"}
 		}
 		return Action{Kind: ActionPull, RelPath: relpath, Resolved: r, Source: SourceRemote,
-			Reason: "remote dominates"}
+			SourceVersion: r.Version, Reason: "remote dominates"}
 
 	case Dominates(l.Version, r.Version):
 		if dir.OutboundBlocked {
@@ -163,7 +163,7 @@ func reconcileConcurrent(relpath string, l, r protocol.FileInfo, nodeID string, 
 	// misdeed — that falls through to the normal handling below.)
 	if dir.OutboundBlocked && !l.Deleted {
 		return Action{Kind: ActionLocallyModified, RelPath: relpath, Resolved: r, Source: SourceRemote,
-			LocallyModified: true, Reason: "concurrent local change under receive-only subscription"}
+			SourceVersion: r.Version, LocallyModified: true, Reason: "concurrent local change under receive-only subscription"}
 	}
 
 	merged := Bump(Merge(l.Version, r.Version), nodeID)
@@ -175,10 +175,17 @@ func reconcileConcurrent(relpath string, l, r protocol.FileInfo, nodeID string, 
 		if !l.Deleted {
 			winner, source = l, SourceLocal
 		}
+		// Capture the winner's real, as-advertised version before
+		// overwriting Resolved.Version with the merged+bumped value below
+		// — SourceVersion (used only when source == SourceRemote) must stay
+		// the version the peer actually has, or the FileRequest this
+		// resurrect issues can never match on the peer's side. See
+		// SourceVersion's doc comment in action.go.
+		sourceVersion := winner.Version
 		winner.Version = merged
 		winner.RelPath = relpath
 		return Action{Kind: ActionResurrect, RelPath: relpath, Resolved: winner, Source: source,
-			Reason: "delete-vs-modify: modify wins"}
+			SourceVersion: sourceVersion, Reason: "delete-vs-modify: modify wins"}
 	}
 
 	if l.Deleted { // && r.Deleted, by the check above
@@ -193,6 +200,47 @@ func reconcileConcurrent(relpath string, l, r protocol.FileInfo, nodeID string, 
 			Reason: "tombstone vs tombstone, concurrent: merge versions"}
 	}
 
+	// Same bytes on both sides: this concurrency isn't a real divergence to
+	// preserve, only version-vector bookkeeping that hasn't caught up yet —
+	// overwhelmingly because both peers just independently resolved this
+	// very conflict on their own (each bumping its own counter per
+	// SPEC.md §5's "element-wise max + local bump"), which leaves their two
+	// results *mutually concurrent with each other* even though the bytes
+	// they each landed on are identical (see conflictWinnerIsRemote's doc
+	// comment on the same equal-content case for the tie-break itself).
+	//
+	// Two things make it essential to short-circuit here rather than fall
+	// through to the generic conflict-copy handling below:
+	//
+	//  1. Correctness: a conflict copy of content that's identical to the
+	//     winner is a no-op at best. At worst it's actively destructive —
+	//     ConflictRelPath is a deterministic function of (relpath, nodeID,
+	//     second), so a second pass through this branch within the same
+	//     second computes the *same* path as this node's own earlier,
+	//     genuinely-different conflict copy and silently overwrites it,
+	//     destroying the very losing content that copy existed to
+	//     preserve.
+	//  2. Liveness: without this, each side keeps re-bumping its own
+	//     counter every time it reconciles the other's already-resolved
+	//     result, which (unlike the merged+bump growing past the *other*
+	//     side's last-known value and settling into a normal dominates
+	//     relationship) has no guarantee of ever converging — under
+	//     symmetric timing both sides can keep leapfrogging each other's
+	//     bump indefinitely. Folding the vectors with a plain Merge (no
+	//     extra local Bump) instead is deterministic and commutative: both
+	//     sides compute the exact same union regardless of processing
+	//     order, so they land on one *equal* vector after this single
+	//     round and the whole thing stops for good, rather than each side
+	//     manufacturing a fresh "local modification" out of applying no
+	//     actual local modification at all.
+	if bytes.Equal(l.SHA256, r.SHA256) {
+		resolved := l
+		resolved.Version = Merge(l.Version, r.Version)
+		resolved.RelPath = relpath
+		return Action{Kind: ActionPull, RelPath: relpath, Resolved: resolved, Source: SourceNone,
+			Reason: "concurrent but content identical: reconcile version only, no conflict copy"}
+	}
+
 	// Genuine content conflict: both sides have live, differing content.
 	// Winner keeps relpath; loser is written beside it as a new file.
 	winner, loser := l, r
@@ -201,6 +249,11 @@ func reconcileConcurrent(relpath string, l, r protocol.FileInfo, nodeID string, 
 		winner, loser = r, l
 		winnerSource, loserSource = SourceRemote, SourceLocal
 	}
+	// Same reasoning as reconcileConcurrent's delete-vs-modify branch above:
+	// capture the winner's real version before it's overwritten with the
+	// merged+bumped value, so a SourceRemote winner's FileRequest still asks
+	// for what the peer actually has.
+	winnerSourceVersion := winner.Version
 	winner.Version = merged
 	winner.RelPath = relpath
 
@@ -212,6 +265,7 @@ func reconcileConcurrent(relpath string, l, r protocol.FileInfo, nodeID string, 
 		RelPath:         relpath,
 		Resolved:        winner,
 		Source:          winnerSource,
+		SourceVersion:   winnerSourceVersion,
 		ConflictRelPath: conflictPath,
 		ConflictInfo:    loser,
 		ConflictSource:  loserSource,

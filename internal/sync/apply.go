@@ -32,7 +32,7 @@ func (s *Session) applyAction(ctx context.Context, cfg ShareConfig, a Action) ([
 
 	case ActionPull:
 		if a.Source == SourceRemote {
-			if err := s.pullAndInstall(ctx, cfg.ShareID, cfg.Root, a.RelPath, a.RelPath, a.Resolved); err != nil {
+			if err := s.pullAndInstall(ctx, cfg.ShareID, cfg.Root, a.RelPath, a.RelPath, a.Resolved, a.SourceVersion); err != nil {
 				return nil, err
 			}
 		}
@@ -40,7 +40,7 @@ func (s *Session) applyAction(ctx context.Context, cfg ShareConfig, a Action) ([
 
 	case ActionResurrect:
 		if a.Source == SourceRemote {
-			if err := s.pullAndInstall(ctx, cfg.ShareID, cfg.Root, a.RelPath, a.RelPath, a.Resolved); err != nil {
+			if err := s.pullAndInstall(ctx, cfg.ShareID, cfg.Root, a.RelPath, a.RelPath, a.Resolved, a.SourceVersion); err != nil {
 				return nil, err
 			}
 		}
@@ -109,7 +109,7 @@ func (s *Session) applyLocallyModified(ctx context.Context, cfg ShareConfig, a A
 	}
 
 	s.logf("locally modified under receive-only subscription, reverting via trash: %s/%s (%s)", cfg.ShareID, a.RelPath, a.Reason)
-	if err := s.pullAndInstall(ctx, cfg.ShareID, cfg.Root, a.RelPath, a.RelPath, a.Resolved); err != nil {
+	if err := s.pullAndInstall(ctx, cfg.ShareID, cfg.Root, a.RelPath, a.RelPath, a.Resolved, a.SourceVersion); err != nil {
 		return nil, fmt.Errorf("sync: revert locally modified %s: %w", a.RelPath, err)
 	}
 	w.Reverted = true
@@ -202,8 +202,12 @@ func (s *Session) applyConflictCopy(ctx context.Context, cfg ShareConfig, a Acti
 		// Pull the loser: it's addressed on the wire by the *original*
 		// relpath, since that's still how the peer's own index refers to
 		// it (the peer hasn't renamed anything; only our local view is
-		// gaining a new conflict-copy path).
-		if err := s.pullAndInstall(ctx, cfg.ShareID, cfg.Root, a.RelPath, a.ConflictRelPath, a.ConflictInfo); err != nil {
+		// gaining a new conflict-copy path). a.ConflictInfo.Version is used
+		// verbatim as the wire version — unlike a.Resolved, ConflictInfo is
+		// never rewritten with a merged/bumped version (see its doc
+		// comment in action.go), so it's already exactly what the peer
+		// advertised.
+		if err := s.pullAndInstall(ctx, cfg.ShareID, cfg.Root, a.RelPath, a.ConflictRelPath, a.ConflictInfo, a.ConflictInfo.Version); err != nil {
 			return []index.FileRow{winnerRow}, fmt.Errorf("sync: conflict copy %s: pull loser: %w", a.RelPath, err)
 		}
 
@@ -238,7 +242,7 @@ func (s *Session) applyConflictCopy(ctx context.Context, cfg ShareConfig, a Acti
 		loserInfo.RelPath = a.ConflictRelPath
 		loserRow := index.FileRowFromInfo(cfg.ShareID, loserInfo, now)
 
-		if err := s.pullAndInstall(ctx, cfg.ShareID, cfg.Root, a.RelPath, a.RelPath, a.Resolved); err != nil {
+		if err := s.pullAndInstall(ctx, cfg.ShareID, cfg.Root, a.RelPath, a.RelPath, a.Resolved, a.SourceVersion); err != nil {
 			return []index.FileRow{loserRow}, fmt.Errorf("sync: conflict copy %s: pull winner: %w", a.RelPath, err)
 		}
 
@@ -265,9 +269,19 @@ func (s *Session) applyConflictCopy(ctx context.Context, cfg ShareConfig, a Acti
 //  3. fsync the temp file and set its mtime/mode;
 //  4. rename(2) into place.
 //
-// The temp file is removed on every error path, including a panic, via a
-// single deferred cleanup keyed off a "committed" flag.
-func (s *Session) pullAndInstall(ctx context.Context, shareID, root, wireRelPath, destRelPath string, info protocol.FileInfo) error {
+// wireVersion is the version named in the FileRequest — deliberately a
+// separate parameter from info.Version, because they can legitimately
+// differ: info carries the version this content will be persisted under
+// locally (for a conflict resolution, Merge(local, remote) plus a local
+// Bump — see Action.Resolved's doc comment), while wireVersion must be the
+// version the peer actually advertised, or the peer's own freshness check
+// (handleFileRequest's Equal(row.Version, req.Version) in transfer.go) can
+// never match. Every caller passes the right one via Action.SourceVersion
+// (or, for a conflict copy's loser, ConflictInfo.Version, which is never
+// rewritten in the first place). The temp file is removed on every error
+// path, including a panic, via a single deferred cleanup keyed off a
+// "committed" flag.
+func (s *Session) pullAndInstall(ctx context.Context, shareID, root, wireRelPath, destRelPath string, info protocol.FileInfo, wireVersion protocol.VersionVector) error {
 	destAbs, err := JoinSharePath(root, destRelPath)
 	if err != nil {
 		return fmt.Errorf("sync: install %s: %w", destRelPath, err)
@@ -300,7 +314,7 @@ func (s *Session) pullAndInstall(ctx context.Context, shareID, root, wireRelPath
 	}()
 
 	hasher := sha256.New()
-	n, err := s.pullFile(ctx, shareID, wireRelPath, info.Version, io.MultiWriter(tmp, hasher))
+	n, err := s.pullFile(ctx, shareID, wireRelPath, wireVersion, io.MultiWriter(tmp, hasher))
 	if err != nil {
 		return fmt.Errorf("sync: install %s: %w", destRelPath, err)
 	}

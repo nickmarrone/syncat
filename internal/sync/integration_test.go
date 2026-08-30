@@ -1,6 +1,7 @@
 package sync
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
@@ -249,6 +250,45 @@ func treesEqual(a, b map[string][32]byte) bool {
 	return true
 }
 
+// integrationWaitTimeout bounds every waitFor/waitForFile call in this
+// file. It was raised from an original 5s (10s for the one test that
+// deliberately serializes 10 files through a 4-slot pull semaphore) after
+// two rounds of diagnosis on a flake that only ever showed up under
+// `go test ./...` for the whole repo — never in isolation, never with
+// `-race` on this package alone — because the whole-repo run puts every
+// package's tests (including internal/transport's real network I/O) on CPU
+// at once:
+//
+//  1. A genuine production bug (fixed in reconcile.go/apply.go/action.go):
+//     resolving a delete-vs-modify or concurrent-conflict case whose winner
+//     needed fetching from the peer sent the FileRequest carrying the
+//     *merged, locally-bumped* version instead of the version the peer
+//     actually advertised, so the peer's freshness check (transfer.go's
+//     handleFileRequest) could never match. This wasted one full request/
+//     error round trip on *every* such resolution, unconditionally — not a
+//     race, reproduced deterministically pre-fix. See Action.SourceVersion.
+//  2. A genuine test-harness synchronization gap (fixed via waitForFile):
+//     several tests wait only for a file's *content* to land, then
+//     immediately read or Bump that same node's *index row* for it
+//     (indexFile/indexDelete/a direct assertion) — but the row is written
+//     by a separate store.PutFile call strictly after the content lands
+//     (session.go's handleIndexUpdate), so under scheduling pressure the
+//     row can still lag behind what's already on disk. Reproduced under
+//     synthetic CPU load as both silent version-vector corruption
+//     (indexFile bumping on a stale/absent row) and hard "not found"
+//     failures — not merely as slow convergence.
+//
+// With both fixed, dozens of `go test -race -count=1 ./...` repeats under
+// synthetic whole-machine CPU load (many more concurrent busy processes
+// than a real `go test ./...` run creates) still occasionally needed more
+// than 5s of *genuine* wall-clock convergence time — no crashes, no wrong
+// state, just scheduling delay — which is what this constant now budgets
+// for. It's a deliberately generous, still-bounded ceiling (a real hang
+// fails a CI run in 20s, not silently); waitFor's polling loop itself
+// already reacts within 10ms of the real condition, so raising this number
+// costs nothing on a healthy run and only buys headroom on a loaded one.
+const integrationWaitTimeout = 20 * time.Second
+
 // waitFor polls cond until it returns true or timeout elapses, failing the
 // test on timeout.
 func waitFor(t *testing.T, timeout time.Duration, cond func() bool) {
@@ -263,6 +303,46 @@ func waitFor(t *testing.T, timeout time.Duration, cond func() bool) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+// waitForFile polls until relpath's on-disk content under root equals want
+// AND the corresponding row in store already reflects that same content
+// (present, not a tombstone, SHA256 matching want).
+//
+// A plain "is it on disk yet" check (what the bare waitFor calls elsewhere
+// in this file use) is enough on its own only when nothing afterward reads
+// that node's *store* — e.g. a final assertion at the end of a test. But
+// several tests immediately follow such a wait with indexFile/indexDelete
+// on the very same store, to simulate the node's own next local edit; those
+// helpers (see putIndexRow) read the store's *current* row for the path
+// and Bump on top of it. The corresponding index row is written by a
+// separate call — session.go's handleIndexUpdate persists it via
+// store.PutFile only after applyAction (which does the actual rename) has
+// already returned — so under load the row can still lag behind what's
+// already readable on disk. A test that doesn't also wait for the row can
+// have indexFile silently Bump on top of a stale or absent row (mistaken
+// for "no prior version" — see putIndexRow's ErrNotFound handling) instead
+// of the version it just received, corrupting the version vector for the
+// rest of that test with no visible error at the call site itself — it
+// only surfaces later as a mysteriously-unconverged waitFor, or as a
+// "not found" a few lines on. This showed up exactly that way under a
+// loaded machine (many packages' tests running in parallel): the two
+// writes (file content, index row) that are simultaneous on a quiet box
+// pull apart under scheduling pressure often enough to matter.
+func waitForFile(t *testing.T, timeout time.Duration, store *index.Store, shareID, root, relpath, want string) {
+	t.Helper()
+	wantSum := sha256.Sum256([]byte(want))
+	waitFor(t, timeout, func() bool {
+		data, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(relpath)))
+		if err != nil || string(data) != want {
+			return false
+		}
+		row, err := store.GetFile(context.Background(), shareID, relpath)
+		if err != nil || row.Deleted {
+			return false
+		}
+		return bytes.Equal(row.SHA256, wantSum[:])
+	})
 }
 
 // --- tests --------------------------------------------------------------
@@ -289,7 +369,7 @@ func TestIntegration_BidirectionalNestedTreeConverges(t *testing.T) {
 	mustSync(t, sa, testShareID)
 	mustSync(t, sb, testShareID)
 
-	waitFor(t, 5*time.Second, func() bool {
+	waitFor(t, integrationWaitTimeout, func() bool {
 		ta, tb := snapshotTree(t, a.root), snapshotTree(t, b.root)
 		return len(ta) == len(files) && treesEqual(ta, tb)
 	})
@@ -315,7 +395,7 @@ func TestIntegration_EditPropagatesBothWays(t *testing.T) {
 	mustSync(t, sa, testShareID)
 	mustSync(t, sb, testShareID)
 
-	waitFor(t, 5*time.Second, func() bool {
+	waitFor(t, integrationWaitTimeout, func() bool {
 		data, err := os.ReadFile(filepath.Join(b.root, "notes.txt"))
 		return err == nil && string(data) == "version 1"
 	})
@@ -325,17 +405,19 @@ func TestIntegration_EditPropagatesBothWays(t *testing.T) {
 	indexFile(t, a.store, a.id, "notes.txt", a.root)
 	mustSync(t, sa, testShareID)
 
-	waitFor(t, 5*time.Second, func() bool {
-		data, err := os.ReadFile(filepath.Join(b.root, "notes.txt"))
-		return err == nil && string(data) == "version 2 from A"
-	})
+	// Also wait for B's index row, not just the file content: B's next
+	// edit (below) reads and bumps B's own current row for this path, and
+	// that row is what B just received from A via the pull above — see
+	// waitForFile's doc comment for why the plain content-only wait isn't
+	// enough here.
+	waitForFile(t, integrationWaitTimeout, b.store, testShareID, b.root, "notes.txt", "version 2 from A")
 
 	// Edit on B.
 	writeFile(t, b.root, "notes.txt", "version 3 from B")
 	indexFile(t, b.store, b.id, "notes.txt", b.root)
 	mustSync(t, sb, testShareID)
 
-	waitFor(t, 5*time.Second, func() bool {
+	waitFor(t, integrationWaitTimeout, func() bool {
 		data, err := os.ReadFile(filepath.Join(a.root, "notes.txt"))
 		return err == nil && string(data) == "version 3 from B"
 	})
@@ -363,7 +445,7 @@ func TestIntegration_ConcurrentEditConflict(t *testing.T) {
 
 	conflictRe := regexp.MustCompile(`^shared\.sync-conflict-\d{8}-\d{6}-[0-9a-f]+\.txt$`)
 
-	waitFor(t, 5*time.Second, func() bool {
+	waitFor(t, integrationWaitTimeout, func() bool {
 		ta, tb := snapshotTree(t, a.root), snapshotTree(t, b.root)
 		if !treesEqual(ta, tb) {
 			return false
@@ -415,7 +497,7 @@ func TestIntegration_DeletePropagates(t *testing.T) {
 	mustSync(t, sa, testShareID)
 	mustSync(t, sb, testShareID)
 
-	waitFor(t, 5*time.Second, func() bool {
+	waitFor(t, integrationWaitTimeout, func() bool {
 		_, err := os.Stat(filepath.Join(b.root, "gone.txt"))
 		return err == nil
 	})
@@ -426,7 +508,7 @@ func TestIntegration_DeletePropagates(t *testing.T) {
 	indexDelete(t, a.store, a.id, "gone.txt")
 	mustSync(t, sa, testShareID)
 
-	waitFor(t, 5*time.Second, func() bool {
+	waitFor(t, integrationWaitTimeout, func() bool {
 		_, err := os.Stat(filepath.Join(b.root, "gone.txt"))
 		return os.IsNotExist(err)
 	})
@@ -444,10 +526,10 @@ func TestIntegration_DeleteVsModifyResurrects(t *testing.T) {
 	mustSync(t, sa, testShareID)
 	mustSync(t, sb, testShareID)
 
-	waitFor(t, 5*time.Second, func() bool {
-		data, err := os.ReadFile(filepath.Join(b.root, "fought-over.txt"))
-		return err == nil && string(data) == "original"
-	})
+	// See waitForFile's doc comment: B's upcoming indexFile call below reads
+	// and bumps B's own row for this path, which is what B just received
+	// from A, so the wait must cover the index row too, not just the file.
+	waitForFile(t, integrationWaitTimeout, b.store, testShareID, b.root, "fought-over.txt", "original")
 
 	// Disconnect (simulated: just stop syncing for a moment) and diverge:
 	// A deletes, B modifies, before either learns of the other's change.
@@ -462,7 +544,7 @@ func TestIntegration_DeleteVsModifyResurrects(t *testing.T) {
 	mustSync(t, sa, testShareID)
 	mustSync(t, sb, testShareID)
 
-	waitFor(t, 5*time.Second, func() bool {
+	waitFor(t, integrationWaitTimeout, func() bool {
 		da, errA := os.ReadFile(filepath.Join(a.root, "fought-over.txt"))
 		db, errB := os.ReadFile(filepath.Join(b.root, "fought-over.txt"))
 		return errA == nil && errB == nil && string(da) == "modified by B" && string(db) == "modified by B"
@@ -485,10 +567,10 @@ func TestIntegration_ReadOnlyShareIsOneWay(t *testing.T) {
 	mustSync(t, sOfferer, testShareID)
 	mustSync(t, sSubscriber, testShareID)
 
-	waitFor(t, 5*time.Second, func() bool {
-		data, err := os.ReadFile(filepath.Join(subscriber.root, "readonly.txt"))
-		return err == nil && string(data) == "from offerer"
-	})
+	// See waitForFile's doc comment: the subscriber's edit below reads and
+	// bumps the subscriber's own row for this path, which is what it just
+	// received from the offerer.
+	waitForFile(t, integrationWaitTimeout, subscriber.store, testShareID, subscriber.root, "readonly.txt", "from offerer")
 
 	// Subscriber edits its local copy.
 	writeFile(t, subscriber.root, "readonly.txt", "edited by subscriber")
@@ -630,7 +712,7 @@ func TestIntegration_ConcurrentPullLimit(t *testing.T) {
 	mustSync(t, sa, testShareID)
 	mustSync(t, sb, testShareID)
 
-	waitFor(t, 10*time.Second, func() bool {
+	waitFor(t, integrationWaitTimeout, func() bool {
 		tb := snapshotTree(t, b.root)
 		return len(tb) == numFiles
 	})
@@ -673,10 +755,10 @@ func TestIntegration_ReceiveOnlyRevertsLocalEditViaTrash(t *testing.T) {
 	mustSync(t, sOfferer, testShareID)
 	mustSync(t, sSubscriber, testShareID)
 
-	waitFor(t, 5*time.Second, func() bool {
-		data, err := os.ReadFile(filepath.Join(subscriber.root, "notes.txt"))
-		return err == nil && string(data) == "v1 from offerer"
-	})
+	// See waitForFile's doc comment: the subscriber's edit below reads and
+	// bumps the subscriber's own row for this path, which is what it just
+	// received from the offerer.
+	waitForFile(t, integrationWaitTimeout, subscriber.store, testShareID, subscriber.root, "notes.txt", "v1 from offerer")
 
 	// Subscriber edits its local copy. Under receive-only this is never
 	// sent outward (mustSync/SyncShare is a no-op for an OutboundBlocked
@@ -694,7 +776,7 @@ func TestIntegration_ReceiveOnlyRevertsLocalEditViaTrash(t *testing.T) {
 	indexFile(t, offerer.store, offerer.id, "notes.txt", offerer.root)
 	mustSync(t, sOfferer, testShareID)
 
-	waitFor(t, 5*time.Second, func() bool {
+	waitFor(t, integrationWaitTimeout, func() bool {
 		data, err := os.ReadFile(filepath.Join(subscriber.root, "notes.txt"))
 		return err == nil && string(data) == "v2 from offerer"
 	})
@@ -750,10 +832,10 @@ func TestIntegration_RestorePropagatesAsNewChange(t *testing.T) {
 	mustSync(t, sa, testShareID)
 	mustSync(t, sb, testShareID)
 
-	waitFor(t, 5*time.Second, func() bool {
-		data, err := os.ReadFile(filepath.Join(b.root, "keepme.txt"))
-		return err == nil && string(data) == "original content"
-	})
+	// See waitForFile's doc comment: the indexDelete call below reads and
+	// bumps B's own row for this path, which is what B just received from
+	// A.
+	waitForFile(t, integrationWaitTimeout, b.store, testShareID, b.root, "keepme.txt", "original content")
 
 	// B deletes the file and that delete propagates to A, which — being a
 	// remote-initiated delete — trashes A's copy first.
@@ -763,7 +845,7 @@ func TestIntegration_RestorePropagatesAsNewChange(t *testing.T) {
 	indexDelete(t, b.store, b.id, "keepme.txt")
 	mustSync(t, sb, testShareID)
 
-	waitFor(t, 5*time.Second, func() bool {
+	waitFor(t, integrationWaitTimeout, func() bool {
 		_, err := os.Stat(filepath.Join(a.root, "keepme.txt"))
 		return os.IsNotExist(err)
 	})
@@ -798,10 +880,9 @@ func TestIntegration_RestorePropagatesAsNewChange(t *testing.T) {
 	// SyncShare after noticing the local change.
 	mustSync(t, sa, testShareID)
 
-	waitFor(t, 5*time.Second, func() bool {
-		data, err := os.ReadFile(filepath.Join(b.root, "keepme.txt"))
-		return err == nil && string(data) == "original content"
-	})
+	// See waitForFile's doc comment: the assertions right below read B's
+	// row directly, so the wait must cover it too, not just the file.
+	waitForFile(t, integrationWaitTimeout, b.store, testShareID, b.root, "keepme.txt", "original content")
 
 	bRow, err := b.store.GetFile(context.Background(), testShareID, "keepme.txt")
 	if err != nil {

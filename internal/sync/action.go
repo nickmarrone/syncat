@@ -139,6 +139,26 @@ type Action struct {
 	// reconciliation with no content change).
 	Source ActionSource
 
+	// SourceVersion is the version to actually request from the peer when
+	// Source == SourceRemote: the version the peer's own index advertised
+	// for this content, before any local merge/bump.
+	//
+	// It matters because Resolved.Version is not always that same value:
+	// for ActionPull/ActionDelete (a plain dominance, no conflict)
+	// Resolved.Version *is* the peer's version as received, so
+	// SourceVersion is identical to it. But for
+	// ActionResurrect/ActionConflictCopy, Resolved.Version has been
+	// rewritten to Merge(local, remote) plus a local Bump (per SPEC.md §5)
+	// — the version we're about to persist locally, reflecting that *we*
+	// have now resolved the conflict. The peer never has that value; they
+	// only ever have what they last told us about. A FileRequest must
+	// carry SourceVersion, or the peer's Equal(row.Version, req.Version)
+	// freshness check (handleFileRequest in transfer.go) can never match,
+	// and the pull always fails with "version_changed" on its first
+	// attempt — see apply.go's pullAndInstall, the only consumer of this
+	// field. Zero/unused when Source != SourceRemote.
+	SourceVersion protocol.VersionVector
+
 	// The following three fields are set only when Kind == ActionConflictCopy:
 	// the losing side, preserved unmodified beside the winner rather than
 	// being discarded.
