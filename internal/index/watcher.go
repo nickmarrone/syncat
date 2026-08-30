@@ -194,19 +194,29 @@ func (w *Watcher) eventLoop() {
 			if !ok {
 				continue
 			}
-			w.deb.markDirty(rel)
 
 			if ev.Op&fsnotify.Create != 0 {
 				if fi, err := os.Lstat(ev.Name); err == nil && fi.IsDir() && fi.Mode()&os.ModeSymlink == 0 {
 					// A directory (or a whole subtree, e.g. a fast `mkdir
 					// -p` or an untar) can appear before we get a chance
 					// to watch each level individually; walk it now so no
-					// nested directory is missed.
+					// nested directory is missed. Do this *before*
+					// markDirty below: markDirty is what a consumer of
+					// OnDirty observes and may react to (e.g. by creating
+					// files under the new directory once it learns the
+					// directory exists), so the watch needs to already be
+					// live by the time that notification goes out. Doing
+					// it the other way around widens an already-real
+					// kernel-level race (mkdir vs. our inotify_add_watch)
+					// with an entirely avoidable one: our own debounce/
+					// notification latency.
 					if err := addTreeWatches(w.fsw, ev.Name); err != nil {
 						w.warnf("index: watcher: add watch for new directory %s: %v", ev.Name, err)
 					}
 				}
 			}
+
+			w.deb.markDirty(rel)
 		case err, ok := <-w.fsw.Errors:
 			if !ok {
 				return

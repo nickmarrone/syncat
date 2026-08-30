@@ -264,18 +264,7 @@ func TestWatcherAddsWatchesForNewSubdirectories(t *testing.T) {
 	if err := os.Mkdir(filepath.Join(root, "sub1"), 0755); err != nil {
 		t.Fatalf("Mkdir: %v", err)
 	}
-	if !clock.waitForWaiters(baseline+1, 5*time.Second) {
-		t.Fatal("timed out waiting for the mkdir event to reach the debouncer")
-	}
-	clock.Advance(time.Second)
-	select {
-	case got := <-dirty:
-		if !containsPath(got, "sub1") {
-			t.Errorf("first flush = %v, want to contain sub1", got)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for dirty notification about sub1")
-	}
+	waitForDirtyFlush(t, clock, baseline, dirty, "sub1", 5*time.Second)
 
 	// ...a file created inside sub1 afterwards is also seen, which only
 	// happens if sub1 itself got a live fsnotify watch. The debouncer's
@@ -285,17 +274,55 @@ func TestWatcherAddsWatchesForNewSubdirectories(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "sub1", "inside.txt"), []byte("x"), 0644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
-	if !clock.waitForWaiters(baseline+1, 5*time.Second) {
-		t.Fatal("timed out waiting for the nested-file event to reach the debouncer")
-	}
-	clock.Advance(time.Second)
-	select {
-	case got := <-dirty:
-		if !containsPath(got, "sub1/inside.txt") {
-			t.Errorf("second flush = %v, want to contain sub1/inside.txt", got)
+	waitForDirtyFlush(t, clock, baseline, dirty, "sub1/inside.txt", 5*time.Second)
+}
+
+// waitForDirtyFlush advances the fake clock until a debounce flush
+// containing want arrives on dirty, and returns it.
+//
+// A single filesystem operation can legitimately produce more than one
+// fsnotify event — os.WriteFile, for instance, is open(O_CREATE)+write+
+// close, which is commonly delivered as separate CREATE and WRITE events
+// for the same path. That means a "new timer registered" signal on the
+// fake clock isn't necessarily the one Advance is meant to fire: if the
+// second event's markDirty call reaches the debouncer's select in the same
+// instant Advance fires the current timer, Go's select is free to pick
+// either ready case. Picking the incoming mark over the already-fired
+// timer is not a bug — the debouncer is meant to treat that as "activity
+// within the window" and extend it (see debouncer.go's re-registration
+// comment, and SPEC.md §5: "batches of events collapse into one scan") —
+// but it means the fired timer's flush is superseded rather than
+// delivered, and waiterCount is right back at baseline+1 with a *new*
+// timer to wait for. So instead of assuming one Advance always yields one
+// flush, keep registering-and-advancing (bounded by overall, never a
+// sleep) until the flush we're after actually shows up.
+func waitForDirtyFlush(t *testing.T, clock *fakeClock, baseline int, dirty chan []string, want string, overall time.Duration) []string {
+	t.Helper()
+	deadline := time.Now().Add(overall)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			t.Fatalf("timed out waiting for a dirty flush containing %s", want)
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for dirty notification about sub1/inside.txt")
+		if !clock.waitForWaiters(baseline+1, remaining) {
+			t.Fatalf("timed out waiting for a new debounce timer registration (want flush containing %s)", want)
+		}
+		clock.Advance(time.Second)
+		select {
+		case got := <-dirty:
+			if containsPath(got, want) {
+				return got
+			}
+			t.Fatalf("flush = %v, want to contain %s", got, want)
+		case <-time.After(200 * time.Millisecond):
+			// The fired timer lost the select race to a fresh mark for the
+			// same underlying filesystem operation (see doc comment above);
+			// a new timer is now registered in its place. Loop and try
+			// advancing past that one instead.
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for a dirty flush containing %s", want)
+		}
 	}
 }
 
