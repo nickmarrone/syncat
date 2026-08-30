@@ -15,6 +15,31 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, toStatusResponse(s.node.Status()))
 }
 
+// --- node (PATCH /api/node, wired to the already-existing core.Node.RenameNode) ---
+
+type patchNodeRequest struct {
+	Name *string `json:"name"`
+}
+
+func (s *Server) handleNodePatch(w http.ResponseWriter, r *http.Request) {
+	var req patchNodeRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.Name != nil {
+		if !requireField(w, "name", *req.Name) {
+			return
+		}
+		if err := s.node.RenameNode(*req.Name); err != nil {
+			status, code, msg := mutationError(err)
+			writeError(w, status, code, msg)
+			return
+		}
+	}
+	st := s.node.Status()
+	writeJSON(w, http.StatusOK, map[string]string{"node_name": st.NodeName, "node_token": st.NodeToken})
+}
+
 // --- peers ---------------------------------------------------------------
 
 func (s *Server) handlePeersList(w http.ResponseWriter, r *http.Request) {

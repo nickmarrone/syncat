@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>syncat</title>
+<link rel="icon" type="image/svg+xml" href="favicon.svg">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand"><span aria-hidden="true">🐱</span> syncat</div>
+  <nav class="tabs" id="tabs">
+    <a href="#/" data-route="/">Dashboard</a>
+    <a href="#/peers" data-route="/peers">Peers</a>
+    <a href="#/shares" data-route="/shares">Shares</a>
+  </nav>
+  <div id="conn-indicator"></div>
+</header>
+<main id="app">
+  <p class="muted">Loading…</p>
+</main>
+<div class="toast-stack" id="toasts"></div>
+<script type="module" src="app.js"></script>
+</body>
+</html>

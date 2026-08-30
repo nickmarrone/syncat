@@ -30,6 +30,7 @@ import (
 	syncsvc "github.com/nickmarrone/syncat/internal/sync"
 
 	"github.com/nickmarrone/syncat/internal/core"
+	"github.com/nickmarrone/syncat/internal/webui"
 )
 
 // maxRequestBody bounds the size of any request body this server reads
@@ -117,6 +118,12 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /ui-token", s.handleUIToken)
 
 	s.mux.HandleFunc("GET /api/status", s.auth(s.handleStatus))
+	// core.Node.RenameNode already existed for Phase 9's editable
+	// dashboard node-name field (SPEC.md §9) but Phase 8 never wired a
+	// route to it — added here since it's the smallest reasonable place
+	// for it (peer with GET /api/status, which is where node_name is
+	// read from).
+	s.mux.HandleFunc("PATCH /api/node", s.auth(s.handleNodePatch))
 
 	s.mux.HandleFunc("GET /api/peers", s.auth(s.handlePeersList))
 	s.mux.HandleFunc("POST /api/peers", s.auth(s.handlePeersAdd))
@@ -150,13 +157,11 @@ func (s *Server) routes() {
 	// registered at all, so it 404s like any other unknown route rather
 	// than pretending to stream.
 
-	// Mount point for Phase 9's embedded web UI (internal/webui,
-	// go:embed). internal/webui exposes no embed hook yet (see its doc.go
-	// — it's an empty package today), so this is a placeholder: swap in
-	// http.FileServer(http.FS(webui.Assets)) or equivalent here once
-	// Phase 9 lands. Unauthenticated by design — a browser must be able
-	// to load the page before it has a token.
-	s.mux.HandleFunc("/", s.handleRoot)
+	// Embedded web UI (internal/webui, go:embed) — see webui.Handler's
+	// doc comment for its own path-traversal and auth reasoning.
+	// Unauthenticated by design: a browser must be able to load the page
+	// before it has a token (GET /ui-token is how it gets one).
+	s.mux.Handle("/", webui.Handler())
 }
 
 // auth wraps h to require a valid X-Syncat-Token header, per SPEC.md §8.
@@ -178,17 +183,6 @@ func (s *Server) handleNotImplemented(message string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotImplemented, "not_implemented", message)
 	}
-}
-
-func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" {
-		http.NotFound(w, r)
-		return
-	}
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	fmt.Fprintln(w, "syncat daemon is running.")
-	fmt.Fprintln(w, "the web UI is not part of this build (Phase 9); use the REST API (see SPEC.md §8) or the syncat CLI.")
 }
 
 func (s *Server) recoverMiddleware(next http.Handler) http.Handler {
