@@ -205,13 +205,30 @@ const (
 	ErrCodeUnauthorized       = "unauthorized"
 	ErrCodeBadHello           = "bad_hello"
 	ErrCodeBadAuth            = "bad_auth"
+
+	// ErrCodeFileNotFound and ErrCodeVersionChanged are Phase 5b's
+	// file-transfer-level error codes (SPEC.md §4/§5: "a peer requesting a
+	// file we no longer have, or whose version moved on, gets an Error —
+	// never a hung stream"). Unlike the handshake codes above, an Error
+	// carrying one of these also sets ShareID/RelPath so the requester can
+	// route it back to the specific FileRequest it answers.
+	ErrCodeFileNotFound   = "file_not_found"
+	ErrCodeVersionChanged = "version_changed"
 )
 
 // Error reports a protocol-level failure to the peer before closing the
-// connection (SPEC.md §4).
+// connection (SPEC.md §4). ShareID and RelPath are optional (omitempty):
+// unset for connection-level errors (e.g. the handshake codes above), set
+// for a file-transfer-level error answering a specific FileRequest so the
+// puller can demultiplex it back to the right in-flight transfer. Adding
+// these two fields is safe under SPEC.md §11 forward compatibility (see
+// the package doc comment above): Error is CBOR-map encoded, so older
+// decoders that don't know about them simply ignore them.
 type Error struct {
-	Code string `cbor:"code"`
-	Msg  string `cbor:"msg"`
+	Code    string `cbor:"code"`
+	Msg     string `cbor:"msg"`
+	ShareID string `cbor:"share_id,omitempty"`
+	RelPath string `cbor:"relpath,omitempty"`
 }
 
 // RemoteError wraps an Error message received from the peer, so callers
