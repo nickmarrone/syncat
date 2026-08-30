@@ -110,6 +110,19 @@ type Session struct {
 
 	logger *log.Logger
 
+	// ctrlMu guards controlHandler/frameObserver, Phase 7's hooks for
+	// driving the parts of the connection lifecycle Session itself doesn't
+	// own: ShareList/SubscribeRequest/AccessUpdate/Ping/Pong (see readLoop's
+	// default case) and keepalive activity tracking (frameObserver fires
+	// for every frame this Session reads, of any type, matching
+	// protocol.Keepalive's "any frame counts as received traffic"
+	// contract). Both are nil-safe (a Session with neither set behaves
+	// exactly as before Phase 7): set them before calling Start to avoid
+	// racing the read loop's first frame.
+	ctrlMu         sync.Mutex
+	controlHandler func(typ protocol.MsgType, payload []byte)
+	frameObserver  func(typ protocol.MsgType)
+
 	sharesMu sync.RWMutex
 	shares   map[string]*ShareConfig
 
@@ -194,6 +207,45 @@ func (s *Session) AddShare(cfg ShareConfig) {
 // trashHook a no-op.
 func (s *Session) SetTrash(tr *Trash) {
 	s.trash = tr
+}
+
+// SetControlHandler registers fn to be called, synchronously from the read
+// loop, for every frame type this Session doesn't itself handle: Hello,
+// Auth, ShareList, SubscribeRequest, AccessUpdate, Ping, and Pong (see
+// readLoop's default case). This is Phase 7's hook for driving the peering
+// flow (SPEC.md §2, §4, §6) on the same connection Session already reads
+// exclusively — Session remains "the single reader of the connection"
+// (readLoop's own invariant); fn just gets a look at what readLoop would
+// otherwise silently drop. fn should not block for long (it runs on the
+// read loop goroutine, same as every other dispatch here); spin off a
+// goroutine internally for anything that does I/O. Call before Start to
+// avoid racing the very first frame the peer sends.
+func (s *Session) SetControlHandler(fn func(typ protocol.MsgType, payload []byte)) {
+	s.ctrlMu.Lock()
+	s.controlHandler = fn
+	s.ctrlMu.Unlock()
+}
+
+// SetFrameObserver registers fn to be called once per frame read, of any
+// type, before dispatch — Phase 7's hook for driving
+// protocol.Keepalive.RecordReceived, since SPEC.md §4's "90s without
+// traffic" dead-connection rule counts every message, not just Ping/Pong,
+// and only Session's read loop ever sees the IndexUpdate/FileRequest/
+// FileChunk/Error traffic that SetControlHandler's default case never
+// reaches. Call before Start, for the same reason as SetControlHandler.
+func (s *Session) SetFrameObserver(fn func(typ protocol.MsgType)) {
+	s.ctrlMu.Lock()
+	s.frameObserver = fn
+	s.ctrlMu.Unlock()
+}
+
+// Writer returns this Session's underlying protocol.Writer, so Phase 7's
+// peer manager can send ShareList/SubscribeRequest/AccessUpdate/Ping
+// frames on the same connection Session writes IndexUpdate/FileRequest/
+// FileChunk/Error to. Writer is safe for concurrent use (see frame.go), so
+// sharing it this way never risks torn or interleaved frames.
+func (s *Session) Writer() *protocol.Writer {
+	return s.writer
 }
 
 // SetLocallyModifiedHandler registers fn to be called synchronously, from
@@ -316,6 +368,14 @@ func (s *Session) readLoop() {
 		if err != nil {
 			return
 		}
+
+		s.ctrlMu.Lock()
+		observer, ctrlHandler := s.frameObserver, s.controlHandler
+		s.ctrlMu.Unlock()
+		if observer != nil {
+			observer(typ)
+		}
+
 		switch typ {
 		case protocol.MsgIndexUpdate:
 			var msg protocol.IndexUpdate
@@ -363,8 +423,12 @@ func (s *Session) readLoop() {
 
 		default:
 			// Handshake/share-list/access/ping-pong messages: other
-			// phases' concern (this Session assumes they already
-			// happened, or are handled elsewhere on this connection).
+			// phases' concern (this Session assumes the handshake already
+			// happened; everything else here is Phase 7's peer manager,
+			// via SetControlHandler, if it registered one).
+			if ctrlHandler != nil {
+				ctrlHandler(typ, payload)
+			}
 		}
 	}
 }
