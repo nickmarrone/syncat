@@ -132,6 +132,28 @@ func (c *Config) Validate() error {
 			errs = append(errs, fmt.Errorf("subscription[%d] (peer %s, share %s): invalid mode %q (want %q or %q)",
 				i, sub.Peer, sub.ShareID, sub.Mode, ModeMirror, ModeReceiveOnly))
 		}
+		if sub.LocalPath != "" && !filepath.IsAbs(sub.LocalPath) {
+			errs = append(errs, fmt.Errorf("subscription[%d] (peer %s, share %s): local path %q must be absolute",
+				i, sub.Peer, sub.ShareID, sub.LocalPath))
+		}
+	}
+
+	// A directory synced down from a peer must not be offered back out as one
+	// of our own shares; see overlap.go for why. Checked here as well as at
+	// the API layer so a hand-edited config.json cannot smuggle it past.
+	for i, s := range c.Shares {
+		if s.Path == "" {
+			continue
+		}
+		for j, sub := range c.Subscriptions {
+			if sub.LocalPath == "" || !pathsOverlap(s.Path, sub.LocalPath) {
+				continue
+			}
+			errs = append(errs, fmt.Errorf(
+				"share[%d] (%s) path %q overlaps subscription[%d] local path %q (peer %s, share %s): "+
+					"a directory synced from another node cannot be offered back out",
+				i, s.Name, s.Path, j, sub.LocalPath, sub.Peer, sub.ShareID))
+		}
 	}
 
 	return errors.Join(errs...)
