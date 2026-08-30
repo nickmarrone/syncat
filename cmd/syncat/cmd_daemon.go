@@ -73,7 +73,7 @@ func cmdDaemon(paths *config.Paths, args []string) error {
 		return err
 	}
 
-	tr := transport.NewTailcatTransport(tcKey, nil)
+	tr := transport.NewTailcatTransport(tcKey, logger.Printf)
 
 	nodeCtx, nodeCancel := context.WithCancel(context.Background())
 	defer nodeCancel()
