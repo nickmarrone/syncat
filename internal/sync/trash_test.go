@@ -1,0 +1,475 @@
+package sync
+
+import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/nickmarrone/syncat/internal/index"
+	"github.com/nickmarrone/syncat/internal/protocol"
+)
+
+const trashTestShareID = "share-trash-1"
+
+func fixedTrashClock(sec int64) Clock {
+	return func() time.Time { return time.Unix(sec, 0) }
+}
+
+func newTestTrash(t *testing.T, clockSec int64) (*Trash, string) {
+	t.Helper()
+	dir := t.TempDir()
+	root := filepath.Join(dir, "trash")
+	return NewTrash(root, fixedTrashClock(clockSec)), root
+}
+
+func writeShareFile(t *testing.T, root, relpath, content string) string {
+	t.Helper()
+	full := filepath.Join(root, filepath.FromSlash(relpath))
+	if err := os.MkdirAll(filepath.Dir(full), 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(full, []byte(content), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	return full
+}
+
+// 1. Trash on overwrite / delete: old content preserved, correct bytes.
+func TestTrash_PutMovesContentIntoTrash(t *testing.T) {
+	shareDir := t.TempDir()
+	srcAbs := writeShareFile(t, shareDir, "dir1/notes.txt", "old content")
+
+	tr, trashRoot := newTestTrash(t, 1735689600)
+
+	if err := tr.Put(context.Background(), trashTestShareID, "dir1/notes.txt", srcAbs); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	if _, err := os.Lstat(srcAbs); !os.IsNotExist(err) {
+		t.Fatalf("source should be gone after trash, stat err = %v", err)
+	}
+
+	want := filepath.Join(trashRoot, trashTestShareID, "dir1", "notes.txt.1735689600")
+	data, err := os.ReadFile(want)
+	if err != nil {
+		t.Fatalf("read trashed file %s: %v", want, err)
+	}
+	if string(data) != "old content" {
+		t.Fatalf("trashed content = %q, want %q", data, "old content")
+	}
+}
+
+// 2. Nothing to trash: no-op, not an error.
+func TestTrash_PutNoOpWhenSourceMissing(t *testing.T) {
+	shareDir := t.TempDir()
+	missing := filepath.Join(shareDir, "gone.txt")
+
+	tr, trashRoot := newTestTrash(t, 1735689600)
+	if err := tr.Put(context.Background(), trashTestShareID, "gone.txt", missing); err != nil {
+		t.Fatalf("Put on missing source: %v", err)
+	}
+	if entries, err := os.ReadDir(trashRoot); err == nil && len(entries) != 0 {
+		t.Fatalf("expected no trash created, got %v", entries)
+	}
+}
+
+// 3. Cross-filesystem fallback: force EXDEV from rename and confirm
+// copy+delete still preserves content and removes the original. We can't
+// rely on a second real filesystem being available in the test
+// environment, so the "same filesystem?" decision is injected via a
+// wrapped rename func that reports the same error os.Rename would return
+// crossing a real mount boundary.
+func TestTrash_CrossDeviceFallback(t *testing.T) {
+	shareDir := t.TempDir()
+	srcAbs := writeShareFile(t, shareDir, "big.bin", "cross-device content")
+
+	tr, trashRoot := newTestTrash(t, 1735689600)
+	renameCalled := false
+	tr.rename = func(oldpath, newpath string) error {
+		renameCalled = true
+		return &os.LinkError{Op: "rename", Old: oldpath, New: newpath, Err: syscall.EXDEV}
+	}
+
+	if err := tr.Put(context.Background(), trashTestShareID, "big.bin", srcAbs); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if !renameCalled {
+		t.Fatal("expected rename to be attempted first")
+	}
+	if _, err := os.Lstat(srcAbs); !os.IsNotExist(err) {
+		t.Fatalf("source should be removed after copy+delete fallback, err = %v", err)
+	}
+
+	want := filepath.Join(trashRoot, trashTestShareID, "big.bin.1735689600")
+	data, err := os.ReadFile(want)
+	if err != nil {
+		t.Fatalf("read trashed file: %v", err)
+	}
+	if string(data) != "cross-device content" {
+		t.Fatalf("trashed content = %q", data)
+	}
+}
+
+// Cross-device copy failing partway must not lose the original: the
+// partial trash copy is cleaned up and the source is left alone.
+func TestTrash_CrossDeviceFallback_PartialCopyLeavesSourceIntact(t *testing.T) {
+	shareDir := t.TempDir()
+	srcAbs := writeShareFile(t, shareDir, "big.bin", "content that will fail to copy")
+
+	// Point trash at a path that will fail to receive the copy (a file in
+	// place of what should be the trash share directory), while still
+	// reporting EXDEV from rename, so copyThenRemove's OpenFile fails.
+	dir := t.TempDir()
+	trashRoot := filepath.Join(dir, "trash")
+	if err := os.MkdirAll(filepath.Join(trashRoot, trashTestShareID), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Make the destination's parent directory unwritable to force the
+	// create to fail without depending on a second filesystem.
+	blocked := filepath.Join(trashRoot, trashTestShareID, "blocked")
+	if err := os.WriteFile(blocked, []byte("not a dir"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tr := NewTrash(trashRoot, fixedTrashClock(1735689600))
+	tr.rename = func(oldpath, newpath string) error {
+		return &os.LinkError{Op: "rename", Old: oldpath, New: newpath, Err: syscall.EXDEV}
+	}
+
+	// relpath "blocked/x" makes destPath's MkdirAll(filepath.Dir(...)) try
+	// to MkdirAll through the "blocked" regular file, which fails cleanly.
+	err := tr.Put(context.Background(), trashTestShareID, "blocked/x", srcAbs)
+	if err == nil {
+		t.Fatal("expected an error when the trash destination can't be created")
+	}
+	data, statErr := os.ReadFile(srcAbs)
+	if statErr != nil {
+		t.Fatalf("source must survive a failed trash attempt, stat err = %v", statErr)
+	}
+	if string(data) != "content that will fail to copy" {
+		t.Fatalf("source content changed: %q", data)
+	}
+}
+
+// 4. Collision: the same relpath trashed twice within the same unix
+// second doesn't overwrite the first copy.
+func TestTrash_CollisionKeepsBothCopies(t *testing.T) {
+	shareDir := t.TempDir()
+	tr, trashRoot := newTestTrash(t, 1735689600)
+
+	src1 := writeShareFile(t, shareDir, "notes.txt", "first version")
+	if err := tr.Put(context.Background(), trashTestShareID, "notes.txt", src1); err != nil {
+		t.Fatalf("Put 1: %v", err)
+	}
+
+	src2 := writeShareFile(t, shareDir, "notes.txt", "second version")
+	if err := tr.Put(context.Background(), trashTestShareID, "notes.txt", src2); err != nil {
+		t.Fatalf("Put 2: %v", err)
+	}
+
+	first := filepath.Join(trashRoot, trashTestShareID, "notes.txt.1735689600")
+	second := filepath.Join(trashRoot, trashTestShareID, "notes.txt.1735689600-1")
+
+	d1, err := os.ReadFile(first)
+	if err != nil {
+		t.Fatalf("read first trash copy: %v", err)
+	}
+	d2, err := os.ReadFile(second)
+	if err != nil {
+		t.Fatalf("read second trash copy: %v", err)
+	}
+	if string(d1) != "first version" {
+		t.Fatalf("first copy = %q, want %q", d1, "first version")
+	}
+	if string(d2) != "second version" {
+		t.Fatalf("second copy = %q, want %q", d2, "second version")
+	}
+}
+
+// 5. List returns relpath/trashed-at/size; Restore copies content back and
+// bumps the local version so the file dominates whatever the index held
+// before (i.e. it will propagate).
+func TestTrash_ListAndRestore(t *testing.T) {
+	ctx := context.Background()
+	shareDir := t.TempDir()
+	tr, _ := newTestTrash(t, 1735689600)
+
+	src := writeShareFile(t, shareDir, "dir1/report.txt", "trashed content")
+	if err := tr.Put(ctx, trashTestShareID, "dir1/report.txt", src); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	entries, err := tr.List(trashTestShareID)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("len(entries) = %d, want 1: %+v", len(entries), entries)
+	}
+	e := entries[0]
+	if e.RelPath != "dir1/report.txt" {
+		t.Fatalf("RelPath = %q, want %q", e.RelPath, "dir1/report.txt")
+	}
+	if !e.TrashedAt.Equal(time.Unix(1735689600, 0)) {
+		t.Fatalf("TrashedAt = %v", e.TrashedAt)
+	}
+	if e.Size != int64(len("trashed content")) {
+		t.Fatalf("Size = %d, want %d", e.Size, len("trashed content"))
+	}
+
+	store := openTestTrashStore(t)
+	// Seed an existing index row with some version, as if this file had
+	// been synced before at v{node: 3}.
+	existing := index.FileRow{
+		ShareID: trashTestShareID, RelPath: "dir1/report.txt", Type: protocol.FileTypeFile,
+		Version: protocol.VersionVector{"nodeA": 3}, Deleted: true, UpdatedAt: time.Now(),
+	}
+	if err := store.PutFile(ctx, existing); err != nil {
+		t.Fatalf("seed index: %v", err)
+	}
+
+	row, err := tr.Restore(ctx, store, "nodeA", shareDir, e)
+	if err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+
+	restoredPath := filepath.Join(shareDir, "dir1", "report.txt")
+	data, err := os.ReadFile(restoredPath)
+	if err != nil {
+		t.Fatalf("read restored file: %v", err)
+	}
+	if string(data) != "trashed content" {
+		t.Fatalf("restored content = %q", data)
+	}
+
+	if !Dominates(row.Version, existing.Version) {
+		t.Fatalf("restored version %v does not dominate previous %v", row.Version, existing.Version)
+	}
+	if row.Version["nodeA"] != 4 {
+		t.Fatalf("restored version[nodeA] = %d, want 4", row.Version["nodeA"])
+	}
+	if row.Deleted {
+		t.Fatal("restored row should not be a tombstone")
+	}
+
+	stored, err := store.GetFile(ctx, trashTestShareID, "dir1/report.txt")
+	if err != nil {
+		t.Fatalf("GetFile after restore: %v", err)
+	}
+	if !Equal(stored.Version, row.Version) {
+		t.Fatalf("index not updated: stored=%v returned=%v", stored.Version, row.Version)
+	}
+
+	// The trash entry itself must still be there (restore copies, doesn't
+	// move).
+	if _, err := os.Stat(filepath.Join(tr.root, trashTestShareID, "dir1", "report.txt.1735689600")); err != nil {
+		t.Fatalf("trash entry should survive a restore: %v", err)
+	}
+}
+
+// Restore-collision policy: refuse rather than silently clobber a file
+// that now occupies the destination path.
+func TestTrash_RestoreRefusesToClobberExistingFile(t *testing.T) {
+	ctx := context.Background()
+	shareDir := t.TempDir()
+	tr, _ := newTestTrash(t, 1735689600)
+
+	src := writeShareFile(t, shareDir, "report.txt", "original trashed content")
+	if err := tr.Put(ctx, trashTestShareID, "report.txt", src); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	entries, err := tr.List(trashTestShareID)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("List: %v, %+v", err, entries)
+	}
+
+	// A different file now occupies that path.
+	writeShareFile(t, shareDir, "report.txt", "unrelated new content")
+
+	store := openTestTrashStore(t)
+	_, err = tr.Restore(ctx, store, "nodeA", shareDir, entries[0])
+	if !errors.Is(err, ErrRestoreDestExists) {
+		t.Fatalf("Restore error = %v, want wrapping ErrRestoreDestExists", err)
+	}
+
+	data, rerr := os.ReadFile(filepath.Join(shareDir, "report.txt"))
+	if rerr != nil {
+		t.Fatalf("read existing file: %v", rerr)
+	}
+	if string(data) != "unrelated new content" {
+		t.Fatalf("existing file was clobbered: %q", data)
+	}
+}
+
+// 6. Trash failure aborts the apply: trashHook (the exact call every
+// destructive apply.go path makes immediately before its destructive step
+// — see applyDelete and pullAndInstall) must return an error without
+// touching the original file when the underlying Trash.Put fails, so the
+// caller never reaches its rename/remove.
+func TestTrash_FailureAbortsApply(t *testing.T) {
+	ctx := context.Background()
+	shareDir := t.TempDir()
+	writeShareFile(t, shareDir, "notes.txt", "local original — must survive")
+	store := openTestTrashStore(t)
+
+	// Force every Put to fail: point the trash root at a path that is
+	// actually a regular file, so Trash.Put's MkdirAll under it always
+	// errors before anything is moved.
+	blockedRoot := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(blockedRoot, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	failingTrash := NewTrash(blockedRoot, nil)
+
+	sess := NewSession(nil, store, "nodeA", "nodeB", nil, nil)
+	sess.SetTrash(failingTrash)
+
+	destAbs := filepath.Join(shareDir, "notes.txt")
+	if err := sess.trashHook(ctx, testShareID, "notes.txt", destAbs); err == nil {
+		t.Fatal("expected trashHook to fail with a broken trash root")
+	}
+
+	data, rerr := os.ReadFile(destAbs)
+	if rerr != nil {
+		t.Fatalf("original file must survive a failed trash: %v", rerr)
+	}
+	if string(data) != "local original — must survive" {
+		t.Fatalf("original file content changed: %q", data)
+	}
+
+	// And the concrete apply.go call sites honor that: applyDelete must
+	// not remove the file either.
+	cfg := ShareConfig{ShareID: testShareID, Root: shareDir}
+	if _, err := sess.applyDelete(ctx, cfg, "notes.txt"); err == nil {
+		t.Fatal("expected applyDelete to abort when trashing fails")
+	}
+	if _, err := os.Stat(destAbs); err != nil {
+		t.Fatalf("applyDelete must leave the file in place on trash failure: %v", err)
+	}
+}
+
+// 7. Structural local-vs-remote distinction: a local delete the user makes
+// (observed by the scanner, applied via index.ApplyScanResult — a code
+// path with zero dependency on this package) must never trash anything. A
+// remote-initiated delete, going through applyDelete, must.
+func TestTrash_LocalDeleteIsNeverTrashed_RemoteDeleteIs(t *testing.T) {
+	ctx := context.Background()
+	shareDir := t.TempDir()
+	writeShareFile(t, shareDir, "keep-me-untrashed.txt", "local content")
+	writeShareFile(t, shareDir, "remote-deleted.txt", "remote content")
+
+	store := openTestTrashStore(t)
+	sc := index.NewScanner(os.DirFS(shareDir), nil)
+	result, err := sc.Scan(ctx, trashTestShareID, nil)
+	if err != nil {
+		t.Fatalf("initial scan: %v", err)
+	}
+	if err := store.ApplyScanResult(ctx, result); err != nil {
+		t.Fatalf("apply initial scan: %v", err)
+	}
+
+	tr, trashRoot := newTestTrash(t, 1735689600)
+
+	// --- local delete: the user removes the file directly; the scanner
+	// just observes it's gone. This path never touches internal/sync.
+	if err := os.Remove(filepath.Join(shareDir, "keep-me-untrashed.txt")); err != nil {
+		t.Fatal(err)
+	}
+	existing, err := store.ListShareMap(ctx, trashTestShareID)
+	if err != nil {
+		t.Fatalf("ListShareMap: %v", err)
+	}
+	result2, err := sc.Scan(ctx, trashTestShareID, existing)
+	if err != nil {
+		t.Fatalf("rescan after local delete: %v", err)
+	}
+	if err := store.ApplyScanResult(ctx, result2); err != nil {
+		t.Fatalf("apply rescan: %v", err)
+	}
+	if len(result2.Deleted) != 1 || result2.Deleted[0].RelPath != "keep-me-untrashed.txt" {
+		t.Fatalf("expected local delete to be observed as a tombstone: %+v", result2.Deleted)
+	}
+
+	// --- remote-initiated delete: goes through Session.applyDelete, which
+	// does call the trash hook.
+	sess := NewSession(nil, store, "nodeA", "nodeB", nil, nil)
+	sess.SetTrash(tr)
+	cfg := ShareConfig{ShareID: trashTestShareID, Root: shareDir}
+	deleted, err := sess.applyDelete(ctx, cfg, "remote-deleted.txt")
+	if err != nil {
+		t.Fatalf("applyDelete: %v", err)
+	}
+	if !deleted {
+		t.Fatal("expected applyDelete to report the file as deleted")
+	}
+
+	// The local delete must have produced no trash entry anywhere.
+	entries, err := tr.List(trashTestShareID)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected exactly one trash entry (the remote delete only), got %+v", entries)
+	}
+	if entries[0].RelPath != "remote-deleted.txt" {
+		t.Fatalf("unexpected trash entry: %+v", entries[0])
+	}
+	if _, err := os.Stat(filepath.Join(trashRoot, trashTestShareID, "keep-me-untrashed.txt.1735689600")); !os.IsNotExist(err) {
+		t.Fatalf("local delete must not appear in trash, stat err = %v", err)
+	}
+}
+
+// 8. Very long relpath: nested-but-valid components succeed without
+// panicking; Trash handles it gracefully end to end (Put, List, Restore).
+func TestTrash_VeryLongRelPath(t *testing.T) {
+	ctx := context.Background()
+	shareDir := t.TempDir()
+
+	// Build a deeply nested relpath comfortably under both the relpath
+	// validator's 4096-byte cap and a single path component's typical
+	// 255-byte filesystem limit, but still long enough to matter.
+	comp := strings.Repeat("a", 200)
+	relpath := strings.Join([]string{comp, comp, comp + ".txt"}, "/")
+
+	src := writeShareFile(t, shareDir, relpath, "deep content")
+	tr, _ := newTestTrash(t, 1735689600)
+
+	if err := tr.Put(ctx, trashTestShareID, relpath, src); err != nil {
+		t.Fatalf("Put with long relpath: %v", err)
+	}
+	entries, err := tr.List(trashTestShareID)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(entries) != 1 || entries[0].RelPath != relpath {
+		t.Fatalf("entries = %+v, want relpath %q", entries, relpath)
+	}
+
+	store := openTestTrashStore(t)
+	if _, err := tr.Restore(ctx, store, "nodeA", shareDir, entries[0]); err != nil {
+		t.Fatalf("Restore with long relpath: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(shareDir, filepath.FromSlash(relpath)))
+	if err != nil {
+		t.Fatalf("read restored long-path file: %v", err)
+	}
+	if string(data) != "deep content" {
+		t.Fatalf("restored content = %q", data)
+	}
+}
+
+func openTestTrashStore(t *testing.T) *index.Store {
+	t.Helper()
+	dir := t.TempDir()
+	store, err := index.Open(context.Background(), filepath.Join(dir, "index.db"))
+	if err != nil {
+		t.Fatalf("open index: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	return store
+}

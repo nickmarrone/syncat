@@ -1,6 +1,27 @@
 package sync
 
-import "github.com/nickmarrone/syncat/internal/protocol"
+import (
+	"time"
+
+	"github.com/nickmarrone/syncat/internal/protocol"
+)
+
+// LocallyModifiedWarning records one receive-only "locally modified" event
+// (SPEC.md §1, §5): a subscriber's local edit that diverged from the
+// offerer under a receive-only subscription. Reverted reports whether the
+// offerer already had content to revert to (a trash copy was taken and the
+// offerer's version installed) or the divergence was only flagged because
+// there was nothing yet to revert to (a local-only file the offerer
+// doesn't have — see applyLocallyModified in apply.go). Session keeps a
+// log of these (Session.LocallyModifiedWarnings) for Phase 8's API/UI to
+// surface.
+type LocallyModifiedWarning struct {
+	ShareID  string
+	RelPath  string
+	At       time.Time
+	Reverted bool
+	Reason   string
+}
 
 // ActionKind identifies what a reconciled Action instructs the caller (5b's
 // transfer/apply layer) to do.

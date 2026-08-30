@@ -92,6 +92,22 @@ type Session struct {
 	peerID string // the peer's ShortID
 	clock  Clock
 
+	// trash is this Session's trash can (SPEC.md §7). Set via SetTrash;
+	// nil until then, in which case trashHook is a no-op (see apply.go) —
+	// so a Session is still fully usable in tests/contexts that don't
+	// care about trash, exactly as before Phase 6.
+	trash *Trash
+
+	// warningsMu/warnings record every LocallyModifiedWarning this Session
+	// has raised (SPEC.md §1/§5's receive-only "flagged as locally
+	// modified" UI warning), for a caller (Phase 8's API) to read back.
+	// onLocallyModified, if set via SetLocallyModifiedHandler, is called
+	// with each warning as it's recorded, in addition to it being kept
+	// here.
+	warningsMu        sync.Mutex
+	warnings          []LocallyModifiedWarning
+	onLocallyModified func(LocallyModifiedWarning)
+
 	logger *log.Logger
 
 	sharesMu sync.RWMutex
@@ -171,6 +187,46 @@ func (s *Session) AddShare(cfg ShareConfig) {
 	s.sharesMu.Lock()
 	s.shares[cfg.ShareID] = &c
 	s.sharesMu.Unlock()
+}
+
+// SetTrash configures the Trash this Session's trashHook uses (SPEC.md
+// §7). Safe to call before or after Start; nil (the default) makes
+// trashHook a no-op.
+func (s *Session) SetTrash(tr *Trash) {
+	s.trash = tr
+}
+
+// SetLocallyModifiedHandler registers fn to be called synchronously, from
+// whichever goroutine is applying the action, every time this Session
+// records a LocallyModifiedWarning (SPEC.md §1/§5). Phase 8's API layer
+// uses this to surface the warning live rather than only polling
+// LocallyModifiedWarnings. Safe to call before or after Start.
+func (s *Session) SetLocallyModifiedHandler(fn func(LocallyModifiedWarning)) {
+	s.warningsMu.Lock()
+	s.onLocallyModified = fn
+	s.warningsMu.Unlock()
+}
+
+// LocallyModifiedWarnings returns a snapshot of every LocallyModifiedWarning
+// recorded so far, oldest first.
+func (s *Session) LocallyModifiedWarnings() []LocallyModifiedWarning {
+	s.warningsMu.Lock()
+	defer s.warningsMu.Unlock()
+	out := make([]LocallyModifiedWarning, len(s.warnings))
+	copy(out, s.warnings)
+	return out
+}
+
+// recordWarning appends w to the session's warning log and, if set, calls
+// the registered handler.
+func (s *Session) recordWarning(w LocallyModifiedWarning) {
+	s.warningsMu.Lock()
+	s.warnings = append(s.warnings, w)
+	handler := s.onLocallyModified
+	s.warningsMu.Unlock()
+	if handler != nil {
+		handler(w)
+	}
 }
 
 func (s *Session) getShare(shareID string) (ShareConfig, bool) {

@@ -32,7 +32,7 @@ var commands = []command{
 	{name: "remote", usage: "syncat remote ls", summary: "list peers' offered shares"},
 	{name: "subscribe", usage: "syncat subscribe PEER SHARE LOCALPATH [--mode mirror|receive]", summary: "sync a peer's share locally"},
 	{name: "approvals", usage: "syncat approvals [grant|deny ID]", summary: "manage pending approvals"},
-	{name: "trash", usage: "syncat trash ls|restore SHARE [PATH]", summary: "browse/restore trashed files"},
+	{name: "trash", usage: "syncat trash ls SHARE | restore SHARE PATH", summary: "browse/restore trashed files", implemented: true, run: cmdTrash},
 }
 
 func main() {

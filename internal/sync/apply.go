@@ -24,11 +24,11 @@ func (s *Session) applyAction(ctx context.Context, cfg ShareConfig, a Action) ([
 	now := time.Now()
 
 	switch a.Kind {
-	case ActionNone, ActionLocallyModified:
-		if a.Kind == ActionLocallyModified {
-			s.logf("locally modified under receive-only subscription: %s/%s (%s)", cfg.ShareID, a.RelPath, a.Reason)
-		}
+	case ActionNone:
 		return nil, nil
+
+	case ActionLocallyModified:
+		return s.applyLocallyModified(ctx, cfg, a, now)
 
 	case ActionPull:
 		if a.Source == SourceRemote {
@@ -68,6 +68,55 @@ func (s *Session) applyAction(ctx context.Context, cfg ShareConfig, a Action) ([
 	}
 }
 
+// applyLocallyModified executes an ActionLocallyModified: SPEC.md §1's
+// receive-only revert. A receive-only subscriber's local edit is never
+// propagated outward (that's what OutboundBlocked already prevents in
+// reconcile.go); this is the other half — reverting the local edit itself
+// once the offerer's own copy has something new to overwrite it with.
+//
+// reconcile.go raises ActionLocallyModified in two situations, only one of
+// which carries real remote content to revert to:
+//
+//   - a.Source == SourceRemote: the offerer's copy is concurrently
+//     different from ours (reconcileConcurrent's receive-only branch).
+//     a.Resolved is the offerer's current content — exactly what SPEC.md
+//     §1 says to overwrite the local edit with "after a trash copy is
+//     taken". This goes through pullAndInstall exactly like an ordinary
+//     ActionPull would, which is what actually takes the trash copy (via
+//     the same trashHook call site every other overwrite uses) before the
+//     new content lands — so the abort-on-trash-failure guarantee applies
+//     here for free, with no separate code path to keep in sync.
+//   - a.Source == SourceNone (reconcileOne's !hasRemote branch): a file
+//     that exists only locally under a receive-only subscription. The
+//     offerer has no corresponding content at all yet, so there is
+//     nothing to revert *to* — SPEC.md §1 only promises a revert "when the
+//     offerer's copy next changes", which hasn't happened. This case is
+//     flagged (recorded as a warning) but left on disk untouched; a later
+//     IndexUpdate that gives the offerer's side real content for this
+//     relpath will re-reconcile as the SourceRemote case above.
+func (s *Session) applyLocallyModified(ctx context.Context, cfg ShareConfig, a Action, now time.Time) ([]index.FileRow, error) {
+	w := LocallyModifiedWarning{
+		ShareID: cfg.ShareID,
+		RelPath: a.RelPath,
+		At:      now,
+		Reason:  a.Reason,
+	}
+
+	if a.Source != SourceRemote {
+		s.logf("locally modified, flagged only (no offerer content to revert to yet): %s/%s (%s)", cfg.ShareID, a.RelPath, a.Reason)
+		s.recordWarning(w)
+		return nil, nil
+	}
+
+	s.logf("locally modified under receive-only subscription, reverting via trash: %s/%s (%s)", cfg.ShareID, a.RelPath, a.Reason)
+	if err := s.pullAndInstall(ctx, cfg.ShareID, cfg.Root, a.RelPath, a.RelPath, a.Resolved); err != nil {
+		return nil, fmt.Errorf("sync: revert locally modified %s: %w", a.RelPath, err)
+	}
+	w.Reverted = true
+	s.recordWarning(w)
+	return []index.FileRow{index.FileRowFromInfo(cfg.ShareID, a.Resolved, now)}, nil
+}
+
 // applyDelete removes relpath from the filesystem, if present, and reports
 // whether the delete actually happened (false for a non-empty directory,
 // which SPEC.md §5 says to keep). Idempotent: a relpath that's already
@@ -98,12 +147,13 @@ func (s *Session) applyDelete(ctx context.Context, cfg ShareConfig, relpath stri
 		return true, nil
 	}
 
-	// --- trash hook (Phase 6, SPEC.md §7) ---
-	// This is the one place a file/symlink is discarded on a peer's
-	// behalf via a delete. Phase 6 replaces trashHook's body with a
-	// rename into <datadir>/trash/<share-id>/<relpath>.<unix-ts>; nothing
-	// else here needs to change.
-	if err := trashHook(ctx, cfg.ShareID, relpath, absPath); err != nil {
+	// --- trash hook (SPEC.md §7) ---
+	// The one place a file/symlink is discarded on a peer's behalf via a
+	// delete: moved into <datadir>/trash/<share-id>/<relpath>.<unix-ts>
+	// (Trash.Put) before the remove below ever runs. A trash failure
+	// aborts here, before anything is removed, rather than risking data
+	// loss because the safety net itself failed.
+	if err := s.trashHook(ctx, cfg.ShareID, relpath, absPath); err != nil {
 		return false, fmt.Errorf("sync: delete %s: trash: %w", relpath, err)
 	}
 
@@ -267,7 +317,7 @@ func (s *Session) pullAndInstall(ctx context.Context, shareID, root, wireRelPath
 		if err != nil {
 			return fmt.Errorf("sync: install symlink %s: read target: %w", destRelPath, err)
 		}
-		if err := replaceWithTrashHook(ctx, shareID, destRelPath, destAbs); err != nil {
+		if err := s.replaceWithTrashHook(ctx, shareID, destRelPath, destAbs); err != nil {
 			return err
 		}
 		if err := os.Symlink(string(target), destAbs); err != nil {
@@ -293,12 +343,15 @@ func (s *Session) pullAndInstall(ctx context.Context, shareID, root, wireRelPath
 		return fmt.Errorf("sync: install %s: chtimes: %w", destRelPath, err)
 	}
 
-	// --- trash hook (Phase 6, SPEC.md §7) ---
+	// --- trash hook (SPEC.md §7) ---
 	// destAbs may already exist here (we're overwriting a file the peer's
-	// version dominates, or resolving a conflict's winner). This is the
-	// other place — alongside applyDelete's — old content is discarded on
-	// a peer's behalf; Phase 6 fills in trashHook the same way there.
-	if err := trashHook(ctx, shareID, destRelPath, destAbs); err != nil {
+	// version dominates, resolving a conflict's winner, or reverting a
+	// receive-only subscriber's local edit). This is the other place —
+	// alongside applyDelete's — old content is discarded on a peer's
+	// behalf, and it runs strictly before the rename below: a trash
+	// failure returns here and the rename never happens, so the original
+	// content is never destroyed just because the safety net failed.
+	if err := s.trashHook(ctx, shareID, destRelPath, destAbs); err != nil {
 		return fmt.Errorf("sync: install %s: trash: %w", destRelPath, err)
 	}
 
@@ -312,9 +365,9 @@ func (s *Session) pullAndInstall(ctx context.Context, shareID, root, wireRelPath
 // replaceWithTrashHook removes an existing destAbs (if any) via the same
 // trash hook as the regular file path, ahead of an os.Symlink call, which
 // unlike os.Rename cannot itself overwrite an existing path.
-func replaceWithTrashHook(ctx context.Context, shareID, relpath, destAbs string) error {
+func (s *Session) replaceWithTrashHook(ctx context.Context, shareID, relpath, destAbs string) error {
 	if _, err := os.Lstat(destAbs); err == nil {
-		if err := trashHook(ctx, shareID, relpath, destAbs); err != nil {
+		if err := s.trashHook(ctx, shareID, relpath, destAbs); err != nil {
 			return fmt.Errorf("sync: install symlink %s: trash: %w", relpath, err)
 		}
 		if err := os.Remove(destAbs); err != nil && !os.IsNotExist(err) {
@@ -326,24 +379,24 @@ func replaceWithTrashHook(ctx context.Context, shareID, relpath, destAbs string)
 	return nil
 }
 
-// trashHook is the single, obvious slot Phase 6 plugs "move old content to
-// trash before overwrite/delete" (SPEC.md §7) into. It's called
-// immediately before every destructive operation that discards existing
-// destination content on a peer's behalf: applyDelete's os.Remove, and
+// trashHook is the single, obvious slot "move old content to trash before
+// overwrite/delete" (SPEC.md §7) plugs into. It's called immediately
+// before every destructive operation that discards existing destination
+// content on a peer's behalf: applyDelete's os.Remove, and
 // pullAndInstall's overwrite (both the rename-into-place path and the
 // symlink-replace path via replaceWithTrashHook). destAbs may or may not
-// currently exist — trashHook is expected to no-op when it doesn't, the
-// same as its future Phase 6 implementation will.
+// currently exist — Trash.Put no-ops when it doesn't.
 //
-// Today this is a no-op: trash is out of scope for Phase 5b. Phase 6
-// replaces the body with a rename (same filesystem) or copy+delete (cross
-// filesystem) of destAbs into
-// <datadir>/trash/<share-id>/<relpath>.<unix-ts>, and nothing else in this
-// file needs to change.
-func trashHook(ctx context.Context, shareID, relpath, destAbs string) error {
-	_ = ctx
-	_ = shareID
-	_ = relpath
-	_ = destAbs
-	return nil
+// If s.trash is nil (no Trash configured — e.g. a test exercising apply
+// logic that doesn't care about trash, or trash deliberately disabled),
+// this is a no-op, matching this hook's pre-Phase-6 behavior. Once a Trash
+// is set via SetTrash, every call site above gets real trash-can behavior
+// with no further change to this file: the hook always runs strictly
+// before its caller's destructive step, and an error here aborts that
+// step rather than proceeding to destroy data.
+func (s *Session) trashHook(ctx context.Context, shareID, relpath, destAbs string) error {
+	if s.trash == nil {
+		return nil
+	}
+	return s.trash.Put(ctx, shareID, relpath, destAbs)
 }

@@ -652,3 +652,165 @@ func TestIntegration_ConcurrentPullLimit(t *testing.T) {
 	}
 	t.Logf("peak concurrent pulls observed: %d (limit %d)", peak, maxConcurrentPulls)
 }
+
+// 10. Receive-only revert (SPEC.md §1, §5, §7): a subscriber's local edit
+// to a receive-only share is trashed and overwritten the next time the
+// offerer's own copy changes, and the revert is recorded as a warning.
+func TestIntegration_ReceiveOnlyRevertsLocalEditViaTrash(t *testing.T) {
+	offerer := newTestNode(t, "aaaaaaaaaaaaaaaa")
+	subscriber := newTestNode(t, "bbbbbbbbbbbbbbbb")
+
+	writeFile(t, offerer.root, "notes.txt", "v1 from offerer")
+	indexFile(t, offerer.store, offerer.id, "notes.txt", offerer.root)
+
+	dirOfferer := DirectionFor(config.PermissionReadWrite, "")
+	dirSubscriber := DirectionFor("", config.ModeReceiveOnly)
+
+	sOfferer, sSubscriber := connectSessions(t, offerer, subscriber, dirOfferer, dirSubscriber)
+	tr := NewTrash(filepath.Join(t.TempDir(), "trash"), nil)
+	sSubscriber.SetTrash(tr)
+
+	mustSync(t, sOfferer, testShareID)
+	mustSync(t, sSubscriber, testShareID)
+
+	waitFor(t, 5*time.Second, func() bool {
+		data, err := os.ReadFile(filepath.Join(subscriber.root, "notes.txt"))
+		return err == nil && string(data) == "v1 from offerer"
+	})
+
+	// Subscriber edits its local copy. Under receive-only this is never
+	// sent outward (mustSync/SyncShare is a no-op for an OutboundBlocked
+	// share; see cfg.Direction.OutboundBlocked in SyncShare), so it just
+	// sits locally, diverging from the offerer's version.
+	writeFile(t, subscriber.root, "notes.txt", "edited locally by subscriber")
+	indexFile(t, subscriber.store, subscriber.id, "notes.txt", subscriber.root)
+	mustSync(t, sSubscriber, testShareID) // no-op under receive-only; asserts nothing breaks calling it anyway
+
+	// The offerer's own copy now changes — this is the trigger SPEC.md §1
+	// promises the revert on. Sending it reaches the subscriber as a
+	// concurrent divergence (offerer's new version doesn't know about the
+	// subscriber's local bump, and vice versa).
+	writeFile(t, offerer.root, "notes.txt", "v2 from offerer")
+	indexFile(t, offerer.store, offerer.id, "notes.txt", offerer.root)
+	mustSync(t, sOfferer, testShareID)
+
+	waitFor(t, 5*time.Second, func() bool {
+		data, err := os.ReadFile(filepath.Join(subscriber.root, "notes.txt"))
+		return err == nil && string(data) == "v2 from offerer"
+	})
+
+	// The subscriber's locally-modified content must have been trashed,
+	// not just discarded.
+	entries, err := tr.List(testShareID)
+	if err != nil {
+		t.Fatalf("trash List: %v", err)
+	}
+	if len(entries) != 1 || entries[0].RelPath != "notes.txt" {
+		t.Fatalf("expected exactly one trashed notes.txt entry, got %+v", entries)
+	}
+	trashedData, err := os.ReadFile(entries[0].trashAbs)
+	if err != nil {
+		t.Fatalf("read trashed copy: %v", err)
+	}
+	if string(trashedData) != "edited locally by subscriber" {
+		t.Fatalf("trashed content = %q, want the subscriber's local edit", trashedData)
+	}
+
+	// And a warning was recorded for the UI (Phase 8).
+	warnings := sSubscriber.LocallyModifiedWarnings()
+	if len(warnings) == 0 {
+		t.Fatal("expected at least one LocallyModifiedWarning to be recorded")
+	}
+	found := false
+	for _, w := range warnings {
+		if w.RelPath == "notes.txt" && w.Reverted {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected a Reverted warning for notes.txt, got %+v", warnings)
+	}
+}
+
+// 11. Restore propagates as a new change (SPEC.md §7): a file trashed by a
+// remote-initiated delete is restored, and the restore reaches the peer
+// through the normal sync pipeline because restoring bumps the local
+// version.
+func TestIntegration_RestorePropagatesAsNewChange(t *testing.T) {
+	a := newTestNode(t, "aaaaaaaaaaaaaaaa")
+	b := newTestNode(t, "bbbbbbbbbbbbbbbb")
+
+	writeFile(t, a.root, "keepme.txt", "original content")
+	indexFile(t, a.store, a.id, "keepme.txt", a.root)
+
+	sa, sb := connectSessions(t, a, b, Direction{}, Direction{})
+	tr := NewTrash(filepath.Join(t.TempDir(), "trash"), nil)
+	sa.SetTrash(tr)
+
+	mustSync(t, sa, testShareID)
+	mustSync(t, sb, testShareID)
+
+	waitFor(t, 5*time.Second, func() bool {
+		data, err := os.ReadFile(filepath.Join(b.root, "keepme.txt"))
+		return err == nil && string(data) == "original content"
+	})
+
+	// B deletes the file and that delete propagates to A, which — being a
+	// remote-initiated delete — trashes A's copy first.
+	if err := os.Remove(filepath.Join(b.root, "keepme.txt")); err != nil {
+		t.Fatal(err)
+	}
+	indexDelete(t, b.store, b.id, "keepme.txt")
+	mustSync(t, sb, testShareID)
+
+	waitFor(t, 5*time.Second, func() bool {
+		_, err := os.Stat(filepath.Join(a.root, "keepme.txt"))
+		return os.IsNotExist(err)
+	})
+	entries, err := tr.List(testShareID)
+	if err != nil {
+		t.Fatalf("trash List: %v", err)
+	}
+	if len(entries) != 1 || entries[0].RelPath != "keepme.txt" {
+		t.Fatalf("expected keepme.txt to be trashed on A, got %+v", entries)
+	}
+
+	// Restore on A: content comes back, and the version is bumped so it
+	// dominates the tombstone currently in A's index.
+	row, err := tr.Restore(context.Background(), a.store, a.id, a.root, entries[0])
+	if err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	if row.Deleted {
+		t.Fatal("restored row must not be a tombstone")
+	}
+	data, err := os.ReadFile(filepath.Join(a.root, "keepme.txt"))
+	if err != nil {
+		t.Fatalf("read restored file on A: %v", err)
+	}
+	if string(data) != "original content" {
+		t.Fatalf("restored content = %q", data)
+	}
+
+	// Propagate the restore, exactly as a real daemon's own
+	// change-detection (Phase 4's watcher/scanner, not wired into this
+	// package's own tests — see indexFile's doc comment) would trigger a
+	// SyncShare after noticing the local change.
+	mustSync(t, sa, testShareID)
+
+	waitFor(t, 5*time.Second, func() bool {
+		data, err := os.ReadFile(filepath.Join(b.root, "keepme.txt"))
+		return err == nil && string(data) == "original content"
+	})
+
+	bRow, err := b.store.GetFile(context.Background(), testShareID, "keepme.txt")
+	if err != nil {
+		t.Fatalf("get b's row: %v", err)
+	}
+	if bRow.Deleted {
+		t.Fatal("B's row should no longer be a tombstone after the restore propagated")
+	}
+	if !Equal(bRow.Version, row.Version) {
+		t.Fatalf("B's version %v does not match A's restored version %v", bRow.Version, row.Version)
+	}
+}
