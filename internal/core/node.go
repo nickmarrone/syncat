@@ -955,3 +955,79 @@ func (n *Node) RenameNode(name string) error {
 	}
 	return nil
 }
+
+// --- trash (SPEC.md §7) -----------------------------------------------------
+
+// shareOrSubscriptionRoot resolves shareID to the local directory its
+// trash entries live under: the share's own path if this node offers it,
+// or the local subscription path if this node subscribes to it from a
+// peer. Mirrors cmd/syncat's offline shareRootFor helper, but reads the
+// live in-memory config under cfgMu instead of a freshly loaded file.
+func (n *Node) shareOrSubscriptionRoot(shareID string) (string, error) {
+	n.cfgMu.RLock()
+	defer n.cfgMu.RUnlock()
+	for _, s := range n.cfg.Shares {
+		if s.ID == shareID {
+			return s.Path, nil
+		}
+	}
+	for _, sub := range n.cfg.Subscriptions {
+		if sub.ShareID == shareID {
+			return sub.LocalPath, nil
+		}
+	}
+	return "", fmt.Errorf("share %s is not a local share or subscription", shareID)
+}
+
+// ListTrash returns every trashed entry for shareID (SPEC.md §7),
+// most-recently-trashed first. shareID must be a locally offered share or
+// subscription; an empty result (not an error) means nothing has been
+// trashed for it yet.
+func (n *Node) ListTrash(shareID string) ([]syncsvc.Entry, error) {
+	if _, err := n.shareOrSubscriptionRoot(shareID); err != nil {
+		return nil, fmt.Errorf("core: list trash: %w", err)
+	}
+	entries, err := n.trash.List(shareID)
+	if err != nil {
+		return nil, fmt.Errorf("core: list trash: %w", err)
+	}
+	return entries, nil
+}
+
+// RestoreTrash restores the most-recently-trashed entry for shareID/relPath
+// (SPEC.md §7): copies the trashed content back into the share's live root
+// with a bumped version vector, then triggers an immediate rescan so the
+// restore propagates to peers right away (unlike the offline `syncat
+// trash restore` path, which requires a later rescan since no daemon is
+// running to trigger one). Returns an error wrapping
+// syncsvc.ErrRestoreDestExists if the destination is already occupied.
+func (n *Node) RestoreTrash(ctx context.Context, shareID, relPath string) (index.FileRow, error) {
+	root, err := n.shareOrSubscriptionRoot(shareID)
+	if err != nil {
+		return index.FileRow{}, fmt.Errorf("core: restore trash: %w", err)
+	}
+
+	entries, err := n.trash.List(shareID)
+	if err != nil {
+		return index.FileRow{}, fmt.Errorf("core: restore trash: %w", err)
+	}
+	var match *syncsvc.Entry
+	for i := range entries {
+		if entries[i].RelPath == relPath {
+			match = &entries[i]
+			break
+		}
+	}
+	if match == nil {
+		return index.FileRow{}, fmt.Errorf("core: restore trash: no trashed entry %q for share %s", relPath, shareID)
+	}
+
+	row, err := n.trash.Restore(ctx, n.store, n.identity.ShortID(), root, *match)
+	if err != nil {
+		return index.FileRow{}, fmt.Errorf("core: restore trash: %w", err)
+	}
+	if err := n.rescanShare(ctx, shareID); err != nil {
+		n.logger.Printf("core: restore trash: rescan %s after restore: %v", shareID, err)
+	}
+	return row, nil
+}
