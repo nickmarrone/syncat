@@ -23,6 +23,16 @@ import (
 // (winning) dial of the time it needs to complete its handshake.
 const dedupLossPause = 2 * time.Second
 
+// dedupLossWarnAfter is how many consecutive dedup losses with nothing
+// ever adopted it takes before noteDedupLoss reports the condition, and
+// dedupLossLogEvery how many further losses between repeat log lines
+// (~1 minute apart, at dedupLossPause). The threshold is set well above
+// the one-or-two losses that normal startup racing produces.
+const (
+	dedupLossWarnAfter = 5
+	dedupLossLogEvery  = 30
+)
+
 // peerConn is one configured peer's connection state machine (SPEC.md
 // §2/§4): it drives the dial-with-backoff loop, adopts whichever
 // connection (dialed or accepted) wins SPEC.md §2.4's dedup rule, and
@@ -52,6 +62,7 @@ type peerConn struct {
 	enabled         bool
 	state           ConnState
 	lastErr         string
+	dedupLosses     int // consecutive dedup losses with nothing adopted; see noteDedupLoss
 	lastConnectedAt time.Time
 	connectedSince  time.Time
 	remoteName      string
@@ -159,6 +170,14 @@ func (pc *peerConn) dialAttempt(ctx context.Context) error {
 		// ever converging. A short pause here — still not counted as a
 		// failure, still not subject to the growing backoff schedule —
 		// is enough to let the peer's dial land.
+		//
+		// That pause assumes the peer's dial *does* eventually land. When
+		// it never does, this branch is the one place a peer can spin
+		// indefinitely while looking perfectly healthy: state stays
+		// "connecting", lastErr stays empty, and nothing is logged,
+		// because losing dedup is deliberately not an error. noteDedupLoss
+		// is what makes that state say so out loud.
+		pc.noteDedupLoss()
 		select {
 		case <-pc.node.clock.After(dedupLossPause):
 		case <-ctx.Done():
@@ -225,6 +244,7 @@ func (pc *peerConn) offer(ctx context.Context, conn net.Conn, result *protocol.H
 	pc.lastConnectedAt = pc.connectedSince
 	pc.remoteName = result.PeerName
 	pc.lastErr = ""
+	pc.dedupLosses = 0 // a connection was adopted (either direction) — see noteDedupLoss
 	done := pc.connDone
 	pc.mu.Unlock()
 
@@ -326,6 +346,54 @@ func (pc *peerConn) setErr(err error) {
 	pc.mu.Lock()
 	pc.state = ConnStateBackingOff
 	pc.lastErr = err.Error()
+	pc.mu.Unlock()
+}
+
+// noteDedupLoss records one outbound dial that authenticated but lost
+// SPEC.md §2.4's dedup rule, and reports the condition once it has
+// repeated enough times to mean something is wrong.
+//
+// A single loss — even a few — is entirely normal for the lower-keyed side
+// of a pairing: it means the peer is the one responsible for this
+// connection, and its own dial is expected to land within a beat, at which
+// point offer adopts it and resets this counter. What is not normal is
+// losing over and over with nothing ever adopted from either direction.
+// That is the signature of a peer we can reach but that cannot reach us
+// (so its winning dial never arrives), or of two nodes that disagree about
+// who the other is. Both used to present identically to a peer that was
+// simply offline: state "connecting", no error, no log line.
+//
+// This deliberately sets lastErr without touching state. The node really
+// is still connecting, and it is still correct for it to keep trying — the
+// only thing missing was a way to see why it never finishes.
+func (pc *peerConn) noteDedupLoss() {
+	pc.mu.Lock()
+	pc.dedupLosses++
+	losses := pc.dedupLosses
+	if losses >= dedupLossWarnAfter {
+		pc.lastErr = fmt.Sprintf("handshake succeeded but this connection lost the deduplication rule %d times in a row and the peer's own dial never arrived: the peer can be reached from here but may not be able to reach us, or may not have us configured as a peer", losses)
+	}
+	name := pc.name
+	pc.mu.Unlock()
+
+	// Log at the threshold, then only occasionally: this runs every
+	// dedupLossPause for as long as the condition lasts, so logging each
+	// time would bury everything else in a long-running daemon.
+	if losses == dedupLossWarnAfter || (losses > dedupLossWarnAfter && (losses-dedupLossWarnAfter)%dedupLossLogEvery == 0) {
+		pc.node.logger.Printf("core: peer %s (%s): dialed and authenticated %d times in a row without a connection being adopted; check that this node's token is configured on the peer", name, pc.peerShort, losses)
+	}
+}
+
+// disable stops pc from ever dialing and records why, for a peer that is
+// misconfigured badly enough that dialing it could not possibly succeed
+// (see Open's own-token check). The peerConn stays registered so the peer
+// remains visible — with reason attached — in `syncat peer ls` and the web
+// UI for as long as it is still in config.json.
+func (pc *peerConn) disable(reason string) {
+	pc.cancel()
+	pc.mu.Lock()
+	pc.state = ConnStateDisconnected
+	pc.lastErr = reason
 	pc.mu.Unlock()
 }
 

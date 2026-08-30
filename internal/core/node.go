@@ -295,6 +295,18 @@ func Open(ctx context.Context, opts Options) (*Node, error) {
 			continue
 		}
 		n.peers[pc.peerKeyHex] = pc
+		// AddPeer rejects our own token, but a config.json written before
+		// that check existed (or edited by hand) can still carry one, and
+		// dialing ourselves fails in a uniquely silent way: the handshake
+		// succeeds against our own server, then loses dedup forever
+		// because KeepConnection compares our key against itself. Register
+		// the peer anyway — so it stays visible in `syncat peer ls` rather
+		// than vanishing while it's still in config.json — but never dial.
+		if pc.peerKeyHex == n.PeerKey() {
+			logger.Printf("core: open: peer %q is configured with this node's own token; not dialing it. Run `syncat peer rm %s`, then add the other node's token.", p.Name, pc.peerKeyHex)
+			pc.disable("configured with this node's own token; remove it and add the other node's token")
+			continue
+		}
 		if p.Enabled {
 			n.goTracked(pc.runSupervisor)
 		}
@@ -535,6 +547,9 @@ func (n *Node) AddPeer(name, token string) (string, error) {
 		return "", fmt.Errorf("core: add peer: %w", err)
 	}
 	peerKeyHex := hex.EncodeToString(tok.ID)
+	if peerKeyHex == n.PeerKey() {
+		return "", fmt.Errorf("core: add peer: this is this node's own token — paste the token printed by `syncat token` on the *other* node")
+	}
 	if name == "" {
 		name = tok.Name
 	}
@@ -561,18 +576,69 @@ func (n *Node) AddPeer(name, token string) (string, error) {
 	return peerKeyHex, nil
 }
 
-// RemovePeer removes a configured peer and closes any active connection
-// to it.
+// RemovePeer removes a configured peer and every trace of it from the rest
+// of the config: subscriptions to its shares, and its entries in our own
+// shares' access lists. It also closes any active connection to it.
+//
+// The subscriptions go because a subscription names the peer that offers
+// the share (config.Subscription.Peer): once that peer is gone there is no
+// node left to sync it with, so leaving it configured would keep a watcher
+// running and keep it listed by `syncat status` forever, permanently
+// stuck. Removal is config-only, matching RemoveSubscription — the local
+// copy of the files stays on disk, it just stops being synced.
+//
+// The access entries go because config.Share.Access is keyed by the peer's
+// Ed25519 public key, and buildShareList reads that map directly with no
+// reference to whether the key still belongs to a configured peer. A
+// leftover "granted" is therefore not just clutter: re-adding that same
+// key later — the obvious thing to do after removing a peer by mistake, or
+// to re-pair after one side is rebuilt — would silently restore its
+// previous access to every share, with no new approval and nothing shown
+// to the user. Removing a peer should mean it starts from nothing if it
+// ever comes back.
 func (n *Node) RemovePeer(peerKeyHex string) error {
+	var droppedSubs []config.Subscription
+	var droppedAccess []string // share ids we revoked this peer's access to
 	if _, err := n.mutateConfig(func(cfg *config.Config) error {
 		i := findPeerIndex(cfg, peerKeyHex)
 		if i < 0 {
 			return fmt.Errorf("peer %s is not configured", peerKeyHex)
 		}
 		cfg.Peers = append(cfg.Peers[:i], cfg.Peers[i+1:]...)
+
+		kept := make([]config.Subscription, 0, len(cfg.Subscriptions))
+		for _, s := range cfg.Subscriptions {
+			if s.Peer == peerKeyHex {
+				droppedSubs = append(droppedSubs, s)
+				continue
+			}
+			kept = append(kept, s)
+		}
+		cfg.Subscriptions = kept
+
+		// Safe to mutate in place: mutateConfig hands us a clone whose
+		// Access maps are themselves freshly built (see cloneConfig).
+		for j := range cfg.Shares {
+			if _, ok := cfg.Shares[j].Access[peerKeyHex]; !ok {
+				continue
+			}
+			delete(cfg.Shares[j].Access, peerKeyHex)
+			droppedAccess = append(droppedAccess, cfg.Shares[j].ID)
+		}
 		return nil
 	}); err != nil {
 		return fmt.Errorf("core: remove peer: %w", err)
+	}
+
+	// No need to neuter these on the peer's live session the way
+	// RemoveSubscription does: cancelling pc below tears the whole session
+	// down anyway.
+	for _, s := range droppedSubs {
+		n.stopShareWatch(s.ShareID)
+		n.logger.Printf("core: remove peer %s: dropped subscription to share %s (local copy left at %s)", peerKeyHex, s.ShareID, s.LocalPath)
+	}
+	for _, shareID := range droppedAccess {
+		n.logger.Printf("core: remove peer %s: revoked its access to share %s", peerKeyHex, shareID)
 	}
 
 	n.peersMu.Lock()

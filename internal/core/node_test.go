@@ -1,21 +1,25 @@
 package core
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/nickmarrone/syncat/internal/config"
+	"github.com/nickmarrone/syncat/internal/protocol"
 	"github.com/nickmarrone/syncat/internal/transport"
 )
 
@@ -667,5 +671,364 @@ func TestLifecycleNoGoroutineLeak(t *testing.T) {
 	}
 	if !ok {
 		t.Fatalf("goroutine leak: before=%d after=%d", before, after)
+	}
+}
+
+// TestAddPeerRejectsOwnToken covers the mistake that motivated the check:
+// the peering flow is symmetric ("run `syncat token` on each node, paste
+// each into the other"), so pasting a node's own token back into itself is
+// easy to do and used to be accepted silently. The resulting peer could
+// never connect — the node dialed its own tailcat server, handshook with
+// itself, and then lost dedup forever because KeepConnection compared its
+// key against itself — while reporting only "connecting", with no error.
+func TestAddPeerRejectsOwnToken(t *testing.T) {
+	n := newTestNode(t, "solo")
+
+	if _, err := n.AddPeer("myself", peerToken(t, n)); err == nil {
+		t.Fatal("AddPeer accepted this node's own token; want an error")
+	} else if !strings.Contains(err.Error(), "own token") {
+		t.Errorf("AddPeer error = %q, want it to mention the token being this node's own", err)
+	}
+
+	if peers := n.Status().Peers; len(peers) != 0 {
+		t.Errorf("Status().Peers = %d entries after the rejected AddPeer, want 0", len(peers))
+	}
+	if subs := n.Status().Subscriptions; len(subs) != 0 {
+		t.Errorf("Status().Subscriptions = %d entries, want 0", len(subs))
+	}
+}
+
+// TestOpenDoesNotDialOwnToken covers the same misconfiguration arriving
+// from disk rather than through AddPeer — a config.json written before that
+// check existed, or edited by hand. The peer must stay listed (it is still
+// in config.json, and hiding it would make it unremovable through the UI)
+// but must never be dialed, and must say why.
+func TestOpenDoesNotDialOwnToken(t *testing.T) {
+	dir := t.TempDir()
+	paths, err := config.ResolvePaths(filepath.Join(dir, "config"), filepath.Join(dir, "data"))
+	if err != nil {
+		t.Fatalf("resolve paths: %v", err)
+	}
+	if err := paths.EnsureDirs(); err != nil {
+		t.Fatalf("ensure dirs: %v", err)
+	}
+	identity, _, err := config.LoadOrCreateIdentityKey(paths.IdentityKeyFile())
+	if err != nil {
+		t.Fatalf("load identity: %v", err)
+	}
+
+	addr := newPipeAddr(t)
+	ownToken, err := config.EncodeToken(addr, identity.Public(), "self")
+	if err != nil {
+		t.Fatalf("encode own token: %v", err)
+	}
+
+	cfg := config.Default()
+	cfg.NodeName = "self"
+	cfg.Peers = []config.Peer{{Name: "self", Token: ownToken, Enabled: true}}
+
+	n, err := Open(context.Background(), Options{
+		Paths:     paths,
+		Config:    cfg,
+		Identity:  identity,
+		Transport: transport.NewPipeTransport(addr),
+		Logger:    log.New(io.Discard, "", 0),
+	})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { n.Close() })
+
+	peers := n.Status().Peers
+	if len(peers) != 1 {
+		t.Fatalf("Status().Peers = %d entries, want the self-peer to stay listed", len(peers))
+	}
+	if peers[0].State == ConnStateConnected {
+		t.Errorf("self-peer state = %q, want it never to connect", peers[0].State)
+	}
+	if !strings.Contains(peers[0].LastError, "own token") {
+		t.Errorf("self-peer LastError = %q, want it to explain the own-token misconfiguration", peers[0].LastError)
+	}
+
+	// It must remain removable through the normal path.
+	if err := n.RemovePeer(n.PeerKey()); err != nil {
+		t.Fatalf("RemovePeer on the self-peer: %v", err)
+	}
+	if peers := n.Status().Peers; len(peers) != 0 {
+		t.Errorf("Status().Peers = %d entries after removal, want 0", len(peers))
+	}
+}
+
+// TestRemovePeerDropsSubscriptions confirms that removing a peer also
+// removes every subscription to that peer's shares. A subscription names
+// its offering peer, so one left behind could never sync again — it would
+// just sit in `syncat status` forever with a watcher still running. The
+// local copy of the files must survive, matching RemoveSubscription:
+// removal unsubscribes, it does not delete the user's data.
+func TestRemovePeerDropsSubscriptions(t *testing.T) {
+	nodeA := newTestNode(t, "nodeA")
+	nodeB := newTestNode(t, "nodeB")
+
+	shareDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(shareDir, "hello.txt"), []byte("hello from A"), 0o644); err != nil {
+		t.Fatalf("seed share file: %v", err)
+	}
+	shareID, err := nodeA.AddShare(shareDir, "docs", config.PermissionReadWrite, false)
+	if err != nil {
+		t.Fatalf("AddShare: %v", err)
+	}
+
+	tokenA, tokenB := peerToken(t, nodeA), peerToken(t, nodeB)
+	if _, err := nodeA.AddPeer("nodeB", tokenB); err != nil {
+		t.Fatalf("nodeA AddPeer: %v", err)
+	}
+	if _, err := nodeB.AddPeer("nodeA", tokenA); err != nil {
+		t.Fatalf("nodeB AddPeer: %v", err)
+	}
+	waitFor(t, 5*time.Second, func() bool { return peerConnected(nodeA) && peerConnected(nodeB) })
+
+	localDir := t.TempDir()
+	if err := nodeB.AddSubscription(nodeA.PeerKey(), shareID, localDir, config.ModeMirror); err != nil {
+		t.Fatalf("AddSubscription: %v", err)
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		data, err := os.ReadFile(filepath.Join(localDir, "hello.txt"))
+		return err == nil && string(data) == "hello from A"
+	})
+
+	// A second subscription, to a share offered by a *different* peer,
+	// must be left completely alone.
+	otherPeerKey := "ff" + strings.Repeat("00", 31)
+	otherDir := t.TempDir()
+	if err := nodeB.AddSubscription(otherPeerKey, "othershare", otherDir, config.ModeMirror); err != nil {
+		t.Fatalf("AddSubscription for the unrelated peer: %v", err)
+	}
+
+	if err := nodeB.RemovePeer(nodeA.PeerKey()); err != nil {
+		t.Fatalf("RemovePeer: %v", err)
+	}
+
+	subs := nodeB.Status().Subscriptions
+	if len(subs) != 1 {
+		t.Fatalf("Subscriptions after RemovePeer = %d, want only the unrelated peer's to remain: %+v", len(subs), subs)
+	}
+	if subs[0].ShareID != "othershare" {
+		t.Errorf("surviving subscription = %q, want the unrelated peer's %q", subs[0].ShareID, "othershare")
+	}
+
+	// The removed subscription's watcher is gone...
+	nodeB.sharesMu.Lock()
+	_, stillWatched := nodeB.shareWatches[shareID]
+	nodeB.sharesMu.Unlock()
+	if stillWatched {
+		t.Errorf("share watch for %s still running after its peer was removed", shareID)
+	}
+
+	// ...but the files it had already synced are still on disk.
+	data, err := os.ReadFile(filepath.Join(localDir, "hello.txt"))
+	if err != nil {
+		t.Fatalf("synced file was removed along with the subscription: %v", err)
+	}
+	if string(data) != "hello from A" {
+		t.Errorf("synced file contents = %q, want it left untouched", data)
+	}
+}
+
+// TestDedupLossIsReported covers the second silent failure mode from the
+// same investigation: a peer whose dial authenticates but always loses
+// SPEC.md §2.4's dedup rule, with the peer's own (winning) dial never
+// arriving. Losing dedup is deliberately not an error — Supervisor retries
+// with no backoff — so this used to look exactly like a peer that was
+// simply offline: state "connecting", LastError empty, nothing logged.
+//
+// The setup pins the outcome without depending on timing: `low` (the
+// lower-keyed node, so its own dial always loses) is given `high`'s real
+// address, while `high` is given `low`'s identity paired with a dead
+// address. So `high` accepts and authenticates `low`'s dial — then drops
+// it per dedup — but can never dial back.
+func TestDedupLossIsReported(t *testing.T) {
+	dir := t.TempDir()
+	logs := &lockedBuffer{}
+
+	open := func(name, addr string, peers []config.Peer, identity *config.IdentityKey, clock Clock) *Node {
+		t.Helper()
+		paths, err := config.ResolvePaths(filepath.Join(dir, name+"-config"), filepath.Join(dir, name+"-data"))
+		if err != nil {
+			t.Fatalf("resolve paths for %s: %v", name, err)
+		}
+		if err := paths.EnsureDirs(); err != nil {
+			t.Fatalf("ensure dirs for %s: %v", name, err)
+		}
+		cfg := config.Default()
+		cfg.NodeName = name
+		cfg.Peers = peers
+		n, err := Open(context.Background(), Options{
+			Paths:     paths,
+			Config:    cfg,
+			Identity:  identity,
+			Transport: transport.NewPipeTransport(addr),
+			Logger:    log.New(logs, "", 0),
+			Clock:     clock,
+		})
+		if err != nil {
+			t.Fatalf("open %s: %v", name, err)
+		}
+		t.Cleanup(func() { n.Close() })
+		return n
+	}
+
+	// Two identities, sorted so we know which side loses its own dial.
+	id1, _, err := config.LoadOrCreateIdentityKey(filepath.Join(t.TempDir(), "id1"))
+	if err != nil {
+		t.Fatalf("identity 1: %v", err)
+	}
+	id2, _, err := config.LoadOrCreateIdentityKey(filepath.Join(t.TempDir(), "id2"))
+	if err != nil {
+		t.Fatalf("identity 2: %v", err)
+	}
+	lowID, highID := id1, id2
+	if bytes.Compare(lowID.Public(), highID.Public()) > 0 {
+		lowID, highID = highID, lowID
+	}
+
+	lowAddr, highAddr := newPipeAddr(t), newPipeAddr(t)
+	highToken, err := config.EncodeToken(highAddr, highID.Public(), "high")
+	if err != nil {
+		t.Fatalf("encode high token: %v", err)
+	}
+	// low's identity, but an address nothing is listening on: high knows
+	// low well enough to authenticate it, and can never dial it.
+	lowTokenDeadAddr, err := config.EncodeToken(newPipeAddr(t), lowID.Public(), "low")
+	if err != nil {
+		t.Fatalf("encode low token: %v", err)
+	}
+
+	clock := newFakeClock(time.Unix(0, 0))
+	open("high", highAddr, []config.Peer{{Name: "low", Token: lowTokenDeadAddr, Enabled: true}}, highID, clock)
+	low := open("low", lowAddr, []config.Peer{{Name: "high", Token: highToken, Enabled: true}}, lowID, clock)
+
+	pc := low.lookupPeer(hex.EncodeToString(highID.Public()))
+	if pc == nil {
+		t.Fatal("low has no peerConn for high")
+	}
+
+	// Drive the clock until the losses pile up. Advancing also fires
+	// high's own backoff waits, which is fine — those dials fail and
+	// change nothing here.
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		pc.mu.Lock()
+		losses, lastErr := pc.dedupLosses, pc.lastErr
+		pc.mu.Unlock()
+		if losses >= dedupLossWarnAfter && lastErr != "" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d dedup losses recorded (want >=%d), lastErr=%q", losses, dedupLossWarnAfter, lastErr)
+		}
+		clock.Advance(dedupLossPause)
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	peers := low.Status().Peers
+	if len(peers) != 1 {
+		t.Fatalf("low Status().Peers = %d, want 1", len(peers))
+	}
+	if !strings.Contains(peers[0].LastError, "deduplication rule") {
+		t.Errorf("LastError = %q, want it to explain the repeated dedup losses", peers[0].LastError)
+	}
+	// The state is still "connecting": the node genuinely is still trying,
+	// and should be. Only the reason it never finishes is now visible.
+	if peers[0].State == ConnStateConnected {
+		t.Errorf("peer state = %q, want it not to be connected", peers[0].State)
+	}
+	if got := logs.String(); !strings.Contains(got, "without a connection being adopted") {
+		t.Errorf("no diagnostic logged for the stuck peer; log was:\n%s", got)
+	}
+}
+
+// lockedBuffer is a bytes.Buffer safe to read while a log.Logger writes to
+// it from the node's background goroutines.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// TestRemovePeerRevokesShareAccess covers the other half of removing a
+// peer: its entries in our own shares' access lists. config.Share.Access is
+// keyed by raw public key and buildShareList reads it without checking that
+// the key still belongs to a configured peer, so a leftover "granted" would
+// silently restore that peer's access to every share the moment the same
+// key was re-added — no approval, nothing surfaced. Other peers' grants on
+// the same share must survive.
+func TestRemovePeerRevokesShareAccess(t *testing.T) {
+	nodeA := newTestNode(t, "nodeA")
+	nodeB := newTestNode(t, "nodeB")
+
+	shareID, err := nodeA.AddShare(t.TempDir(), "docs", config.PermissionReadWrite, false)
+	if err != nil {
+		t.Fatalf("AddShare: %v", err)
+	}
+	if _, err := nodeA.AddPeer("nodeB", peerToken(t, nodeB)); err != nil {
+		t.Fatalf("AddPeer: %v", err)
+	}
+
+	otherPeerKey := "ff" + strings.Repeat("00", 31)
+	if err := nodeA.SetShareAccess(shareID, nodeB.PeerKey(), protocol.AccessGranted); err != nil {
+		t.Fatalf("SetShareAccess for nodeB: %v", err)
+	}
+	if err := nodeA.SetShareAccess(shareID, otherPeerKey, protocol.AccessGranted); err != nil {
+		t.Fatalf("SetShareAccess for the unrelated peer: %v", err)
+	}
+
+	accessFor := func(peerKey string) (string, bool) {
+		t.Helper()
+		for _, s := range nodeA.Status().Shares {
+			if s.ShareID != shareID {
+				continue
+			}
+			for _, a := range s.Access {
+				if a.PeerKey == peerKey {
+					return a.Access, true
+				}
+			}
+		}
+		return "", false
+	}
+
+	if got, ok := accessFor(nodeB.PeerKey()); !ok || got != protocol.AccessGranted {
+		t.Fatalf("nodeB access before removal = %q (present=%v), want %q", got, ok, protocol.AccessGranted)
+	}
+
+	if err := nodeA.RemovePeer(nodeB.PeerKey()); err != nil {
+		t.Fatalf("RemovePeer: %v", err)
+	}
+
+	if got, ok := accessFor(nodeB.PeerKey()); ok {
+		t.Errorf("removed peer still has %q access to share %s; want the entry gone", got, shareID)
+	}
+	if got, ok := accessFor(otherPeerKey); !ok || got != protocol.AccessGranted {
+		t.Errorf("unrelated peer's access = %q (present=%v), want it untouched at %q", got, ok, protocol.AccessGranted)
+	}
+
+	// The grant must not come back if the same key is re-added — the whole
+	// point of clearing it.
+	if _, err := nodeA.AddPeer("nodeB-again", peerToken(t, nodeB)); err != nil {
+		t.Fatalf("re-AddPeer: %v", err)
+	}
+	if got, ok := accessFor(nodeB.PeerKey()); ok {
+		t.Errorf("re-added peer regained %q access without a new grant", got)
 	}
 }
