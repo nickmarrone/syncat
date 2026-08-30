@@ -16,6 +16,13 @@ import (
 	"github.com/nickmarrone/syncat/internal/transport"
 )
 
+// dedupLossPause bounds how long dialAttempt waits before redialing after
+// losing SPEC.md §2.4's dedup rule on our own outbound dial. See
+// dialAttempt's "not adopted" branch for why this exists: without it, the
+// losing side's dial loop can redial fast enough to starve the peer's own
+// (winning) dial of the time it needs to complete its handshake.
+const dedupLossPause = 2 * time.Second
+
 // peerConn is one configured peer's connection state machine (SPEC.md
 // §2/§4): it drives the dial-with-backoff loop, adopts whichever
 // connection (dialed or accepted) wins SPEC.md §2.4's dedup rule, and
@@ -139,6 +146,23 @@ func (pc *peerConn) dialAttempt(ctx context.Context) error {
 		return err
 	}
 	if !adopted {
+		// We lost SPEC.md §2.4's dedup rule on our own dial: the peer has
+		// the higher key, so it's expected to complete this pairing's
+		// connection via its own dial to us instead. Supervisor.Run
+		// treats a nil error as success and retries with no backoff at
+		// all (deliberately — see this func's doc comment, "isn't a
+		// failure worth backing off from") — but redialing instantly,
+		// over and over, tears down and rebuilds the underlying
+		// tailcat/WireGuard session far faster than the peer's own dial
+		// can complete its handshake, so in practice the peer's dial
+		// never gets a clear window and both sides spin forever without
+		// ever converging. A short pause here — still not counted as a
+		// failure, still not subject to the growing backoff schedule —
+		// is enough to let the peer's dial land.
+		select {
+		case <-pc.node.clock.After(dedupLossPause):
+		case <-ctx.Done():
+		}
 		return nil
 	}
 
