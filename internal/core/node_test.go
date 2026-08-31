@@ -1315,3 +1315,67 @@ func TestRemovePeerResolvesRef(t *testing.T) {
 		t.Errorf("error = %v, want it to say the peer is not configured", err)
 	}
 }
+
+// TestDialFailureIsLogged covers the silence that made a wedged peer so
+// hard to diagnose. transport.Supervisor.Run does no logging of its own, so
+// a peer that could not dial out wrote nothing to any log — its error
+// reached `syncat status` as lastErr and nowhere else. In practice that
+// meant the node at fault said nothing at all, while the *other* node
+// filled its log with dedup-loss warnings about a dial that was never
+// coming.
+func TestDialFailureIsLogged(t *testing.T) {
+	dir := t.TempDir()
+	logs := &lockedBuffer{}
+
+	identity, _, err := config.LoadOrCreateIdentityKey(filepath.Join(dir, "id"))
+	if err != nil {
+		t.Fatalf("identity: %v", err)
+	}
+	peerIdentity, _, err := config.LoadOrCreateIdentityKey(filepath.Join(dir, "peer-id"))
+	if err != nil {
+		t.Fatalf("peer identity: %v", err)
+	}
+	// A well-formed token for an address nothing is listening on: the peer
+	// is configured and dialable in principle, and every dial fails.
+	token, err := config.EncodeToken(newPipeAddr(t), peerIdentity.Public(), "ghost")
+	if err != nil {
+		t.Fatalf("encode token: %v", err)
+	}
+
+	paths, err := config.ResolvePaths(filepath.Join(dir, "config"), filepath.Join(dir, "data"))
+	if err != nil {
+		t.Fatalf("resolve paths: %v", err)
+	}
+	if err := paths.EnsureDirs(); err != nil {
+		t.Fatalf("ensure dirs: %v", err)
+	}
+	cfg := config.Default()
+	cfg.NodeName = "node"
+	cfg.Peers = []config.Peer{{Name: "ghost", Token: token, Enabled: true}}
+
+	node, err := Open(context.Background(), Options{
+		Paths: paths, Config: cfg, Identity: identity,
+		Transport: transport.NewPipeTransport(newPipeAddr(t)),
+		Logger:    log.New(logs, "", 0), DisableJitter: true,
+	})
+	if err != nil {
+		t.Fatalf("open node: %v", err)
+	}
+	t.Cleanup(func() { node.Close() })
+
+	// The very first failure logs; no need to wait out a backoff schedule.
+	waitFor(t, 5*time.Second, func() bool {
+		return strings.Contains(logs.String(), "dial failed (1 in a row)")
+	})
+
+	peers := node.Status().Peers
+	if len(peers) != 1 {
+		t.Fatalf("Peers = %d, want 1", len(peers))
+	}
+	if peers[0].LastError == "" {
+		t.Error("LastError is empty; the failure must still reach `syncat status` too")
+	}
+	if peers[0].State != ConnStateBackingOff {
+		t.Errorf("state = %q, want %q", peers[0].State, ConnStateBackingOff)
+	}
+}

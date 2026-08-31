@@ -33,6 +33,10 @@ const (
 	dedupLossLogEvery  = 30
 )
 
+// dialFailureLogEvery is how many consecutive failed dials between repeat
+// log lines from noteDialFailure. The first failure always logs.
+const dialFailureLogEvery = 30
+
 // peerConn is one configured peer's connection state machine (SPEC.md
 // §2/§4): it drives the dial-with-backoff loop, adopts whichever
 // connection (dialed or accepted) wins SPEC.md §2.4's dedup rule, and
@@ -63,6 +67,7 @@ type peerConn struct {
 	state           ConnState
 	lastErr         string
 	dedupLosses     int // consecutive dedup losses with nothing adopted; see noteDedupLoss
+	dialFailures    int // consecutive failed dials/handshakes; see noteDialFailure
 	lastConnectedAt time.Time
 	connectedSince  time.Time
 	remoteName      string
@@ -136,7 +141,7 @@ func (pc *peerConn) dialAttempt(ctx context.Context) error {
 	pc.setState(ConnStateConnecting)
 	conn, err := pc.node.transport.Dial(ctx, connBlob)
 	if err != nil {
-		pc.setErr(err)
+		pc.noteDialFailure("dial", err)
 		return fmt.Errorf("dial: %w", err)
 	}
 
@@ -148,7 +153,7 @@ func (pc *peerConn) dialAttempt(ctx context.Context) error {
 	})
 	if err != nil {
 		conn.Close()
-		pc.setErr(err)
+		pc.noteDialFailure("handshake", err)
 		return fmt.Errorf("handshake: %w", err)
 	}
 
@@ -244,7 +249,8 @@ func (pc *peerConn) offer(ctx context.Context, conn net.Conn, result *protocol.H
 	pc.lastConnectedAt = pc.connectedSince
 	pc.remoteName = result.PeerName
 	pc.lastErr = ""
-	pc.dedupLosses = 0 // a connection was adopted (either direction) — see noteDedupLoss
+	pc.dedupLosses = 0  // a connection was adopted (either direction) — see noteDedupLoss
+	pc.dialFailures = 0 // ... and getting here means dialling works — see noteDialFailure
 	done := pc.connDone
 	pc.mu.Unlock()
 
@@ -342,11 +348,29 @@ func (pc *peerConn) setState(s ConnState) {
 	pc.mu.Unlock()
 }
 
-func (pc *peerConn) setErr(err error) {
+// noteDialFailure records one failed outbound dial or handshake: it moves
+// the peer to backing-off with err as its last error, and logs the failure.
+//
+// Rate-limited rather than silent or spammy. transport.Supervisor.Run
+// deliberately does no logging of its own, so before this existed a peer
+// that could not dial out produced *no log line at all* — the error reached
+// `syncat status` as lastErr and nowhere else. That is a bad way to find
+// out a link is down: this node looks like it is merely backing off, and
+// the only thing written to any log is on the *other* node, which keeps
+// dialing, authenticating, and losing SPEC.md §2.4's dedup rule while it
+// waits for the dial this node is failing to make.
+func (pc *peerConn) noteDialFailure(stage string, err error) {
 	pc.mu.Lock()
 	pc.state = ConnStateBackingOff
 	pc.lastErr = err.Error()
+	pc.dialFailures++
+	failures := pc.dialFailures
+	name := pc.name
 	pc.mu.Unlock()
+
+	if failures == 1 || failures%dialFailureLogEvery == 0 {
+		pc.node.logger.Printf("core: peer %s (%s): %s failed (%d in a row): %v", name, pc.peerShort, stage, failures, err)
+	}
 }
 
 // noteDedupLoss records one outbound dial that authenticated but lost

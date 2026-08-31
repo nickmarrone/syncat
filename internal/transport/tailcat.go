@@ -114,9 +114,58 @@ func (t *TailcatTransport) Dial(ctx context.Context, addr string) (net.Conn, err
 	// (via Client.up) until the server has acked us as a peer.
 	conn, err := c.DialTCPPort(ctx, SyncatPort)
 	if err != nil {
+		t.discardClient(addr, c)
 		return nil, fmt.Errorf("transport: tailcat: dial %s: %w", addr, err)
 	}
 	return conn, nil
+}
+
+// discardClient drops a cached Client after a failed dial and closes it, so
+// the next dial to addr builds a fresh one.
+//
+// This is what makes a peer restart recoverable. tailcat.Client.up latches:
+//
+//	func (c *Client) up(ctx context.Context) error {
+//		if c.upDone.Load() { return nil }  // set once, never cleared
+//		_, err := c.Ping(ctx)
+//		return err
+//	}
+//
+// and that Ping is the meow that tells the *server* to add us as a
+// WireGuard peer. So a cached Client which has meowed once never meows
+// again. When the peer restarts, its new process has no WireGuard peers at
+// all, and every later dial on the cached Client sends TCP into a tunnel
+// the far side will not accept — forever, because each retry reuses the
+// same latched Client.
+//
+// Observed as a striking asymmetry: restarting the *peer* wedged the link
+// permanently, while restarting *this* node fixed it (Close clears the
+// whole map). Nothing on this side said anything; the only visible symptom
+// was on the peer, which kept dialing, kept authenticating, and kept losing
+// SPEC.md §2.4's dedup rule with nothing ever adopted, because the dial
+// that was supposed to win was this one.
+//
+// Only failed dials discard. A healthy peer keeps its warm Client across
+// dials, which is the whole reason for caching.
+//
+// Closing matters as much as evicting: each Client owns a locoBackend with
+// its own WireGuard engine and DERP connections, so dropping one without
+// closing it would leak an engine per failed dial attempt.
+func (t *TailcatTransport) discardClient(addr string, c *tailcat.Client) {
+	t.clientsMu.Lock()
+	cached, ok := t.clients[addr]
+	if ok && cached == c {
+		delete(t.clients, addr)
+	} else {
+		// Another dial already discarded this one and installed a
+		// replacement; it owns closing what it removed.
+		c = nil
+	}
+	t.clientsMu.Unlock()
+
+	if c != nil {
+		_ = c.Close()
+	}
 }
 
 // clientFor returns the [tailcat.Client] for addr, creating and caching it

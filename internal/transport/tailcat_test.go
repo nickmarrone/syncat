@@ -238,3 +238,51 @@ func TestTailcatTransportStaysReachableAfterDialing(t *testing.T) {
 		t.Errorf("got %q, want %q", got, want)
 	}
 }
+
+// TestClientCacheDiscardsFailedDials pins the eviction that makes a peer
+// restart recoverable.
+//
+// tailcat.Client.up latches on upDone: the meow that tells the *server* to
+// add us as a WireGuard peer is sent once and never again. A Client cached
+// across a peer restart therefore dials into a tunnel whose far side has
+// forgotten us, forever, because every retry reuses the same latched
+// Client. Discarding on failure is what forces the next dial to build a
+// fresh Client and meow again.
+func TestClientCacheDiscardsFailedDials(t *testing.T) {
+	tr := NewTailcatTransport(tailcat.NewPrivateKey(), nil)
+	const addr = "tc-cache-test"
+
+	// Healthy peers must keep their warm Client — that is the point of
+	// caching, and only failed dials are supposed to discard.
+	first, err := tr.clientFor(addr)
+	if err != nil {
+		t.Fatalf("clientFor: %v", err)
+	}
+	again, err := tr.clientFor(addr)
+	if err != nil {
+		t.Fatalf("clientFor (second): %v", err)
+	}
+	if again != first {
+		t.Fatal("clientFor built a second Client for the same address; the cache is not reusing")
+	}
+
+	tr.discardClient(addr, first)
+	replacement, err := tr.clientFor(addr)
+	if err != nil {
+		t.Fatalf("clientFor after discard: %v", err)
+	}
+	if replacement == first {
+		t.Fatal("clientFor returned the discarded Client; a peer restart would stay wedged")
+	}
+
+	// A stale pointer must not evict whatever replaced it, or one slow
+	// failing dial could throw away a Client another dial just built.
+	tr.discardClient(addr, first)
+	still, err := tr.clientFor(addr)
+	if err != nil {
+		t.Fatalf("clientFor after stale discard: %v", err)
+	}
+	if still != replacement {
+		t.Fatal("a stale discard evicted the replacement Client")
+	}
+}
