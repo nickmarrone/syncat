@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -602,5 +603,94 @@ func TestHandshakeRejectsOwnMismatchedToken(t *testing.T) {
 	cfgA := HandshakeConfig{IdentityKey: privA, NodeName: "alice", Token: badTok, IsKnownPeer: acceptAll, Timeout: 5 * time.Second}
 	if _, err := Handshake(context.Background(), connA, cfgA); err == nil {
 		t.Fatal("Handshake accepted a Token whose id doesn't match our own IdentityKey")
+	}
+}
+
+// --- deadline hygiene ---------------------------------------------------
+
+// deadlineRecorder wraps a net.Conn and records every SetDeadline call, so
+// a test can assert what state the connection was left in.
+type deadlineRecorder struct {
+	net.Conn
+	mu       sync.Mutex
+	current  time.Time
+	sawArmed bool // a non-zero deadline was set at some point
+}
+
+func (c *deadlineRecorder) SetDeadline(t time.Time) error {
+	c.mu.Lock()
+	c.current = t
+	if !t.IsZero() {
+		c.sawArmed = true
+	}
+	c.mu.Unlock()
+	return c.Conn.SetDeadline(t)
+}
+
+func (c *deadlineRecorder) state() (current time.Time, sawArmed bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.current, c.sawArmed
+}
+
+// TestHandshakeClearsDeadlineOnSuccess pins the contract that a successful
+// Handshake hands conn back with no deadline armed.
+//
+// This is a regression test for a bug that no other test could see. The
+// deadline Handshake sets is an *absolute* time (handshakeStart+Timeout),
+// and callers keep conn for the entire life of the session that follows.
+// Left armed, it silently poisoned the connection 30s in: every Read and
+// Write started failing with os.ErrDeadlineExceeded on a perfectly healthy
+// link, the session's read loop exited without logging anything, and the
+// peer was torn down by SPEC.md §4's 90s dead rule and redialed — forever,
+// at a steady ~90s period.
+//
+// Nothing caught it because bufconn.go's Write deadline is a no-op and its
+// read deadline is only consulted against real wall-clock time, which no
+// in-memory test runs long enough to reach. Hence asserting on the
+// deadline directly rather than on downstream I/O.
+func TestHandshakeClearsDeadlineOnSuccess(t *testing.T) {
+	rawA, rawB := newPipeConnPair(t)
+	defer rawA.Close()
+	defer rawB.Close()
+	connA := &deadlineRecorder{Conn: rawA}
+	connB := &deadlineRecorder{Conn: rawB}
+
+	privA, pubA := newTestIdentity(t)
+	privB, pubB := newTestIdentity(t)
+
+	errA, errB := runBothHandshakes(t, connA, connB,
+		HandshakeConfig{
+			IdentityKey: privA,
+			NodeName:    "alice",
+			Token:       mustToken(t, pubA, "alice"),
+			IsKnownPeer: func(p ed25519.PublicKey) bool { return bytes.Equal(p, pubB) },
+		},
+		HandshakeConfig{
+			IdentityKey: privB,
+			NodeName:    "bob",
+			Token:       mustToken(t, pubB, "bob"),
+			IsKnownPeer: func(p ed25519.PublicKey) bool { return bytes.Equal(p, pubA) },
+		})
+	if errA != nil {
+		t.Fatalf("A's handshake: %v", errA)
+	}
+	if errB != nil {
+		t.Fatalf("B's handshake: %v", errB)
+	}
+
+	for _, tc := range []struct {
+		name string
+		conn *deadlineRecorder
+	}{{"dialer", connA}, {"accepter", connB}} {
+		current, sawArmed := tc.conn.state()
+		// Guard against this test passing vacuously if the bounding
+		// deadline is ever dropped from Handshake altogether.
+		if !sawArmed {
+			t.Errorf("%s: Handshake never armed a deadline; it is supposed to bound itself by cfg.Timeout", tc.name)
+		}
+		if !current.IsZero() {
+			t.Errorf("%s: Handshake left a deadline armed at %v; it must be cleared on success or it will poison every later Read/Write on this conn", tc.name, current)
+		}
 	}
 }

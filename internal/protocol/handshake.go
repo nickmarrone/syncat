@@ -106,9 +106,19 @@ type HandshakeResult struct {
 // The whole call is bounded by cfg.Timeout (default
 // DefaultHandshakeTimeout) and by ctx: conn's deadline is set for the
 // duration of the call, and a background goroutine forces it to expire
-// immediately if ctx is canceled first. The deadline is left expired (not
-// cleared) on return; callers that keep conn afterward should call
-// conn.SetDeadline(time.Time{}) themselves.
+// immediately if ctx is canceled first.
+//
+// On success the deadline is cleared before returning, so the caller gets
+// conn back exactly as it handed it over. This is not merely tidy: the
+// caller keeps conn for the whole life of the session that follows, and
+// the deadline set here is an *absolute* time. Leaving it armed silently
+// poisons the connection at handshakeStart+Timeout — every later Read and
+// Write fails with os.ErrDeadlineExceeded even though the connection is
+// perfectly healthy, which reads as a peer that connects, goes quiet, and
+// gets torn down by SPEC.md §4's 90s dead rule, over and over.
+//
+// On failure the deadline is left as-is; the caller owns conn and must
+// close it.
 func Handshake(ctx context.Context, conn net.Conn, cfg HandshakeConfig) (*HandshakeResult, error) {
 	if len(cfg.IdentityKey) != ed25519.PrivateKeySize {
 		return nil, fmt.Errorf("protocol: handshake: identity key must be %d bytes, got %d", ed25519.PrivateKeySize, len(cfg.IdentityKey))
@@ -142,7 +152,16 @@ func Handshake(ctx context.Context, conn net.Conn, cfg HandshakeConfig) (*Handsh
 	// promptly by pulling the deadline in to "now". The watcher goroutine
 	// always exits when Handshake returns, via stop.
 	stop := make(chan struct{})
-	defer close(stop)
+	stopped := false
+	// Only ever called on Handshake's own goroutine, so the bool needs no
+	// synchronisation.
+	stopWatcher := func() {
+		if !stopped {
+			stopped = true
+			close(stop)
+		}
+	}
+	defer stopWatcher()
 	go func() {
 		select {
 		case <-ctx.Done():
@@ -229,6 +248,17 @@ func Handshake(ctx context.Context, conn net.Conn, cfg HandshakeConfig) (*Handsh
 	if !ed25519.Verify(peerPub, authTranscript(ourNonce, peerHello.Nonce), peerAuth.Sig) {
 		sendError(fw, ErrCodeBadAuth, "signature verification failed")
 		return nil, errors.New("protocol: handshake: peer signature verification failed")
+	}
+
+	// Authenticated. Retire the ctx watcher and disarm the deadline before
+	// handing conn back — see this func's doc comment. Ordering matters:
+	// stopping the watcher first keeps it from re-arming the deadline
+	// behind us. (A cancel that has already been observed can still land
+	// after this, but that only happens when the node is shutting down and
+	// the session is being torn down anyway.)
+	stopWatcher()
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		return nil, fmt.Errorf("protocol: handshake: clear deadline: %w", err)
 	}
 
 	return &HandshakeResult{
