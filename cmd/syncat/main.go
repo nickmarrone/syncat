@@ -30,8 +30,7 @@ var commands = []command{
 	{name: "status", usage: "syncat status [--watch] [--json]", summary: "show node/peer/transfer status", implemented: true, run: cmdStatus},
 	{name: "share", usage: "syncat share add PATH --name N [--perm ro|rw] [--approval] | ls | rm ID | set ID [...]", summary: "manage local shares", implemented: true, run: cmdShare},
 	{name: "remote", usage: "syncat remote ls", summary: "list peers' offered shares", implemented: true, run: cmdRemote},
-	{name: "subscribe", usage: "syncat subscribe PEER SHARE LOCALPATH [--mode mirror|receive]", summary: "sync a peer's share locally (PEER/SHARE: name, id, or id prefix)", implemented: true, run: cmdSubscribe},
-	{name: "unsubscribe", usage: "syncat unsubscribe PEER SHARE", summary: "stop syncing a peer's share (local files are kept)", implemented: true, run: cmdUnsubscribe},
+	{name: "subscription", usage: "syncat subscription add PEER SHARE LOCALPATH [--mode mirror|receive] | ls | rm PEER SHARE | pause PEER SHARE | resume PEER SHARE", summary: "manage subscriptions to peers' shares (PEER/SHARE: name, id, or id prefix)", implemented: true, run: cmdSubscription},
 	{name: "approvals", usage: "syncat approvals [grant|deny ID]", summary: "manage pending approvals (not implemented — SPEC.md §2.3 is deferred)", implemented: true, run: cmdApprovals},
 	{name: "trash", usage: "syncat trash ls SHARE | restore SHARE PATH", summary: "browse/restore trashed files", implemented: true, run: cmdTrash},
 }

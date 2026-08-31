@@ -653,3 +653,62 @@ func TestSubscriptionsAddRejectsUnknownPeer(t *testing.T) {
 		t.Fatalf("subscriptions = %+v, want the rejected one not to be persisted", subs)
 	}
 }
+
+// TestSubscriptionsList covers the GET that completes the collection:
+// /api/peers and /api/shares have had one since Phase 8, and subscriptions
+// were the one collection you could create, modify and delete but never
+// enumerate — so `syncat subscription ls` had nothing to call.
+func TestSubscriptionsList(t *testing.T) {
+	srv, _, _ := newTestServer(t)
+
+	w := doRequest(t, srv, http.MethodGet, "/api/subscriptions", testToken, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+	var empty struct {
+		Subscriptions []subscriptionDTO `json:"subscriptions"`
+	}
+	decodeJSONBody(t, w, &empty)
+	if len(empty.Subscriptions) != 0 {
+		t.Fatalf("subscriptions = %+v, want none", empty.Subscriptions)
+	}
+
+	w = doRequest(t, srv, http.MethodPost, "/api/peers", testToken, map[string]string{"token": fakePeerToken(t, "bob"), "name": "bob"})
+	if w.Code != http.StatusCreated {
+		t.Fatalf("add peer: status = %d, want 201; body: %s", w.Code, w.Body.String())
+	}
+	var peer peerDTO
+	decodeJSONBody(t, w, &peer)
+
+	localDir := filepath.Join(t.TempDir(), "sub")
+	w = doRequest(t, srv, http.MethodPost, "/api/subscriptions", testToken, map[string]any{
+		"peer": peer.ID, "share_id": "bb22", "local_path": localDir, "mode": "mirror",
+	})
+	if w.Code != http.StatusCreated {
+		t.Fatalf("add subscription: status = %d, want 201; body: %s", w.Code, w.Body.String())
+	}
+
+	w = doRequest(t, srv, http.MethodGet, "/api/subscriptions", testToken, nil)
+	var resp struct {
+		Subscriptions []subscriptionDTO `json:"subscriptions"`
+	}
+	decodeJSONBody(t, w, &resp)
+	if len(resp.Subscriptions) != 1 {
+		t.Fatalf("subscriptions = %+v, want exactly one", resp.Subscriptions)
+	}
+	got := resp.Subscriptions[0]
+	if got.ID != peer.ID+":bb22" || got.ShareID != "bb22" || got.LocalPath != localDir || got.Mode != "mirror" {
+		t.Fatalf("unexpected subscription: %+v", got)
+	}
+
+	// A pause has to be visible here, or `subscription ls` cannot show it.
+	w = doRequest(t, srv, http.MethodPatch, "/api/subscriptions/"+got.ID, testToken, map[string]any{"paused": true})
+	if w.Code != http.StatusOK {
+		t.Fatalf("patch: status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+	w = doRequest(t, srv, http.MethodGet, "/api/subscriptions", testToken, nil)
+	decodeJSONBody(t, w, &resp)
+	if len(resp.Subscriptions) != 1 || !resp.Subscriptions[0].Paused {
+		t.Fatalf("subscriptions after pause = %+v, want one, paused", resp.Subscriptions)
+	}
+}

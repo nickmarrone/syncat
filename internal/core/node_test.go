@@ -1039,7 +1039,7 @@ func TestRemovePeerRevokesShareAccess(t *testing.T) {
 }
 
 // TestAddSubscriptionRejectsUnknownPeer covers the failure that motivated
-// resolve.go. `syncat subscribe PEER SHARE PATH` used to take only a hex
+// resolve.go. The subscribe command used to take only a hex
 // peer key while reading as though it took a display name, so "subscribe
 // nishinomiya test ./test/" is the natural thing to type — and it was
 // accepted verbatim. The resulting subscription was inert and silently so:

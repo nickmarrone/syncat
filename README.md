@@ -68,7 +68,7 @@ $ ./syncat --config ~/.alice-cfg --data ~/.alice-data status --watch
 # Alice offers a share, bob subscribes to it:
 $ ./syncat --config ~/.alice-cfg --data ~/.alice-data share add ~/Documents --name docs --perm rw
 $ ./syncat --config ~/.bob-cfg --data ~/.bob-data remote ls
-$ ./syncat --config ~/.bob-cfg --data ~/.bob-data subscribe <alice-peer-id> <share-id> ~/docs-from-alice --mode mirror
+$ ./syncat --config ~/.bob-cfg --data ~/.bob-data subscription add <alice-name-or-id> <share-name-or-id> ~/docs-from-alice --mode mirror
 ```
 
 Write a file under `~/Documents` on alice's side and it appears under

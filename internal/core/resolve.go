@@ -12,9 +12,10 @@ import (
 // public key, a 16-hex share id — and a readable display name shown right
 // beside it by `syncat peer ls` and `syncat remote ls`. Taking only the id
 // is a usability trap: the name is what a user reads, remembers, and types,
-// so `syncat subscribe nishinomiya test ./test/` is the natural command to
-// reach for, and until these resolvers existed it was accepted verbatim and
-// then failed silently forever (see AddSubscription's doc comment).
+// so `syncat subscription add nishinomiya test ./test/` is the natural
+// command to reach for, and until these resolvers existed it was accepted
+// verbatim and then failed silently forever (see AddSubscription's doc
+// comment).
 //
 // So a "ref" here is any of:
 //

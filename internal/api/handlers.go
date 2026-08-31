@@ -278,6 +278,18 @@ type patchSubscriptionRequest struct {
 	Mode   *string `json:"mode"`
 }
 
+// handleSubscriptionsList completes the collection: /api/peers and
+// /api/shares have both had a GET since Phase 8, and subscriptions were the
+// one collection you could create, modify and delete but never enumerate.
+func (s *Server) handleSubscriptionsList(w http.ResponseWriter, r *http.Request) {
+	st := s.node.Status()
+	subs := make([]subscriptionDTO, 0, len(st.Subscriptions))
+	for _, sub := range st.Subscriptions {
+		subs = append(subs, toSubscriptionDTO(sub))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"subscriptions": subs})
+}
+
 func (s *Server) handleSubscriptionsPatch(w http.ResponseWriter, r *http.Request) {
 	peerKey, shareID, ok := parseSubscriptionID(r.PathValue("id"))
 	if !ok {

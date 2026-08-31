@@ -3,7 +3,7 @@
 # syncat daemons, on separate config/data dirs and API ports, talking to
 # each other over real tailcat (DERP-relayed unless direct connectivity is
 # available). Exercises the product the way a user would: init, exchange
-# tokens, peer, share, subscribe, and then verify bidirectional sync,
+# tokens, peer, share, subscription, and then verify bidirectional sync,
 # delete/trash, and conflict resolution actually happen on disk.
 #
 # Usage: scripts/e2e.sh
@@ -210,7 +210,7 @@ ALICE_PEER_KEY="$(bob peer ls --json | jq -r '.[] | select(.name=="alice") | .id
 [ -n "$ALICE_PEER_KEY" ] || fail "could not determine alice's peer key from bob"
 
 log "Bob subscribes to alice's share in mirror mode (read-write + mirror => bidirectional, SPEC.md §1)"
-bob subscribe "$ALICE_PEER_KEY" "$SHARE_ID" "$BOB_SYNCDIR" --mode mirror
+bob subscription add "$ALICE_PEER_KEY" "$SHARE_ID" "$BOB_SYNCDIR" --mode mirror
 
 log "Alice writes a file; verifying it replicates to bob"
 echo "hello from alice" >"$ALICE_SHARE/hello.txt"

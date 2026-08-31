@@ -255,9 +255,10 @@ CLI (each maps 1:1 onto the API):
 syncat init [--name NAME]           syncat share add PATH --name N [--perm ro|rw] [--approval]
 syncat daemon [--api ADDR]          syncat share ls|rm|set
 syncat token                        syncat remote ls            # peers' offered shares
-syncat peer add TOKEN [--name N]    syncat subscribe PEER SHARE LOCALPATH [--mode mirror|receive]
-syncat peer ls|rm|approve           syncat approvals [grant|deny ID]
-syncat status [--watch]             syncat trash ls|restore SHARE [PATH]
+syncat peer add TOKEN [--name N]    syncat subscription add PEER SHARE LOCALPATH [--mode mirror|receive]
+syncat peer ls|rm|approve           syncat subscription ls|rm|pause|resume
+syncat status [--watch]             syncat approvals [grant|deny ID]
+                                    syncat trash ls|restore SHARE [PATH]
 ```
 
 ## 9. Web UI

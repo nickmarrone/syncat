@@ -145,6 +145,7 @@ func (s *Server) routes() {
 
 	s.mux.HandleFunc("GET /api/remote-shares", s.auth(s.handleRemoteShares))
 
+	s.mux.HandleFunc("GET /api/subscriptions", s.auth(s.handleSubscriptionsList))
 	s.mux.HandleFunc("POST /api/subscriptions", s.auth(s.handleSubscriptionsAdd))
 	s.mux.HandleFunc("PATCH /api/subscriptions/{id}", s.auth(s.handleSubscriptionsPatch))
 	s.mux.HandleFunc("DELETE /api/subscriptions/{id}", s.auth(s.handleSubscriptionsDelete))
