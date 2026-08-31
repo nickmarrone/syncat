@@ -6,9 +6,11 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -1377,5 +1379,96 @@ func TestDialFailureIsLogged(t *testing.T) {
 	}
 	if peers[0].State != ConnStateBackingOff {
 		t.Errorf("state = %q, want %q", peers[0].State, ConnStateBackingOff)
+	}
+}
+
+// deadlineProbeTransport records whether Dial was handed a context with a
+// deadline, then fails the dial.
+type deadlineProbeTransport struct {
+	transport.Transport
+	mu       sync.Mutex
+	dialed   bool
+	deadline time.Duration
+	hadOne   bool
+}
+
+func (t *deadlineProbeTransport) Dial(ctx context.Context, addr string) (net.Conn, error) {
+	deadline, ok := ctx.Deadline()
+	t.mu.Lock()
+	t.dialed = true
+	t.hadOne = ok
+	if ok {
+		t.deadline = time.Until(deadline)
+	}
+	t.mu.Unlock()
+	return nil, errors.New("probe: dial refused")
+}
+
+// TestDialIsBounded pins that a dial attempt carries a deadline.
+//
+// Supervisor.Run hands dialAttempt the peer's own long-lived context, so
+// before dialTimeout existed a dial had no deadline at all — and a dial into
+// a half-dead tailcat tunnel does not fail, it hangs: WireGuard retries its
+// handshake indefinitely while netstack retransmits the SYN behind it.
+//
+// That stalls every recovery path, because all of them are driven by a dial
+// *failing*. A hung dial never reaches the backoff schedule, never counts a
+// failure, and never reaches TailcatTransport.discardClient — the thing that
+// rebuilds the stale per-peer Client after a peer restarts. Observed as a
+// peer that stayed disconnected indefinitely after the *other* node
+// restarted, with its WireGuard handshake retrying forever in the log.
+//
+// Asserting on the deadline rather than on elapsed time keeps this a
+// millisecond test instead of a 30-second one.
+func TestDialIsBounded(t *testing.T) {
+	dir := t.TempDir()
+	identity, _, err := config.LoadOrCreateIdentityKey(filepath.Join(dir, "id"))
+	if err != nil {
+		t.Fatalf("identity: %v", err)
+	}
+	peerIdentity, _, err := config.LoadOrCreateIdentityKey(filepath.Join(dir, "peer-id"))
+	if err != nil {
+		t.Fatalf("peer identity: %v", err)
+	}
+	token, err := config.EncodeToken(newPipeAddr(t), peerIdentity.Public(), "ghost")
+	if err != nil {
+		t.Fatalf("encode token: %v", err)
+	}
+
+	paths, err := config.ResolvePaths(filepath.Join(dir, "config"), filepath.Join(dir, "data"))
+	if err != nil {
+		t.Fatalf("resolve paths: %v", err)
+	}
+	if err := paths.EnsureDirs(); err != nil {
+		t.Fatalf("ensure dirs: %v", err)
+	}
+	cfg := config.Default()
+	cfg.NodeName = "node"
+	cfg.Peers = []config.Peer{{Name: "ghost", Token: token, Enabled: true}}
+
+	probe := &deadlineProbeTransport{Transport: transport.NewPipeTransport(newPipeAddr(t))}
+	node, err := Open(context.Background(), Options{
+		Paths: paths, Config: cfg, Identity: identity, Transport: probe,
+		Logger: log.New(io.Discard, "", 0), DisableJitter: true,
+	})
+	if err != nil {
+		t.Fatalf("open node: %v", err)
+	}
+	t.Cleanup(func() { node.Close() })
+
+	waitFor(t, 5*time.Second, func() bool {
+		probe.mu.Lock()
+		defer probe.mu.Unlock()
+		return probe.dialed
+	})
+
+	probe.mu.Lock()
+	hadOne, remaining := probe.hadOne, probe.deadline
+	probe.mu.Unlock()
+	if !hadOne {
+		t.Fatal("Dial got a context with no deadline; a dial that hangs would wedge the peer forever")
+	}
+	if remaining <= 0 || remaining > dialTimeout {
+		t.Errorf("dial deadline is %v away, want (0, %v]", remaining, dialTimeout)
 	}
 }

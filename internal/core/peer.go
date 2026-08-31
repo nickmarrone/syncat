@@ -37,6 +37,28 @@ const (
 // log lines from noteDialFailure. The first failure always logs.
 const dialFailureLogEvery = 30
 
+// dialTimeout bounds one call to Transport.Dial.
+//
+// Supervisor.Run hands dialAttempt the peer's own long-lived context,
+// which is cancelled only on shutdown or peer removal, so without this a
+// dial has no deadline whatsoever — and a dial into a half-dead tunnel does
+// not fail, it *hangs*. tailcat's WireGuard session retries its handshake
+// forever ("Handshake did not complete after 5 seconds, retrying (try N)")
+// while netstack keeps retransmitting the SYN behind it, so Dial simply
+// never returns.
+//
+// That is worse than slow: every recovery path here is driven by a dial
+// *failing*. A dial that hangs never reaches the backoff schedule, never
+// increments the failure count, and never reaches
+// TailcatTransport.discardClient — which is what rebuilds the stale
+// per-peer Client after the peer restarts. One wedged dial pins the peer in
+// that state indefinitely.
+//
+// 30s is comfortably above a legitimate cold dial (a fresh Client needs a
+// DERP connection, ~3s, plus tailcat's own hard 10s meow-ping timeout)
+// while still giving up fast enough to retry with a fresh Client promptly.
+const dialTimeout = 30 * time.Second
+
 // peerConn is one configured peer's connection state machine (SPEC.md
 // §2/§4): it drives the dial-with-backoff loop, adopts whichever
 // connection (dialed or accepted) wins SPEC.md §2.4's dedup rule, and
@@ -139,7 +161,16 @@ func (pc *peerConn) dialAttempt(ctx context.Context) error {
 	pc.mu.Unlock()
 
 	pc.setState(ConnStateConnecting)
-	conn, err := pc.node.transport.Dial(ctx, connBlob)
+	// cancel() as soon as Dial returns, not on function exit: this ctx
+	// bounds the dial alone, and dialAttempt goes on to block for the whole
+	// life of the connection below.
+	// Real time, not node.clock: this bounds a network call inside
+	// Transport, which has no notion of the injected clock. No test dials
+	// slowly enough to reach it (PipeTransport fails an unroutable address
+	// immediately), so nothing here waits on wall-clock time.
+	dialCtx, cancel := context.WithTimeout(ctx, dialTimeout)
+	conn, err := pc.node.transport.Dial(dialCtx, connBlob)
+	cancel()
 	if err != nil {
 		pc.noteDialFailure("dial", err)
 		return fmt.Errorf("dial: %w", err)
