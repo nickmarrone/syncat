@@ -27,6 +27,17 @@ type Transport interface {
 	// or a registry key for [PipeTransport].
 	Dial(ctx context.Context, addr string) (net.Conn, error)
 
+	// DiscardPeer drops whatever per-peer state the transport has cached
+	// for addr, so the next Dial to it starts from scratch. Called when a
+	// connection to that peer has ended and anything cached for it should
+	// be assumed stale — notably tailcat's per-peer Client, whose "tell the
+	// server to add us as a WireGuard peer" handshake happens once per
+	// Client and never again (see TailcatTransport.discardClient).
+	//
+	// Must be safe to call for an addr the transport has nothing cached
+	// for, and safe to call concurrently with Dial.
+	DiscardPeer(addr string)
+
 	// LocalAddress returns this node's address blob, suitable for
 	// embedding as the "tc" field of our own sc1 token. It is only valid
 	// after Start has returned successfully.

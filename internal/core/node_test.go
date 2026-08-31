@@ -1472,3 +1472,155 @@ func TestDialIsBounded(t *testing.T) {
 		t.Errorf("dial deadline is %v away, want (0, %v]", remaining, dialTimeout)
 	}
 }
+
+// discardSpyTransport records DiscardPeer calls, then delegates.
+type discardSpyTransport struct {
+	transport.Transport
+	mu        sync.Mutex
+	discarded []string
+}
+
+func (t *discardSpyTransport) DiscardPeer(addr string) {
+	t.mu.Lock()
+	t.discarded = append(t.discarded, addr)
+	t.mu.Unlock()
+	t.Transport.DiscardPeer(addr)
+}
+
+func (t *discardSpyTransport) sawDiscard(addr string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for _, a := range t.discarded {
+		if a == addr {
+			return true
+		}
+	}
+	return false
+}
+
+// TestPeerRedialDropsStaleSession covers how a node learns its connection
+// died without waiting out SPEC.md §4's 90s dead rule.
+//
+// A peer only dials when it holds no session (dialAttempt short-circuits
+// otherwise), so an authenticated inbound connection from a peer we believe
+// we are already connected to means our side is a corpse — and the peer
+// just proved it is alive by completing the handshake. The cost of not
+// noticing falls entirely on whichever node the dedup rule made responsible
+// for dialling the pairing, since the other node's dials are rejected here
+// by design and can never repair it alone.
+//
+// The tear-down must also discard the transport's cached per-peer state, or
+// the redial reuses a tailcat Client that announces itself to the peer's
+// server only once and hangs dialling into a tunnel that has forgotten it.
+func TestPeerRedialDropsStaleSession(t *testing.T) {
+	dir := t.TempDir()
+	clock := newFakeClock(time.Unix(0, 0))
+
+	id1, _, err := config.LoadOrCreateIdentityKey(filepath.Join(dir, "id1"))
+	if err != nil {
+		t.Fatalf("identity 1: %v", err)
+	}
+	id2, _, err := config.LoadOrCreateIdentityKey(filepath.Join(dir, "id2"))
+	if err != nil {
+		t.Fatalf("identity 2: %v", err)
+	}
+	lowID, highID := id1, id2
+	if bytes.Compare(lowID.Public(), highID.Public()) > 0 {
+		lowID, highID = highID, lowID
+	}
+	lowAddr, highAddr := newPipeAddr(t), newPipeAddr(t)
+	lowToken, err := config.EncodeToken(lowAddr, lowID.Public(), "low")
+	if err != nil {
+		t.Fatalf("encode low token: %v", err)
+	}
+	highToken, err := config.EncodeToken(highAddr, highID.Public(), "high")
+	if err != nil {
+		t.Fatalf("encode high token: %v", err)
+	}
+
+	logs := &lockedBuffer{}
+	open := func(name, addr string, peers []config.Peer, identity *config.IdentityKey, tr transport.Transport) *Node {
+		t.Helper()
+		paths, err := config.ResolvePaths(filepath.Join(dir, name+"-config"), filepath.Join(dir, name+"-data"))
+		if err != nil {
+			t.Fatalf("resolve paths for %s: %v", name, err)
+		}
+		if err := paths.EnsureDirs(); err != nil {
+			t.Fatalf("ensure dirs for %s: %v", name, err)
+		}
+		cfg := config.Default()
+		cfg.NodeName = name
+		cfg.Peers = peers
+		n, err := Open(context.Background(), Options{
+			Paths: paths, Config: cfg, Identity: identity, Transport: tr,
+			Logger: log.New(logs, "", 0), Clock: clock,
+		})
+		if err != nil {
+			t.Fatalf("open %s: %v", name, err)
+		}
+		t.Cleanup(func() { n.Close() })
+		return n
+	}
+
+	// "high" is the node the dedup rule makes responsible for dialling, so
+	// it is the one that pays for a slow recovery in production. Open
+	// "low" first so high's very first dial finds something listening: a
+	// failed dial would back off on the fake clock, which this test never
+	// advances until it means to.
+	open("low", lowAddr, []config.Peer{{Name: "high", Token: highToken, Enabled: true}}, lowID, transport.NewPipeTransport(lowAddr))
+	spy := &discardSpyTransport{Transport: transport.NewPipeTransport(highAddr)}
+	high := open("high", highAddr, []config.Peer{{Name: "low", Token: lowToken, Enabled: true}}, highID, spy)
+
+	pc := high.lookupPeer(hex.EncodeToString(lowID.Public()))
+	if pc == nil {
+		t.Fatal("high has no peerConn for low")
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		pc.mu.Lock()
+		defer pc.mu.Unlock()
+		return pc.session != nil
+	})
+
+	// Drive the real path: an inbound connection from low, authenticated,
+	// which the dedup rule rejects here because high owns this pairing's
+	// dial. Calling offer rather than notePeerRedialed directly is what
+	// makes this cover the wiring too.
+	redial := func() {
+		inbound, far := net.Pipe()
+		defer far.Close()
+		if adopted, err := pc.offer(context.Background(), inbound, &protocol.HandshakeResult{
+			PeerPub: lowID.Public(), PeerName: "low",
+		}, false); adopted || err != nil {
+			t.Fatalf("offer(inbound) = (%v, %v), want the dedup rule to reject it", adopted, err)
+		}
+	}
+
+	// A connection this young is the simultaneous-start race, not a
+	// restart: the peer's dial simply lost. It must be left alone.
+	redial()
+	pc.mu.Lock()
+	original, connBlob := pc.session, pc.connBlob
+	pc.mu.Unlock()
+	if original == nil {
+		t.Fatal("a redial inside the grace window tore down a healthy new connection")
+	}
+
+	// Older than the grace, the same signal means the peer restarted.
+	clock.Advance(staleInboundGrace + time.Second)
+	redial()
+
+	// Assert on identity, not on nil: the supervisor redials the moment the
+	// stale session is torn down, so over a pipe the nil window is far too
+	// short to observe. What matters is that the corpse was replaced.
+	waitFor(t, 5*time.Second, func() bool {
+		pc.mu.Lock()
+		defer pc.mu.Unlock()
+		return pc.session != original
+	})
+	if !spy.sawDiscard(connBlob) {
+		t.Error("the transport's cached state for the peer was not discarded; a redial would reuse a stale client")
+	}
+	if got := logs.String(); !strings.Contains(got, "so that connection is dead") {
+		t.Errorf("nothing logged about dropping the dead connection; log was:\n%s", got)
+	}
+}

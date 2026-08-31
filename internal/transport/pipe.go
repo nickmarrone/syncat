@@ -59,6 +59,10 @@ func (t *PipeTransport) Start(ctx context.Context, onConn func(net.Conn)) error 
 	return nil
 }
 
+// DiscardPeer implements Transport. PipeTransport caches nothing per peer
+// — every Dial goes straight to the registry — so there is nothing to drop.
+func (t *PipeTransport) DiscardPeer(string) {}
+
 func (t *PipeTransport) Dial(ctx context.Context, addr string) (net.Conn, error) {
 	v, ok := pipeRegistry.Load(addr)
 	if !ok {

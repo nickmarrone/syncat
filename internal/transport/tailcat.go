@@ -213,6 +213,20 @@ func (t *TailcatTransport) clientFor(addr string) (*tailcat.Client, error) {
 	return c, nil
 }
 
+// DiscardPeer implements Transport. Unlike discardClient it is
+// unconditional: the caller is telling us the peer's connection has ended,
+// so whatever we hold for it is stale regardless of which Client it is.
+func (t *TailcatTransport) DiscardPeer(addr string) {
+	t.clientsMu.Lock()
+	c := t.clients[addr]
+	delete(t.clients, addr)
+	t.clientsMu.Unlock()
+
+	if c != nil {
+		_ = c.Close()
+	}
+}
+
 func (t *TailcatTransport) LocalAddress() (string, error) {
 	t.mu.Lock()
 	srv, started := t.server, t.started

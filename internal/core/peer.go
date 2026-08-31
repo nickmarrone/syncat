@@ -37,6 +37,14 @@ const (
 // log lines from noteDialFailure. The first failure always logs.
 const dialFailureLogEvery = 30
 
+// staleInboundGrace is how long a freshly adopted connection is immune to
+// notePeerRedialed's staleness inference. It exists only for the
+// simultaneous-start race: when both nodes boot at once, the loser's dial
+// can land a few seconds after the winner adopted its own, and that inbound
+// is not evidence of anything. A connection older than this did not come
+// from that race.
+const staleInboundGrace = 15 * time.Second
+
 // dialTimeout bounds one call to Transport.Dial.
 //
 // Supervisor.Run hands dialAttempt the peer's own long-lived context,
@@ -96,6 +104,7 @@ type peerConn struct {
 	remoteShares    []protocol.ShareListEntry
 	subAccess       map[string]string // shareID -> our access state, as offerer's peer reports it
 
+	sessCancel   context.CancelFunc // ends the current session; see notePeerRedialed
 	session      *syncsvc.Session
 	conn         net.Conn
 	activeShares map[string]bool // shareIDs currently added on session, for propagateShare
@@ -250,6 +259,9 @@ func (pc *peerConn) offer(ctx context.Context, conn net.Conn, result *protocol.H
 	keep := transport.KeepConnection(pc.node.identity.Public(), result.PeerPub, dialed)
 	if !keep {
 		conn.Close()
+		if !dialed {
+			pc.notePeerRedialed()
+		}
 		return false, nil
 	}
 
@@ -271,6 +283,7 @@ func (pc *peerConn) offer(ctx context.Context, conn net.Conn, result *protocol.H
 		pc.handleControl(sessCtx, sess, typ, payload)
 	})
 
+	pc.sessCancel = cancel
 	pc.session = sess
 	pc.conn = conn
 	pc.activeShares = map[string]bool{}
@@ -303,7 +316,16 @@ func (pc *peerConn) offer(ctx context.Context, conn net.Conn, result *protocol.H
 		sess.Close()
 		conn.Close()
 
+		// Before close(done) releases dialAttempt to redial: whatever the
+		// transport cached for this peer belongs to the connection that
+		// just died. tailcat's per-peer Client is the case that matters —
+		// it announces itself to the peer's server exactly once, so a
+		// Client reused across the peer's restart dials into a tunnel the
+		// far side has forgotten, and hangs there.
+		node.transport.DiscardPeer(pc.connBlob)
+
 		pc.mu.Lock()
+		pc.sessCancel = nil
 		pc.session = nil
 		pc.conn = nil
 		pc.activeShares = nil
@@ -377,6 +399,44 @@ func (pc *peerConn) setState(s ConnState) {
 	pc.mu.Lock()
 	pc.state = s
 	pc.mu.Unlock()
+}
+
+// notePeerRedialed reacts to an authenticated inbound connection that the
+// dedup rule told us to reject while we still hold a session for that peer.
+//
+// That combination is evidence, not noise. dialAttempt does not dial while
+// it holds a session, so a peer only dials us when it has none — and if it
+// has none while we believe we have one, ours is a corpse. The peer just
+// proved it is alive and reachable by completing a full handshake over it.
+//
+// Without this the corpse is only noticed by SPEC.md §4's 90s dead rule,
+// and the wait is paid by whichever node the dedup rule made responsible
+// for dialling this pairing: the *other* node can redial all it likes, but
+// its connections are rejected here by design, so they can never repair the
+// pairing on their own. Restarting the dialling node therefore looked
+// instant while restarting its peer took minutes — an asymmetry with no
+// cause beyond how the two keys happened to compare.
+//
+// Both the close and the cancel are needed, in that order. Closing the conn
+// is what unblocks the session's read loop — cancelling alone would deadlock
+// the teardown, which calls sess.Close() before conn.Close() and so waits on
+// a reader still parked in conn.Read. Cancelling is what makes it prompt:
+// closing alone would leave the keepalive's Run loop waiting out the full
+// dead timer before the teardown that redials could run. The dead-rule path
+// closes the conn for exactly the first reason.
+func (pc *peerConn) notePeerRedialed() {
+	pc.mu.Lock()
+	cancel, sess, conn := pc.sessCancel, pc.session, pc.conn
+	age := pc.node.clock.Now().Sub(pc.connectedSince)
+	name := pc.name
+	pc.mu.Unlock()
+
+	if sess == nil || cancel == nil || conn == nil || age < staleInboundGrace {
+		return
+	}
+	pc.node.logger.Printf("core: peer %s (%s): it dialled us while we still held a connection to it %s old, so that connection is dead; dropping it and redialling", name, pc.peerShort, age.Truncate(time.Second))
+	conn.Close()
+	cancel()
 }
 
 // noteDialFailure records one failed outbound dial or handshake: it moves
