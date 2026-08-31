@@ -8,6 +8,7 @@ func TestMarshalUnmarshalRoundTrip(t *testing.T) {
 		APIAddr:               "127.0.0.1:9999",
 		TrashRetentionDays:    14,
 		RescanIntervalSeconds: 60,
+		Debug:                 true,
 		GlobalIgnores:         []string{"*.tmp", "node_modules/"},
 		Peers: []Peer{
 			{Name: "bob", Token: "sc1abc", Enabled: true},
@@ -103,6 +104,9 @@ func TestUnmarshalAppliesTopLevelDefaults(t *testing.T) {
 	if cfg.RescanIntervalSeconds != DefaultRescanIntervalSeconds {
 		t.Errorf("RescanIntervalSeconds = %d, want %d", cfg.RescanIntervalSeconds, DefaultRescanIntervalSeconds)
 	}
+	if cfg.Debug {
+		t.Errorf("Debug = true, want false when absent from config")
+	}
 }
 
 func TestUnmarshalRejectsInvalidJSON(t *testing.T) {
@@ -124,6 +128,9 @@ func assertConfigEqual(t *testing.T, got, want *Config) {
 	}
 	if got.RescanIntervalSeconds != want.RescanIntervalSeconds {
 		t.Errorf("RescanIntervalSeconds = %d, want %d", got.RescanIntervalSeconds, want.RescanIntervalSeconds)
+	}
+	if got.Debug != want.Debug {
+		t.Errorf("Debug = %v, want %v", got.Debug, want.Debug)
 	}
 	if len(got.Peers) != len(want.Peers) {
 		t.Fatalf("got %d peers, want %d", len(got.Peers), len(want.Peers))

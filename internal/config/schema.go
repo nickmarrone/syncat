@@ -40,6 +40,7 @@ type Config struct {
 	APIAddr               string
 	TrashRetentionDays    int
 	RescanIntervalSeconds int
+	Debug                 bool
 	GlobalIgnores         []string
 	Peers                 []Peer
 	Shares                []Share

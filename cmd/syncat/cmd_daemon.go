@@ -73,7 +73,15 @@ func cmdDaemon(paths *config.Paths, args []string) error {
 		return err
 	}
 
-	tr := transport.NewTailcatTransport(tcKey, logger.Printf)
+	// tailcat's own logging (netcheck reports, link-change/route-monitor
+	// events) is routine network housekeeping, not something syncat's own
+	// operational log should carry by default; only forward it when the
+	// user has opted in via `syncat config set debug true`.
+	var tcLogf func(string, ...any)
+	if cfg.Debug {
+		tcLogf = logger.Printf
+	}
+	tr := transport.NewTailcatTransport(tcKey, tcLogf)
 
 	nodeCtx, nodeCancel := context.WithCancel(context.Background())
 	defer nodeCancel()

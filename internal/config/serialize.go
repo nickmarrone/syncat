@@ -17,6 +17,7 @@ type configDoc struct {
 	APIAddr               string         `json:"api_addr"`
 	TrashRetentionDays    int            `json:"trash_retention_days"`
 	RescanIntervalSeconds int            `json:"rescan_interval_seconds"`
+	Debug                 bool           `json:"debug"`
 	GlobalIgnores         []string       `json:"global_ignores,omitempty"`
 	Peers                 []peerDoc      `json:"peers,omitempty"`
 	Shares                []shareDoc     `json:"shares,omitempty"`
@@ -78,6 +79,7 @@ func configToDoc(cfg *Config) *configDoc {
 		APIAddr:               cfg.APIAddr,
 		TrashRetentionDays:    cfg.TrashRetentionDays,
 		RescanIntervalSeconds: cfg.RescanIntervalSeconds,
+		Debug:                 cfg.Debug,
 		GlobalIgnores:         cfg.GlobalIgnores,
 	}
 	for _, p := range cfg.Peers {
@@ -106,6 +108,7 @@ func docToConfig(doc *configDoc) *Config {
 		APIAddr:               doc.APIAddr,
 		TrashRetentionDays:    doc.TrashRetentionDays,
 		RescanIntervalSeconds: doc.RescanIntervalSeconds,
+		Debug:                 doc.Debug,
 		GlobalIgnores:         doc.GlobalIgnores,
 	}
 	for _, p := range doc.Peers {
