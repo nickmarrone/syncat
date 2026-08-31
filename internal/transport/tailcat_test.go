@@ -2,6 +2,7 @@ package transport
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"testing"
@@ -9,6 +10,42 @@ import (
 
 	"github.com/tailscale/tailcat"
 )
+
+// dialWithRetry dials addr, retrying until it succeeds or ctx expires.
+//
+// Transport.Start returns as soon as tailcat's Server.Start does, which is
+// before that server has picked a home DERP region and connected to it —
+// measured here at roughly 2.5–3s after Start returns. Until then the server
+// is registered on no relay at all, and a dial's meow ping is a single DERP
+// packet with no retry of its own: tailcat's Client.ping sends one and then
+// waits on a hard internal 10s timeout, documented as applying "regardless
+// of ctx". Dialing straight after Start therefore fires that one packet into
+// the void and fails, deterministically and with a context-deadline error
+// that says nothing about the real cause.
+//
+// Production never sees this, which is why it went unnoticed: syncat dials
+// peers through transport.Supervisor (internal/core's runSupervisor), which
+// retries with backoff, so a meow lost in the startup window costs one
+// retry. These tests dial the transport directly, so they have to do the
+// same thing themselves rather than assert on a window production never
+// depends on.
+func dialWithRetry(ctx context.Context, t *testing.T, tr *TailcatTransport, addr string) (net.Conn, error) {
+	t.Helper()
+	var lastErr error
+	for attempt := 1; ctx.Err() == nil; attempt++ {
+		conn, err := tr.Dial(ctx, addr)
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+		t.Logf("dial attempt %d failed (retrying): %v", attempt, err)
+		select {
+		case <-time.After(time.Second):
+		case <-ctx.Done():
+		}
+	}
+	return nil, fmt.Errorf("no dial succeeded before the deadline: %w", lastErr)
+}
 
 // TestTailcatTransportEndToEnd exercises the production transport against
 // the real Tailscale DERP relays (confirmed reachable from this sandbox in
@@ -41,9 +78,7 @@ func TestTailcatTransportEndToEnd(t *testing.T) {
 		t.Fatalf("server LocalAddress: %v", err)
 	}
 
-	// No sleep before dialing: DialTCPPort blocks internally until the
-	// server has acked the client as a peer.
-	dialConn, err := client.Dial(ctx, addr)
+	dialConn, err := dialWithRetry(ctx, t, client, addr)
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -172,14 +207,14 @@ func TestTailcatTransportStaysReachableAfterDialing(t *testing.T) {
 
 	// Give the subject a Client of its own. Before the fix, this is the step
 	// that cost the subject its inbound reachability.
-	outConn, err := subject.Dial(ctx, targetAddr)
+	outConn, err := dialWithRetry(ctx, t, subject, targetAddr)
 	if err != nil {
 		t.Fatalf("subject dial target: %v", err)
 	}
 	defer outConn.Close()
 
 	// The subject must still be reachable from outside.
-	conn, err := inbound.Dial(ctx, subjectAddr)
+	conn, err := dialWithRetry(ctx, t, inbound, subjectAddr)
 	if err != nil {
 		t.Fatalf("inbound dial subject after subject had dialled out (the regression): %v", err)
 	}
