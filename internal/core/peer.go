@@ -420,21 +420,15 @@ func (pc *peerConn) setRemoteShares(entries []protocol.ShareListEntry) {
 	pc.mu.Unlock()
 }
 
-// remoteShareIDs returns the ids of the shares this peer most recently
-// offered us, or nil if it has never sent a ShareList (it has not been
-// connected since this process started — the list is in-memory only).
-// Callers must treat nil as "unknown", not "offers nothing".
-func (pc *peerConn) remoteShareIDs() []string {
+// offeredShares returns a copy of the share list this peer most recently
+// sent us, or nil if it has never sent one.
+func (pc *peerConn) offeredShares() []protocol.ShareListEntry {
 	pc.mu.Lock()
 	defer pc.mu.Unlock()
 	if len(pc.remoteShares) == 0 {
 		return nil
 	}
-	ids := make([]string, 0, len(pc.remoteShares))
-	for _, e := range pc.remoteShares {
-		ids = append(ids, e.ShareID)
-	}
-	return ids
+	return append([]protocol.ShareListEntry(nil), pc.remoteShares...)
 }
 
 func (pc *peerConn) setSubscriptionAccess(shareID, access string) {

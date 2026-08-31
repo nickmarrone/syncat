@@ -12,6 +12,10 @@ import (
 
 // cmdSubscribe implements `syncat subscribe PEER SHARE LOCALPATH [--mode
 // mirror|receive]` (SPEC.md §8).
+//
+// PEER and SHARE are resolved by the daemon (internal/core/resolve.go) and
+// accept any of a canonical id, a display name, or a unique id prefix — so
+// the two readable names `syncat remote ls` prints can be typed directly.
 func cmdSubscribe(paths *config.Paths, args []string) error {
 	positional, rest := splitLeadingPositional(args, 3)
 	fs := flag.NewFlagSet("subscribe", flag.ContinueOnError)
@@ -20,7 +24,7 @@ func cmdSubscribe(paths *config.Paths, args []string) error {
 		return err
 	}
 	if len(positional) != 3 || fs.NArg() != 0 {
-		return fmt.Errorf("usage: syncat subscribe PEER SHARE LOCALPATH [--mode mirror|receive]")
+		return fmt.Errorf("usage: syncat subscribe PEER SHARE LOCALPATH [--mode mirror|receive]\n\nPEER and SHARE each accept a name, an id, or a unique id prefix (see `syncat remote ls`)")
 	}
 	peer, shareID := positional[0], positional[1]
 	abs, err := filepath.Abs(positional[2])

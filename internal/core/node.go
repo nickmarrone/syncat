@@ -37,8 +37,6 @@ import (
 	"math/rand"
 	"net"
 	"os"
-	"slices"
-	"strings"
 	"sync"
 	"time"
 
@@ -137,6 +135,11 @@ type Node struct {
 	cancel    context.CancelFunc
 	wg        sync.WaitGroup
 	closeOnce sync.Once
+
+	// closeMu/closing order every wg.Add strictly before Close's
+	// wg.Wait — see goTracked.
+	closeMu sync.RWMutex
+	closing bool
 
 	cfgMu sync.RWMutex
 	cfg   *config.Config
@@ -327,6 +330,11 @@ func (n *Node) Close() error {
 	var closeErr error
 	n.closeOnce.Do(func() {
 		n.cancel()
+		// Refuse new tracked goroutines before waiting for the running
+		// ones, so no wg.Add can race this Wait (see goTracked).
+		n.closeMu.Lock()
+		n.closing = true
+		n.closeMu.Unlock()
 		n.wg.Wait()
 
 		n.sharesMu.Lock()
@@ -356,12 +364,36 @@ func (n *Node) Close() error {
 
 // goTracked runs fn in a new goroutine tracked by n.wg, so Close waits for
 // it.
-func (n *Node) goTracked(fn func()) {
+// goTracked runs fn on a goroutine counted by n.wg, reporting false
+// without running it if the node is already closing.
+//
+// The guard is what makes n.wg safe to Add to from goroutines the
+// WaitGroup is not already counting. Three callers are like that:
+// onAccept runs on a transport goroutine, and AddPeer and startShareWatch
+// on API goroutines. (The rest are called from already-tracked goroutines,
+// which keep the counter above zero and so cannot race a Wait.) Without
+// the guard, such an Add can land after Close's wg.Wait has begun — the
+// documented "Add that starts when the counter is zero must happen before
+// Wait" misuse, which the race detector flags, and which really can leak a
+// goroutine past Close and on into a closed store or transport.
+//
+// Holding closeMu for read across the Add, and taking it for write in
+// Close before waiting, orders every Add strictly before the Wait.
+// Deliberately *not* done by closing the transport before waiting, which
+// would be simpler but would abandon in-flight transfers that SPEC.md §8's
+// graceful shutdown exists to let finish.
+func (n *Node) goTracked(fn func()) bool {
+	n.closeMu.RLock()
+	defer n.closeMu.RUnlock()
+	if n.closing {
+		return false
+	}
 	n.wg.Add(1)
 	go func() {
 		defer n.wg.Done()
 		fn()
 	}()
+	return true
 }
 
 // nodeName returns the current configured node display name.
@@ -393,7 +425,11 @@ func (n *Node) onAccept(conn net.Conn) {
 		conn.Close()
 		return
 	}
-	n.goTracked(func() { n.handleAccept(conn) })
+	// Unlike the other callers, this one owns a conn, so a refused
+	// goTracked has to close it rather than drop it on the floor.
+	if !n.goTracked(func() { n.handleAccept(conn) }) {
+		conn.Close()
+	}
 }
 
 // handleAccept authenticates one inbound connection and, on success, hands
@@ -868,26 +904,26 @@ func (n *Node) neuterShareOnSessions(shareID string) {
 // watching the local copy, and — if already connected to the peer — sends
 // SubscribeRequest immediately.
 //
-// peerKeyHex is a peer's hex public key and shareID a share id, as printed
-// by `syncat peer ls` and `syncat remote ls`; neither is a display name.
-// Both are checked here rather than taken on faith, because a subscription
-// naming a peer we don't have fails *silently* and permanently: nothing
-// sends a SubscribeRequest for it (lookupPeer returns nil here, and
-// requestSubscriptions never matches it on any later reconnect), so it sits
-// in config looking configured while no bytes ever move.
-func (n *Node) AddSubscription(peerKeyHex, shareID, localPath, mode string) error {
+// peerRef and shareRef are references in the sense of resolve.go: a
+// canonical id, a display name, or a unique id prefix. Both are resolved
+// against what is actually configured rather than taken on faith, because a
+// subscription naming a peer we don't have fails *silently* and
+// permanently: nothing sends a SubscribeRequest for it (lookupPeer returns
+// nil here, and requestSubscriptions never matches it on any later
+// reconnect), so it sits in config looking configured while no bytes ever
+// move.
+func (n *Node) AddSubscription(peerRef, shareRef, localPath, mode string) error {
 	if mode != config.ModeMirror && mode != config.ModeReceiveOnly {
 		return fmt.Errorf("core: add subscription: invalid mode %q", mode)
 	}
-	pc := n.lookupPeer(peerKeyHex)
-	if pc == nil {
-		return fmt.Errorf("core: add subscription: %q is not a configured peer — this argument is a peer's hex key, not its display name; `syncat peer ls` prints the keys", peerKeyHex)
+	pc, err := n.resolvePeerRef(peerRef)
+	if err != nil {
+		return fmt.Errorf("core: add subscription: %w", err)
 	}
-	// Only enforced once the peer has actually told us what it offers.
-	// Subscribing before ever connecting is legitimate, and remoteShares
-	// is in-memory only, so an empty list means "we don't know yet".
-	if offered := pc.remoteShareIDs(); offered != nil && !slices.Contains(offered, shareID) {
-		return fmt.Errorf("core: add subscription: peer %s offers no share %q — it offers %s (`syncat remote ls` prints share ids)", pc.name, shareID, strings.Join(offered, ", "))
+	peerKeyHex := pc.peerKeyHex
+	shareID, err := n.resolveOfferedShareRef(pc, shareRef)
+	if err != nil {
+		return fmt.Errorf("core: add subscription: %w", err)
 	}
 	if err := os.MkdirAll(localPath, 0o700); err != nil {
 		return fmt.Errorf("core: add subscription: create local path: %w", err)
@@ -928,7 +964,8 @@ func (n *Node) AddSubscription(peerKeyHex, shareID, localPath, mode string) erro
 // RemoveSubscription stops syncing a subscription: persists the removal,
 // stops its watcher, and neuters it on the offering peer's live session
 // (see the package doc comment).
-func (n *Node) RemoveSubscription(peerKeyHex, shareID string) error {
+func (n *Node) RemoveSubscription(peerRef, shareRef string) error {
+	peerKeyHex, shareID := n.resolveSubscriptionRef(peerRef, shareRef)
 	if _, err := n.mutateConfig(func(cfg *config.Config) error {
 		idx := -1
 		for i, s := range cfg.Subscriptions {
@@ -964,7 +1001,8 @@ func (n *Node) RemoveSubscription(peerKeyHex, shareID string) error {
 // PauseSubscription pauses or resumes a subscription: paused stops the
 // local watcher and neuters the share on the live session; resuming
 // restarts the watcher and re-requests access.
-func (n *Node) PauseSubscription(peerKeyHex, shareID string, paused bool) error {
+func (n *Node) PauseSubscription(peerRef, shareRef string, paused bool) error {
+	peerKeyHex, shareID := n.resolveSubscriptionRef(peerRef, shareRef)
 	var sub config.Subscription
 	if _, err := n.mutateConfig(func(cfg *config.Config) error {
 		idx := -1

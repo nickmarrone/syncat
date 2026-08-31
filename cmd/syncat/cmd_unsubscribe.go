@@ -16,16 +16,17 @@ import (
 // the CLI that reaches it, so removing a subscription no longer means
 // hand-rolling a curl or hand-editing config.json.
 //
-// PEER and SHARE are the same two identifiers `syncat subscribe` takes:
-// a peer's hex key and a share id, as printed by `syncat status` and
-// `syncat remote ls`.
+// PEER and SHARE are the same two references `syncat subscribe` takes: a
+// name, an id, or a unique id prefix. A subscription whose peer is no
+// longer configured has nothing to resolve against, and stays removable by
+// its literal stored values — see core.resolveSubscriptionRef.
 func cmdUnsubscribe(paths *config.Paths, args []string) error {
 	fs := flag.NewFlagSet("unsubscribe", flag.ContinueOnError)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() != 2 {
-		return fmt.Errorf("usage: syncat unsubscribe PEER SHARE")
+		return fmt.Errorf("usage: syncat unsubscribe PEER SHARE\n\nPEER and SHARE each accept a name, an id, or a unique id prefix (see `syncat status`)")
 	}
 	peer, shareID := fs.Arg(0), fs.Arg(1)
 

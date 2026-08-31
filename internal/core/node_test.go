@@ -1039,39 +1039,164 @@ func TestRemovePeerRevokesShareAccess(t *testing.T) {
 }
 
 // TestAddSubscriptionRejectsUnknownPeer covers the failure that motivated
-// AddSubscription's validation. `syncat subscribe PEER SHARE PATH` takes a
-// peer's hex key, but reads as though it takes a display name, so
-// "subscribe nishinomiya test ./test/" is the natural thing to type — and
-// it used to be accepted verbatim. The resulting subscription was inert
-// and silently so: lookupPeer found nothing, so no SubscribeRequest was
-// ever sent, and requestSubscriptions never matched it on any later
-// reconnect either. `syncat status` listed it with a blank peer and share
-// name while no bytes moved, and nothing was ever logged.
+// resolve.go. `syncat subscribe PEER SHARE PATH` used to take only a hex
+// peer key while reading as though it took a display name, so "subscribe
+// nishinomiya test ./test/" is the natural thing to type — and it was
+// accepted verbatim. The resulting subscription was inert and silently so:
+// lookupPeer found nothing, so no SubscribeRequest was ever sent, and
+// requestSubscriptions never matched it on any later reconnect either.
+// `syncat status` listed it with a blank peer and share name while no bytes
+// moved, and nothing was ever logged. Names now resolve
+// (TestAddSubscriptionResolvesNames); a name that matches nothing is an
+// error rather than a silent write.
 func TestAddSubscriptionRejectsUnknownPeer(t *testing.T) {
 	node := newTestNode(t, "node")
 
 	err := node.AddSubscription("nishinomiya", "test", t.TempDir(), config.ModeMirror)
 	if err == nil {
-		t.Fatal("AddSubscription with a display name in place of a peer key succeeded; want an error")
+		t.Fatal("AddSubscription naming a peer that does not exist succeeded; want an error")
 	}
-	if !strings.Contains(err.Error(), "not a configured peer") {
-		t.Errorf("error = %v, want it to say the peer is not configured", err)
+	if !strings.Contains(err.Error(), "peer") {
+		t.Errorf("error = %v, want it to be about the peer", err)
 	}
 	if subs := node.Status().Subscriptions; len(subs) != 0 {
 		t.Errorf("Subscriptions = %+v, want the rejected subscription not to be persisted", subs)
 	}
 }
 
-// TestAddSubscriptionRejectsUnofferedShare is the same guard one level
-// down: the peer key resolves, but the share id doesn't name anything that
-// peer offers — the other half of "subscribe nishinomiya test" (share ids
-// are not share names either). Only enforced once the peer has actually
-// sent a ShareList; see AddSubscription.
-func TestAddSubscriptionRejectsUnofferedShare(t *testing.T) {
-	nodeA := newTestNode(t, "nodeA")
-	nodeB := newTestNode(t, "nodeB")
+// TestAddSubscriptionResolvesNames is the payoff: the two identifiers a
+// user actually reads off `syncat peer ls` and `syncat remote ls` work
+// directly, and are stored as their canonical ids.
+func TestAddSubscriptionResolvesNames(t *testing.T) {
+	nodeA, nodeB, shareID := connectedPairWithShare(t, "docs")
 
-	shareID, err := nodeA.AddShare(t.TempDir(), "docs", config.PermissionReadOnly, false)
+	if err := nodeB.AddSubscription("nodeA", "docs", t.TempDir(), config.ModeMirror); err != nil {
+		t.Fatalf("AddSubscription by display name: %v", err)
+	}
+
+	subs := nodeB.Status().Subscriptions
+	if len(subs) != 1 {
+		t.Fatalf("Subscriptions = %+v, want exactly one", subs)
+	}
+	if subs[0].PeerKey != nodeA.PeerKey() {
+		t.Errorf("PeerKey = %q, want the resolved key %q", subs[0].PeerKey, nodeA.PeerKey())
+	}
+	if subs[0].ShareID != shareID {
+		t.Errorf("ShareID = %q, want the resolved id %q", subs[0].ShareID, shareID)
+	}
+}
+
+// TestAddSubscriptionResolvesIDPrefix covers the git-style shorthand, which
+// is the only ergonomic way to name a share whose display name is ambiguous
+// or absent.
+func TestAddSubscriptionResolvesIDPrefix(t *testing.T) {
+	nodeA, nodeB, shareID := connectedPairWithShare(t, "docs")
+
+	if err := nodeB.AddSubscription(nodeA.PeerKey()[:8], shareID[:6], t.TempDir(), config.ModeMirror); err != nil {
+		t.Fatalf("AddSubscription by id prefix: %v", err)
+	}
+	subs := nodeB.Status().Subscriptions
+	if len(subs) != 1 || subs[0].PeerKey != nodeA.PeerKey() || subs[0].ShareID != shareID {
+		t.Fatalf("Subscriptions = %+v, want the prefixes resolved to full ids", subs)
+	}
+}
+
+// TestAddSubscriptionRejectsUnknownShare is the peer-resolves-share-doesn't
+// case. Only enforced once the peer has actually sent a ShareList; see
+// resolveOfferedShareRef.
+func TestAddSubscriptionRejectsUnknownShare(t *testing.T) {
+	_, nodeB, shareID := connectedPairWithShare(t, "docs")
+
+	err := nodeB.AddSubscription("nodeA", "nosuchshare", t.TempDir(), config.ModeMirror)
+	if err == nil {
+		t.Fatal("AddSubscription naming a share the peer does not offer succeeded; want an error")
+	}
+	// The error has to be actionable, so it names what is on offer.
+	if !strings.Contains(err.Error(), shareID) || !strings.Contains(err.Error(), "docs") {
+		t.Errorf("error = %v, want it to list the offered share %s (docs)", err, shareID)
+	}
+	if subs := nodeB.Status().Subscriptions; len(subs) != 0 {
+		t.Errorf("Subscriptions = %+v, want the rejected subscription not to be persisted", subs)
+	}
+}
+
+// TestAddSubscriptionRejectsAmbiguousName pins that a name matching two
+// peers is refused rather than silently resolved to whichever happened to
+// come first out of the map.
+func TestAddSubscriptionRejectsAmbiguousName(t *testing.T) {
+	nodeB := newTestNode(t, "nodeB")
+	first, second := newTestNode(t, "first"), newTestNode(t, "second")
+	if _, err := nodeB.AddPeer("twin", peerToken(t, first)); err != nil {
+		t.Fatalf("AddPeer first: %v", err)
+	}
+	if _, err := nodeB.AddPeer("twin", peerToken(t, second)); err != nil {
+		t.Fatalf("AddPeer second: %v", err)
+	}
+
+	err := nodeB.AddSubscription("twin", "whatever", t.TempDir(), config.ModeMirror)
+	if err == nil {
+		t.Fatal("AddSubscription with an ambiguous peer name succeeded; want an error")
+	}
+	if !strings.Contains(err.Error(), "ambiguous") {
+		t.Errorf("error = %v, want it to say the name is ambiguous", err)
+	}
+	if !strings.Contains(err.Error(), first.PeerKey()) || !strings.Contains(err.Error(), second.PeerKey()) {
+		t.Errorf("error = %v, want it to name both candidate keys", err)
+	}
+}
+
+// TestRemoveSubscriptionOfOrphanedPeer is the constraint that keeps ref
+// resolution from making a mess unfixable. A subscription whose peer is no
+// longer configured cannot resolve — there is nothing to resolve against —
+// and if that were an error it would be permanently stuck in config with no
+// CLI able to remove it. resolveSubscriptionRef passes unresolvable refs
+// through untouched precisely so these stay removable by their literal
+// stored values.
+func TestRemoveSubscriptionOfOrphanedPeer(t *testing.T) {
+	nodeA, nodeB, shareID := connectedPairWithShare(t, "docs")
+
+	if err := nodeB.AddSubscription("nodeA", "docs", t.TempDir(), config.ModeMirror); err != nil {
+		t.Fatalf("AddSubscription: %v", err)
+	}
+	peerKey := nodeA.PeerKey()
+	// Orphan it: drop the peer, keeping the subscription behind.
+	nodeB.peersMu.Lock()
+	delete(nodeB.peers, peerKey)
+	nodeB.peersMu.Unlock()
+
+	if err := nodeB.RemoveSubscription(peerKey, shareID); err != nil {
+		t.Fatalf("RemoveSubscription for an orphaned peer: %v", err)
+	}
+	if subs := nodeB.Status().Subscriptions; len(subs) != 0 {
+		t.Fatalf("Subscriptions = %+v, want the orphan removed", subs)
+	}
+}
+
+// TestRemoveSubscriptionResolvesNames: unsubscribing takes the same refs
+// subscribing does, or the pair would be unusable together.
+func TestRemoveSubscriptionResolvesNames(t *testing.T) {
+	_, nodeB, _ := connectedPairWithShare(t, "docs")
+
+	if err := nodeB.AddSubscription("nodeA", "docs", t.TempDir(), config.ModeMirror); err != nil {
+		t.Fatalf("AddSubscription: %v", err)
+	}
+	if err := nodeB.RemoveSubscription("nodeA", "docs"); err != nil {
+		t.Fatalf("RemoveSubscription by display name: %v", err)
+	}
+	if subs := nodeB.Status().Subscriptions; len(subs) != 0 {
+		t.Fatalf("Subscriptions = %+v, want none", subs)
+	}
+}
+
+// connectedPairWithShare returns two connected nodes, where nodeA offers a
+// read-only share by the given name and nodeB has already received nodeA's
+// ShareList — the precondition for resolving share names.
+func connectedPairWithShare(t *testing.T, shareName string) (nodeA, nodeB *Node, shareID string) {
+	t.Helper()
+	nodeA = newTestNode(t, "nodeA")
+	nodeB = newTestNode(t, "nodeB")
+
+	shareID, err := nodeA.AddShare(t.TempDir(), shareName, config.PermissionReadOnly, false)
 	if err != nil {
 		t.Fatalf("AddShare: %v", err)
 	}
@@ -1081,9 +1206,6 @@ func TestAddSubscriptionRejectsUnofferedShare(t *testing.T) {
 	if _, err := nodeB.AddPeer("nodeA", peerToken(t, nodeA)); err != nil {
 		t.Fatalf("nodeB AddPeer: %v", err)
 	}
-	// Wait for A's ShareList to actually land: until it does, B has no
-	// idea what A offers and AddSubscription deliberately lets anything
-	// through.
 	waitFor(t, 5*time.Second, func() bool {
 		for _, rs := range nodeB.Status().RemoteShares {
 			if rs.ShareID == shareID {
@@ -1092,24 +1214,5 @@ func TestAddSubscriptionRejectsUnofferedShare(t *testing.T) {
 		}
 		return false
 	})
-
-	err = nodeB.AddSubscription(nodeA.PeerKey(), "docs", t.TempDir(), config.ModeMirror)
-	if err == nil {
-		t.Fatal("AddSubscription with a share name in place of a share id succeeded; want an error")
-	}
-	if !strings.Contains(err.Error(), "offers no share") {
-		t.Errorf("error = %v, want it to say the peer offers no such share", err)
-	}
-	// The error has to be actionable, so it names what is on offer.
-	if !strings.Contains(err.Error(), shareID) {
-		t.Errorf("error = %v, want it to list the offered share id %s", err, shareID)
-	}
-	if subs := nodeB.Status().Subscriptions; len(subs) != 0 {
-		t.Errorf("Subscriptions = %+v, want the rejected subscription not to be persisted", subs)
-	}
-
-	// The real id still works, so validation isn't just refusing everything.
-	if err := nodeB.AddSubscription(nodeA.PeerKey(), shareID, t.TempDir(), config.ModeMirror); err != nil {
-		t.Fatalf("AddSubscription with the correct share id: %v", err)
-	}
+	return nodeA, nodeB, shareID
 }
