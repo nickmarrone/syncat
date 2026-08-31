@@ -37,6 +37,8 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -861,12 +863,31 @@ func (n *Node) neuterShareOnSessions(shareID string) {
 // --- subscription mutations -------------------------------------------------
 
 // AddSubscription subscribes to a peer's share (SPEC.md §1/§6): validates
-// the local path (CheckSubscriptionPath), creates it if needed, persists
-// the subscription, starts watching the local copy, and — if already
-// connected to the peer — sends SubscribeRequest immediately.
+// the peer and share ids and the local path (CheckSubscriptionPath),
+// creates the local path if needed, persists the subscription, starts
+// watching the local copy, and — if already connected to the peer — sends
+// SubscribeRequest immediately.
+//
+// peerKeyHex is a peer's hex public key and shareID a share id, as printed
+// by `syncat peer ls` and `syncat remote ls`; neither is a display name.
+// Both are checked here rather than taken on faith, because a subscription
+// naming a peer we don't have fails *silently* and permanently: nothing
+// sends a SubscribeRequest for it (lookupPeer returns nil here, and
+// requestSubscriptions never matches it on any later reconnect), so it sits
+// in config looking configured while no bytes ever move.
 func (n *Node) AddSubscription(peerKeyHex, shareID, localPath, mode string) error {
 	if mode != config.ModeMirror && mode != config.ModeReceiveOnly {
 		return fmt.Errorf("core: add subscription: invalid mode %q", mode)
+	}
+	pc := n.lookupPeer(peerKeyHex)
+	if pc == nil {
+		return fmt.Errorf("core: add subscription: %q is not a configured peer — this argument is a peer's hex key, not its display name; `syncat peer ls` prints the keys", peerKeyHex)
+	}
+	// Only enforced once the peer has actually told us what it offers.
+	// Subscribing before ever connecting is legitimate, and remoteShares
+	// is in-memory only, so an empty list means "we don't know yet".
+	if offered := pc.remoteShareIDs(); offered != nil && !slices.Contains(offered, shareID) {
+		return fmt.Errorf("core: add subscription: peer %s offers no share %q — it offers %s (`syncat remote ls` prints share ids)", pc.name, shareID, strings.Join(offered, ", "))
 	}
 	if err := os.MkdirAll(localPath, 0o700); err != nil {
 		return fmt.Errorf("core: add subscription: create local path: %w", err)
@@ -893,14 +914,12 @@ func (n *Node) AddSubscription(peerKeyHex, shareID, localPath, mode string) erro
 		n.logger.Printf("core: add subscription: start watcher for %s: %v", shareID, err)
 	}
 
-	if pc := n.lookupPeer(peerKeyHex); pc != nil {
-		pc.mu.Lock()
-		sess := pc.session
-		pc.mu.Unlock()
-		if sess != nil {
-			if err := sess.Writer().WriteMessage(protocol.MsgSubscribeRequest, protocol.SubscribeRequest{ShareID: shareID}); err != nil {
-				n.logger.Printf("core: send subscribe request %s to %s: %v", shareID, peerKeyHex, err)
-			}
+	pc.mu.Lock()
+	sess := pc.session
+	pc.mu.Unlock()
+	if sess != nil {
+		if err := sess.Writer().WriteMessage(protocol.MsgSubscribeRequest, protocol.SubscribeRequest{ShareID: shareID}); err != nil {
+			n.logger.Printf("core: send subscribe request %s to %s: %v", shareID, peerKeyHex, err)
 		}
 	}
 	return nil

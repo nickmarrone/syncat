@@ -797,10 +797,15 @@ func TestRemovePeerDropsSubscriptions(t *testing.T) {
 	})
 
 	// A second subscription, to a share offered by a *different* peer,
-	// must be left completely alone.
-	otherPeerKey := "ff" + strings.Repeat("00", 31)
+	// must be left completely alone. The other peer has to be genuinely
+	// configured (rather than a made-up key) because AddSubscription now
+	// rejects a peer it doesn't have — see TestAddSubscriptionRejectsUnknownPeer.
+	nodeC := newTestNode(t, "nodeC")
+	if _, err := nodeB.AddPeer("nodeC", peerToken(t, nodeC)); err != nil {
+		t.Fatalf("nodeB AddPeer nodeC: %v", err)
+	}
 	otherDir := t.TempDir()
-	if err := nodeB.AddSubscription(otherPeerKey, "othershare", otherDir, config.ModeMirror); err != nil {
+	if err := nodeB.AddSubscription(nodeC.PeerKey(), "othershare", otherDir, config.ModeMirror); err != nil {
 		t.Fatalf("AddSubscription for the unrelated peer: %v", err)
 	}
 
@@ -1030,5 +1035,81 @@ func TestRemovePeerRevokesShareAccess(t *testing.T) {
 	}
 	if got, ok := accessFor(nodeB.PeerKey()); ok {
 		t.Errorf("re-added peer regained %q access without a new grant", got)
+	}
+}
+
+// TestAddSubscriptionRejectsUnknownPeer covers the failure that motivated
+// AddSubscription's validation. `syncat subscribe PEER SHARE PATH` takes a
+// peer's hex key, but reads as though it takes a display name, so
+// "subscribe nishinomiya test ./test/" is the natural thing to type — and
+// it used to be accepted verbatim. The resulting subscription was inert
+// and silently so: lookupPeer found nothing, so no SubscribeRequest was
+// ever sent, and requestSubscriptions never matched it on any later
+// reconnect either. `syncat status` listed it with a blank peer and share
+// name while no bytes moved, and nothing was ever logged.
+func TestAddSubscriptionRejectsUnknownPeer(t *testing.T) {
+	node := newTestNode(t, "node")
+
+	err := node.AddSubscription("nishinomiya", "test", t.TempDir(), config.ModeMirror)
+	if err == nil {
+		t.Fatal("AddSubscription with a display name in place of a peer key succeeded; want an error")
+	}
+	if !strings.Contains(err.Error(), "not a configured peer") {
+		t.Errorf("error = %v, want it to say the peer is not configured", err)
+	}
+	if subs := node.Status().Subscriptions; len(subs) != 0 {
+		t.Errorf("Subscriptions = %+v, want the rejected subscription not to be persisted", subs)
+	}
+}
+
+// TestAddSubscriptionRejectsUnofferedShare is the same guard one level
+// down: the peer key resolves, but the share id doesn't name anything that
+// peer offers — the other half of "subscribe nishinomiya test" (share ids
+// are not share names either). Only enforced once the peer has actually
+// sent a ShareList; see AddSubscription.
+func TestAddSubscriptionRejectsUnofferedShare(t *testing.T) {
+	nodeA := newTestNode(t, "nodeA")
+	nodeB := newTestNode(t, "nodeB")
+
+	shareID, err := nodeA.AddShare(t.TempDir(), "docs", config.PermissionReadOnly, false)
+	if err != nil {
+		t.Fatalf("AddShare: %v", err)
+	}
+	if _, err := nodeA.AddPeer("nodeB", peerToken(t, nodeB)); err != nil {
+		t.Fatalf("nodeA AddPeer: %v", err)
+	}
+	if _, err := nodeB.AddPeer("nodeA", peerToken(t, nodeA)); err != nil {
+		t.Fatalf("nodeB AddPeer: %v", err)
+	}
+	// Wait for A's ShareList to actually land: until it does, B has no
+	// idea what A offers and AddSubscription deliberately lets anything
+	// through.
+	waitFor(t, 5*time.Second, func() bool {
+		for _, rs := range nodeB.Status().RemoteShares {
+			if rs.ShareID == shareID {
+				return true
+			}
+		}
+		return false
+	})
+
+	err = nodeB.AddSubscription(nodeA.PeerKey(), "docs", t.TempDir(), config.ModeMirror)
+	if err == nil {
+		t.Fatal("AddSubscription with a share name in place of a share id succeeded; want an error")
+	}
+	if !strings.Contains(err.Error(), "offers no share") {
+		t.Errorf("error = %v, want it to say the peer offers no such share", err)
+	}
+	// The error has to be actionable, so it names what is on offer.
+	if !strings.Contains(err.Error(), shareID) {
+		t.Errorf("error = %v, want it to list the offered share id %s", err, shareID)
+	}
+	if subs := nodeB.Status().Subscriptions; len(subs) != 0 {
+		t.Errorf("Subscriptions = %+v, want the rejected subscription not to be persisted", subs)
+	}
+
+	// The real id still works, so validation isn't just refusing everything.
+	if err := nodeB.AddSubscription(nodeA.PeerKey(), shareID, t.TempDir(), config.ModeMirror); err != nil {
+		t.Fatalf("AddSubscription with the correct share id: %v", err)
 	}
 }

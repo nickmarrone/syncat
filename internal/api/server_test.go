@@ -456,15 +456,26 @@ func TestSubscriptionsAddPatchDelete(t *testing.T) {
 	srv, _, _ := newTestServer(t)
 	localDir := filepath.Join(t.TempDir(), "sub")
 
-	w := doRequest(t, srv, http.MethodPost, "/api/subscriptions", testToken, map[string]any{
-		"peer": "aa11", "share_id": "bb22", "local_path": localDir, "mode": "mirror",
+	// A real configured peer: core.AddSubscription rejects a peer it
+	// doesn't have (see TestSubscriptionsAddRejectsUnknownPeer). It never
+	// connects over the pipe transport, so it never sends a ShareList and
+	// the share id below isn't checked against anything.
+	w := doRequest(t, srv, http.MethodPost, "/api/peers", testToken, map[string]string{"token": fakePeerToken(t, "bob"), "name": "bob"})
+	if w.Code != http.StatusCreated {
+		t.Fatalf("add peer: status = %d, want 201; body: %s", w.Code, w.Body.String())
+	}
+	var peer peerDTO
+	decodeJSONBody(t, w, &peer)
+
+	w = doRequest(t, srv, http.MethodPost, "/api/subscriptions", testToken, map[string]any{
+		"peer": peer.ID, "share_id": "bb22", "local_path": localDir, "mode": "mirror",
 	})
 	if w.Code != http.StatusCreated {
 		t.Fatalf("add subscription: status = %d, want 201; body: %s", w.Code, w.Body.String())
 	}
 	var sub subscriptionDTO
 	decodeJSONBody(t, w, &sub)
-	if sub.ID != "aa11:bb22" || sub.Mode != "mirror" {
+	if sub.ID != peer.ID+":bb22" || sub.Mode != "mirror" {
 		t.Fatalf("unexpected subscription body: %+v", sub)
 	}
 
@@ -624,5 +635,21 @@ func TestRootPlaceholder(t *testing.T) {
 	srv.Handler().ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestSubscriptionsAddRejectsUnknownPeer pins that core's peer validation
+// surfaces as a 400 rather than a 201 with an inert subscription behind it.
+func TestSubscriptionsAddRejectsUnknownPeer(t *testing.T) {
+	srv, node, _ := newTestServer(t)
+
+	w := doRequest(t, srv, http.MethodPost, "/api/subscriptions", testToken, map[string]any{
+		"peer": "nishinomiya", "share_id": "test", "local_path": filepath.Join(t.TempDir(), "sub"), "mode": "mirror",
+	})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body: %s", w.Code, w.Body.String())
+	}
+	if subs := node.Status().Subscriptions; len(subs) != 0 {
+		t.Fatalf("subscriptions = %+v, want the rejected one not to be persisted", subs)
 	}
 }
