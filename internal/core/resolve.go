@@ -38,7 +38,10 @@ func matchRef(kind, ref string, candidates [][2]string) (string, error) {
 		return "", fmt.Errorf("empty %s reference", kind)
 	}
 	if len(candidates) == 0 {
-		return "", fmt.Errorf("no %ss are configured", kind)
+		// Same "no <kind> matches" opening as the miss below, deliberately:
+		// callers (internal/api's mutationError) key the not-found status
+		// off that phrase, and an empty collection is still a miss.
+		return "", fmt.Errorf("no %s matches %q — no %ss are configured", kind, ref, kind)
 	}
 
 	var byName, byPrefix []string
@@ -173,4 +176,58 @@ func (n *Node) resolveSubscriptionRef(peerRef, shareRef string) (peerKeyHex, sha
 		shareID = id
 	}
 	return peerKeyHex, shareID
+}
+
+// resolveLocalShareRef resolves a share ref against the shares this node
+// offers.
+func (n *Node) resolveLocalShareRef(ref string) (string, error) {
+	n.cfgMu.RLock()
+	candidates := make([][2]string, 0, len(n.cfg.Shares))
+	for _, s := range n.cfg.Shares {
+		candidates = append(candidates, [2]string{s.ID, s.Name})
+	}
+	n.cfgMu.RUnlock()
+	return matchRef("share", ref, candidates)
+}
+
+// resolveShareOrSubscriptionRef resolves a share ref against everything this
+// node holds a local copy of: the shares it offers plus the shares it
+// subscribes to from peers. That union is exactly what the trash is keyed
+// by (see shareOrSubscriptionRoot), since files are trashed on whichever
+// side deleted them.
+//
+// A subscription's display name comes from the offering peer's last
+// ShareList, so it is only known while that peer has been connected during
+// this run. A subscription with no name yet is still matchable by id or id
+// prefix — it simply contributes no name to match against.
+func (n *Node) resolveShareOrSubscriptionRef(ref string) (string, error) {
+	type subRef struct{ peerKeyHex, shareID string }
+
+	n.cfgMu.RLock()
+	candidates := make([][2]string, 0, len(n.cfg.Shares)+len(n.cfg.Subscriptions))
+	for _, s := range n.cfg.Shares {
+		candidates = append(candidates, [2]string{s.ID, s.Name})
+	}
+	subs := make([]subRef, 0, len(n.cfg.Subscriptions))
+	for _, s := range n.cfg.Subscriptions {
+		subs = append(subs, subRef{s.Peer, s.ShareID})
+	}
+	n.cfgMu.RUnlock()
+
+	// Names are gathered after releasing cfgMu: offeredShares takes the
+	// peerConn lock, and nesting the two would invert the order every
+	// other path here uses.
+	for _, s := range subs {
+		var name string
+		if pc := n.lookupPeer(s.peerKeyHex); pc != nil {
+			for _, e := range pc.offeredShares() {
+				if e.ShareID == s.shareID {
+					name = e.Name
+					break
+				}
+			}
+		}
+		candidates = append(candidates, [2]string{s.shareID, name})
+	}
+	return matchRef("share", ref, candidates)
 }

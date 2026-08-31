@@ -1216,3 +1216,102 @@ func connectedPairWithShare(t *testing.T, shareName string) (nodeA, nodeB *Node,
 	})
 	return nodeA, nodeB, shareID
 }
+
+// TestTrashResolvesShareRef covers the case that exposed how narrowly
+// resolve.go had been wired in: `syncat share ls` prints a share's name
+// right next to its id, but `syncat trash ls <name>` answered "share test is
+// not a local share or subscription" — because trash resolution was exact-id
+// only. Every ref form the rest of the CLI accepts has to work here too.
+func TestTrashResolvesShareRef(t *testing.T) {
+	node := newTestNode(t, "node")
+	shareID, err := node.AddShare(t.TempDir(), "test", config.PermissionReadOnly, false)
+	if err != nil {
+		t.Fatalf("AddShare: %v", err)
+	}
+
+	for _, ref := range []string{"test", shareID, shareID[:6]} {
+		if _, err := node.ListTrash(ref); err != nil {
+			t.Errorf("ListTrash(%q): %v", ref, err)
+		}
+	}
+	if _, err := node.ListTrash("nosuchshare"); err == nil {
+		t.Error("ListTrash with an unknown ref succeeded; want an error")
+	}
+}
+
+// TestTrashResolvesSubscriptionRef: the trash holds entries for subscribed
+// shares too (files are trashed on whichever side deleted them), so trash
+// refs resolve against the union of offered and subscribed shares — not just
+// the ones this node offers.
+func TestTrashResolvesSubscriptionRef(t *testing.T) {
+	_, nodeB, shareID := connectedPairWithShare(t, "docs")
+	if err := nodeB.AddSubscription("nodeA", "docs", t.TempDir(), config.ModeMirror); err != nil {
+		t.Fatalf("AddSubscription: %v", err)
+	}
+
+	// nodeB offers nothing; "docs" is only reachable as a subscription, and
+	// its name is only known because nodeA sent a ShareList.
+	for _, ref := range []string{"docs", shareID, shareID[:6]} {
+		if _, err := nodeB.ListTrash(ref); err != nil {
+			t.Errorf("ListTrash(%q) on a subscribed share: %v", ref, err)
+		}
+	}
+}
+
+// TestShareMutatorsResolveRefs: every share-addressed mutator takes the same
+// refs, or the CLI is inconsistent again in a different place.
+func TestShareMutatorsResolveRefs(t *testing.T) {
+	node := newTestNode(t, "node")
+	shareID, err := node.AddShare(t.TempDir(), "docs", config.PermissionReadOnly, false)
+	if err != nil {
+		t.Fatalf("AddShare: %v", err)
+	}
+
+	if err := node.RenameShare("docs", "papers"); err != nil {
+		t.Fatalf("RenameShare by name: %v", err)
+	}
+	if err := node.SetSharePermission("papers", config.PermissionReadWrite); err != nil {
+		t.Fatalf("SetSharePermission by the new name: %v", err)
+	}
+	if err := node.SetShareApprovalRequired(shareID[:6], true); err != nil {
+		t.Fatalf("SetShareApprovalRequired by id prefix: %v", err)
+	}
+
+	shares := node.Status().Shares
+	if len(shares) != 1 || shares[0].Name != "papers" ||
+		shares[0].Permission != config.PermissionReadWrite || !shares[0].ApprovalRequired {
+		t.Fatalf("Shares = %+v, want one renamed rw share requiring approval", shares)
+	}
+
+	if err := node.RemoveShare("papers"); err != nil {
+		t.Fatalf("RemoveShare by name: %v", err)
+	}
+	if shares := node.Status().Shares; len(shares) != 0 {
+		t.Fatalf("Shares = %+v, want none", shares)
+	}
+}
+
+// TestRemovePeerResolvesRef: peer removal takes a name too, and — because it
+// resolves best-effort — an exact key still works even when resolution has
+// nothing to work with.
+func TestRemovePeerResolvesRef(t *testing.T) {
+	nodeA := newTestNode(t, "nodeA")
+	other := newTestNode(t, "other")
+	if _, err := nodeA.AddPeer("bob", peerToken(t, other)); err != nil {
+		t.Fatalf("AddPeer: %v", err)
+	}
+	if err := nodeA.RemovePeer("bob"); err != nil {
+		t.Fatalf("RemovePeer by display name: %v", err)
+	}
+	if peers := nodeA.Status().Peers; len(peers) != 0 {
+		t.Fatalf("Peers = %+v, want none", peers)
+	}
+
+	// An unresolvable ref must still produce the plain "not configured"
+	// error rather than a resolver error, so the API keeps answering 404.
+	if err := nodeA.RemovePeer("bob"); err == nil {
+		t.Fatal("RemovePeer of an already-removed peer succeeded; want an error")
+	} else if !strings.Contains(err.Error(), "is not configured") {
+		t.Errorf("error = %v, want it to say the peer is not configured", err)
+	}
+}

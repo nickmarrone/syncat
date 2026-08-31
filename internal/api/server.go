@@ -278,7 +278,19 @@ func mutationError(err error) (status int, code, message string) {
 
 	msg := err.Error()
 	switch {
-	case containsAny(msg, "is not configured", "is not a local share", "no trashed entry", "has no active watch"):
+	// "no share matches" is internal/core/resolve.go's phrasing for a share
+	// ref that names nothing. Every path that produces it is addressing a
+	// share by URL — /api/shares/{id} and /api/shares/{id}/trash — so it is
+	// the addressed resource being absent, i.e. a 404, exactly like the
+	// "is not configured" lookups it now runs ahead of.
+	//
+	// Its peer counterpart ("no peer matches") is deliberately absent here.
+	// A peer ref only ever reaches core from a request *body*
+	// (POST /api/subscriptions), which is caller-fixable input and stays a
+	// 400. DELETE /api/peers/{id} never produces it: RemovePeer resolves
+	// best-effort and falls through to findPeerIndex's own "is not
+	// configured", which this same case already maps to 404.
+	case containsAny(msg, "is not configured", "is not a local share", "no trashed entry", "has no active watch", "no share matches"):
 		return http.StatusNotFound, "not_found", msg
 	case containsAny(msg, "already configured", "already exists", "overlaps"):
 		return http.StatusConflict, "conflict", msg

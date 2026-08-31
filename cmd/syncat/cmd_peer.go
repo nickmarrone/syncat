@@ -94,7 +94,7 @@ func cmdPeerRm(paths *config.Paths, args []string) error {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return fmt.Errorf("usage: syncat peer rm ID")
+		return fmt.Errorf("usage: syncat peer rm ID\n\nID accepts a name, an id, or a unique id prefix (see `syncat peer ls`)")
 	}
 
 	c, err := newAPIClient(paths)

@@ -103,7 +103,7 @@ func cmdShareRm(paths *config.Paths, args []string) error {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return fmt.Errorf("usage: syncat share rm ID")
+		return fmt.Errorf("usage: syncat share rm ID\n\nID accepts a name, an id, or a unique id prefix (see `syncat share ls`)")
 	}
 
 	c, err := newAPIClient(paths)
@@ -128,7 +128,7 @@ func cmdShareSet(paths *config.Paths, args []string) error {
 		return err
 	}
 	if len(positional) != 1 || fs.NArg() != 0 {
-		return fmt.Errorf("usage: syncat share set ID [--name N] [--perm ro|rw] [--approval|--no-approval]")
+		return fmt.Errorf("usage: syncat share set ID [--name N] [--perm ro|rw] [--approval|--no-approval]\n\nID accepts a name, an id, or a unique id prefix (see `syncat share ls`)")
 	}
 	if *approval && *noApproval {
 		return fmt.Errorf("--approval and --no-approval are mutually exclusive")

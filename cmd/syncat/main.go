@@ -26,13 +26,13 @@ var commands = []command{
 	{name: "init", usage: "syncat init [--name NAME]", summary: "generate keys and config for a new node", implemented: true, run: cmdInit},
 	{name: "daemon", usage: "syncat daemon [--api ADDR]", summary: "run the syncat daemon", implemented: true, run: cmdDaemon},
 	{name: "token", usage: "syncat token", summary: "print this node's connection token", implemented: true, run: cmdToken},
-	{name: "peer", usage: "syncat peer add TOKEN [--name N] | ls | rm ID | approve ID", summary: "manage peers", implemented: true, run: cmdPeer},
+	{name: "peer", usage: "syncat peer add TOKEN [--name N] | ls | rm ID | approve ID", summary: "manage peers (ID: name, key, or key prefix)", implemented: true, run: cmdPeer},
 	{name: "status", usage: "syncat status [--watch] [--json]", summary: "show node/peer/transfer status", implemented: true, run: cmdStatus},
-	{name: "share", usage: "syncat share add PATH --name N [--perm ro|rw] [--approval] | ls | rm ID | set ID [...]", summary: "manage local shares", implemented: true, run: cmdShare},
+	{name: "share", usage: "syncat share add PATH --name N [--perm ro|rw] [--approval] | ls | rm ID | set ID [...]", summary: "manage local shares (ID: name, id, or id prefix)", implemented: true, run: cmdShare},
 	{name: "remote", usage: "syncat remote ls", summary: "list peers' offered shares", implemented: true, run: cmdRemote},
 	{name: "subscription", usage: "syncat subscription add PEER SHARE LOCALPATH [--mode mirror|receive] | ls | rm PEER SHARE | pause PEER SHARE | resume PEER SHARE", summary: "manage subscriptions to peers' shares (PEER/SHARE: name, id, or id prefix)", implemented: true, run: cmdSubscription},
 	{name: "approvals", usage: "syncat approvals [grant|deny ID]", summary: "manage pending approvals (not implemented — SPEC.md §2.3 is deferred)", implemented: true, run: cmdApprovals},
-	{name: "trash", usage: "syncat trash ls SHARE | restore SHARE PATH", summary: "browse/restore trashed files", implemented: true, run: cmdTrash},
+	{name: "trash", usage: "syncat trash ls SHARE | restore SHARE PATH", summary: "browse/restore trashed files (SHARE: name, id, or id prefix)", implemented: true, run: cmdTrash},
 }
 
 func main() {

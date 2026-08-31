@@ -634,7 +634,14 @@ func (n *Node) AddPeer(name, token string) (string, error) {
 // previous access to every share, with no new approval and nothing shown
 // to the user. Removing a peer should mean it starts from nothing if it
 // ever comes back.
-func (n *Node) RemovePeer(peerKeyHex string) error {
+func (n *Node) RemovePeer(peerRef string) error {
+	// Best-effort, matching RemoveSubscription: an unresolvable ref falls
+	// through to findPeerIndex's own "is not configured" error rather than
+	// being rejected here.
+	peerKeyHex := peerRef
+	if pc, err := n.resolvePeerRef(peerRef); err == nil {
+		peerKeyHex = pc.peerKeyHex
+	}
 	var droppedSubs []config.Subscription
 	var droppedAccess []string // share ids we revoked this peer's access to
 	if _, err := n.mutateConfig(func(cfg *config.Config) error {
@@ -729,7 +736,11 @@ func (n *Node) AddShare(path, name, permission string, approvalRequired bool) (s
 // RemoveShare stops offering a share: persists the removal, stops its
 // watcher, neuters it on any live sessions (see the package doc comment),
 // and announces the updated share list.
-func (n *Node) RemoveShare(shareID string) error {
+func (n *Node) RemoveShare(shareRef string) error {
+	shareID, err := n.resolveLocalShareRef(shareRef)
+	if err != nil {
+		return fmt.Errorf("core: remove share: %w", err)
+	}
 	if _, err := n.mutateConfig(func(cfg *config.Config) error {
 		i := findShareIndex(cfg, shareID)
 		if i < 0 {
@@ -748,7 +759,11 @@ func (n *Node) RemoveShare(shareID string) error {
 }
 
 // RenameShare updates a share's display name.
-func (n *Node) RenameShare(shareID, name string) error {
+func (n *Node) RenameShare(shareRef, name string) error {
+	shareID, err := n.resolveLocalShareRef(shareRef)
+	if err != nil {
+		return fmt.Errorf("core: rename share: %w", err)
+	}
 	if _, err := n.mutateConfig(func(cfg *config.Config) error {
 		i := findShareIndex(cfg, shareID)
 		if i < 0 {
@@ -766,9 +781,13 @@ func (n *Node) RenameShare(shareID, name string) error {
 // SetSharePermission changes a share's permission (SPEC.md §6), updating
 // the Direction every currently-connected, currently-granted session for
 // this share uses from this point on.
-func (n *Node) SetSharePermission(shareID, permission string) error {
+func (n *Node) SetSharePermission(shareRef, permission string) error {
 	if permission != config.PermissionReadOnly && permission != config.PermissionReadWrite {
 		return fmt.Errorf("core: set share permission: invalid permission %q", permission)
+	}
+	shareID, err := n.resolveLocalShareRef(shareRef)
+	if err != nil {
+		return fmt.Errorf("core: set share permission: %w", err)
 	}
 	if _, err := n.mutateConfig(func(cfg *config.Config) error {
 		i := findShareIndex(cfg, shareID)
@@ -806,7 +825,11 @@ func (n *Node) SetSharePermission(shareID, permission string) error {
 // SPEC.md §6's approval queue is deferred (see the package doc comment),
 // so this is persisted but has no live effect yet — every SubscribeRequest
 // is still auto-granted.
-func (n *Node) SetShareApprovalRequired(shareID string, required bool) error {
+func (n *Node) SetShareApprovalRequired(shareRef string, required bool) error {
+	shareID, err := n.resolveLocalShareRef(shareRef)
+	if err != nil {
+		return fmt.Errorf("core: set share approval required: %w", err)
+	}
 	if _, err := n.mutateConfig(func(cfg *config.Config) error {
 		i := findShareIndex(cfg, shareID)
 		if i < 0 {
@@ -825,11 +848,23 @@ func (n *Node) SetShareApprovalRequired(shareID string, required bool) error {
 // (SPEC.md §6), persisting the decision and, if the peer is connected,
 // pushing AccessUpdate and adding/neutering the share on that session
 // immediately.
-func (n *Node) SetShareAccess(shareID, peerKeyHex, access string) error {
+func (n *Node) SetShareAccess(shareRef, peerRef, access string) error {
 	switch access {
 	case protocol.AccessGranted, protocol.AccessDenied, protocol.AccessRevoked:
 	default:
 		return fmt.Errorf("core: set share access: invalid access %q", access)
+	}
+	shareID, err := n.resolveLocalShareRef(shareRef)
+	if err != nil {
+		return fmt.Errorf("core: set share access: %w", err)
+	}
+	// The peer ref is resolved best-effort, not strictly: an access entry
+	// may legitimately name a key this node has no peer for (a peer removed
+	// while its grant lingered), and refusing those would make the stale
+	// entry impossible to revoke.
+	peerKeyHex := peerRef
+	if pc, err := n.resolvePeerRef(peerRef); err == nil {
+		peerKeyHex = pc.peerKeyHex
 	}
 
 	var share config.Share
@@ -1106,7 +1141,11 @@ func (n *Node) shareOrSubscriptionRoot(shareID string) (string, error) {
 // most-recently-trashed first. shareID must be a locally offered share or
 // subscription; an empty result (not an error) means nothing has been
 // trashed for it yet.
-func (n *Node) ListTrash(shareID string) ([]syncsvc.Entry, error) {
+func (n *Node) ListTrash(shareRef string) ([]syncsvc.Entry, error) {
+	shareID, err := n.resolveShareOrSubscriptionRef(shareRef)
+	if err != nil {
+		return nil, fmt.Errorf("core: list trash: %w", err)
+	}
 	if _, err := n.shareOrSubscriptionRoot(shareID); err != nil {
 		return nil, fmt.Errorf("core: list trash: %w", err)
 	}
@@ -1124,7 +1163,11 @@ func (n *Node) ListTrash(shareID string) ([]syncsvc.Entry, error) {
 // trash restore` path, which requires a later rescan since no daemon is
 // running to trigger one). Returns an error wrapping
 // syncsvc.ErrRestoreDestExists if the destination is already occupied.
-func (n *Node) RestoreTrash(ctx context.Context, shareID, relPath string) (index.FileRow, error) {
+func (n *Node) RestoreTrash(ctx context.Context, shareRef, relPath string) (index.FileRow, error) {
+	shareID, err := n.resolveShareOrSubscriptionRef(shareRef)
+	if err != nil {
+		return index.FileRow{}, fmt.Errorf("core: restore trash: %w", err)
+	}
 	root, err := n.shareOrSubscriptionRoot(shareID)
 	if err != nil {
 		return index.FileRow{}, fmt.Errorf("core: restore trash: %w", err)

@@ -45,7 +45,7 @@ func cmdTrashLs(paths *config.Paths, args []string) error {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return fmt.Errorf("usage: syncat trash ls SHARE")
+		return fmt.Errorf("usage: syncat trash ls SHARE\n\nSHARE accepts a name, an id, or a unique id prefix, for a share you offer or subscribe to")
 	}
 	shareID := fs.Arg(0)
 
@@ -78,7 +78,7 @@ func cmdTrashRestore(paths *config.Paths, args []string) error {
 		return err
 	}
 	if fs.NArg() != 2 {
-		return fmt.Errorf("usage: syncat trash restore SHARE PATH")
+		return fmt.Errorf("usage: syncat trash restore SHARE PATH\n\nSHARE accepts a name, an id, or a unique id prefix, for a share you offer or subscribe to")
 	}
 	shareID, relPath := fs.Arg(0), fs.Arg(1)
 
