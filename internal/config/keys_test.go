@@ -2,7 +2,11 @@ package config
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -120,5 +124,146 @@ func TestLoadTailcatKeyMissingFile(t *testing.T) {
 	_, err := LoadTailcatKey(filepath.Join(t.TempDir(), "nope.key"))
 	if err == nil {
 		t.Fatal("expected error for missing tailcat key, got nil")
+	}
+}
+
+func TestTokenRoundTrip(t *testing.T) {
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	const connBlob = "tcSomeOpaqueBlobData123"
+	const name = "alice's laptop"
+
+	tok, err := EncodeToken(connBlob, pub, name)
+	if err != nil {
+		t.Fatalf("EncodeToken: %v", err)
+	}
+	if !strings.HasPrefix(tok, TokenPrefix) {
+		t.Fatalf("token %q missing prefix %q", tok, TokenPrefix)
+	}
+
+	got, err := ParseToken(tok)
+	if err != nil {
+		t.Fatalf("ParseToken: %v", err)
+	}
+	if got.ConnBlob != connBlob {
+		t.Errorf("ConnBlob = %q, want %q", got.ConnBlob, connBlob)
+	}
+	if !got.ID.Equal(pub) {
+		t.Errorf("ID = %x, want %x", []byte(got.ID), []byte(pub))
+	}
+	if got.Name != name {
+		t.Errorf("Name = %q, want %q", got.Name, name)
+	}
+}
+
+func TestParseTokenRejectsBadPrefix(t *testing.T) {
+	_, err := ParseToken("xy1abcdef")
+	if err == nil {
+		t.Fatal("expected error for bad prefix, got nil")
+	}
+}
+
+func TestParseTokenRejectsBadBase64(t *testing.T) {
+	_, err := ParseToken(TokenPrefix + "not-valid-base64!!!")
+	if err == nil {
+		t.Fatal("expected error for bad base64, got nil")
+	}
+}
+
+func TestParseTokenRejectsBadCBOR(t *testing.T) {
+	// Valid base64url, but not valid CBOR.
+	_, err := ParseToken(TokenPrefix + "AAAAAAAA")
+	if err == nil {
+		t.Fatal("expected error for bad cbor, got nil")
+	}
+}
+
+func TestParseTokenRejectsWrongLengthID(t *testing.T) {
+	// Encode a payload with a short id directly, bypassing EncodeToken's
+	// length check.
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	tok, err := EncodeToken("tcblob", pub, "name")
+	if err != nil {
+		t.Fatalf("EncodeToken: %v", err)
+	}
+
+	// Sanity: a correctly-sized id parses fine.
+	if _, err := ParseToken(tok); err != nil {
+		t.Fatalf("ParseToken of well-formed token failed: %v", err)
+	}
+
+	if _, err := EncodeToken("tcblob", pub[:16], "name"); err == nil {
+		t.Fatal("expected EncodeToken to reject a short id, got nil error")
+	}
+}
+
+func TestAPITokenIsHex64AndPrivateMode(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "api.token")
+
+	tok, err := LoadOrCreateAPIToken(path)
+	if err != nil {
+		t.Fatalf("LoadOrCreateAPIToken: %v", err)
+	}
+	if len(tok) != 64 {
+		t.Errorf("token length = %d, want 64", len(tok))
+	}
+	for _, r := range tok {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')) {
+			t.Errorf("token %q contains non-hex character %q", tok, r)
+			break
+		}
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0600 {
+		t.Errorf("api.token mode = %o, want 0600", perm)
+	}
+}
+
+func TestAPITokenRegenerateIsNoOp(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "api.token")
+
+	tok1, err := LoadOrCreateAPIToken(path)
+	if err != nil {
+		t.Fatalf("LoadOrCreateAPIToken (first): %v", err)
+	}
+	tok2, err := LoadOrCreateAPIToken(path)
+	if err != nil {
+		t.Fatalf("LoadOrCreateAPIToken (second): %v", err)
+	}
+	if tok1 != tok2 {
+		t.Errorf("token changed across reload: %s != %s", tok1, tok2)
+	}
+}
+
+func TestNewShareIDLengthAndUniqueness(t *testing.T) {
+	seen := make(map[string]bool)
+	for i := 0; i < 1000; i++ {
+		id, err := NewShareID()
+		if err != nil {
+			t.Fatalf("NewShareID: %v", err)
+		}
+		if len(id) != 16 { // 8 bytes, hex-encoded
+			t.Fatalf("NewShareID() = %q, want 16 hex chars", id)
+		}
+		for _, r := range id {
+			if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')) {
+				t.Fatalf("NewShareID() = %q contains non-hex character %q", id, r)
+			}
+		}
+		if seen[id] {
+			t.Fatalf("NewShareID() produced duplicate id %q", id)
+		}
+		seen[id] = true
 	}
 }

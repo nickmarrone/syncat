@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/fxamacker/cbor/v2"
 	"github.com/tailscale/tailcat"
 )
 
@@ -153,4 +155,108 @@ func LoadOrCreateTailcatKey(ctx context.Context, path string) (key *tailcat.Priv
 		return nil, false, fmt.Errorf("config: save tailcat key %s: %w", path, err)
 	}
 	return priv, true, nil
+}
+
+// TokenPrefix versions the syncat node token format (SPEC.md §2).
+const TokenPrefix = "sc1"
+
+// tokenPayload is the CBOR body of a node token. It's encoded as a CBOR map
+// (not an array) keyed by these short field names so that decoding ignores
+// unknown fields going forward (SPEC.md §11 forward-compat obligation).
+type tokenPayload struct {
+	TC   string `cbor:"tc"`
+	ID   []byte `cbor:"id"`
+	Name string `cbor:"name"`
+}
+
+// NodeToken is the parsed form of a syncat node token: the tailcat
+// connection blob, the node's Ed25519 public key, and its suggested display
+// name.
+type NodeToken struct {
+	ConnBlob string
+	ID       ed25519.PublicKey
+	Name     string
+}
+
+// EncodeToken builds an `sc1...` token wrapping connBlob (a tailcat
+// ConnBlob string), the node's Ed25519 public key, and its display name.
+func EncodeToken(connBlob string, id ed25519.PublicKey, name string) (string, error) {
+	if len(id) != ed25519.PublicKeySize {
+		return "", fmt.Errorf("config: token: identity key must be %d bytes, got %d", ed25519.PublicKeySize, len(id))
+	}
+
+	payload := tokenPayload{TC: connBlob, ID: []byte(id), Name: name}
+	data, err := cbor.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("config: token: cbor encode: %w", err)
+	}
+	return TokenPrefix + base64.RawURLEncoding.EncodeToString(data), nil
+}
+
+// ParseToken decodes an `sc1...` token, rejecting a missing/wrong prefix,
+// invalid base64, invalid CBOR, or an id that isn't exactly 32 bytes.
+func ParseToken(token string) (*NodeToken, error) {
+	rest, ok := strings.CutPrefix(token, TokenPrefix)
+	if !ok {
+		return nil, fmt.Errorf("config: token: missing %q prefix", TokenPrefix)
+	}
+
+	data, err := base64.RawURLEncoding.DecodeString(rest)
+	if err != nil {
+		return nil, fmt.Errorf("config: token: base64 decode: %w", err)
+	}
+
+	var payload tokenPayload
+	if err := cbor.Unmarshal(data, &payload); err != nil {
+		return nil, fmt.Errorf("config: token: cbor decode: %w", err)
+	}
+
+	if len(payload.ID) != ed25519.PublicKeySize {
+		return nil, fmt.Errorf("config: token: id has %d bytes, want %d", len(payload.ID), ed25519.PublicKeySize)
+	}
+
+	return &NodeToken{
+		ConnBlob: payload.TC,
+		ID:       ed25519.PublicKey(payload.ID),
+		Name:     payload.Name,
+	}, nil
+}
+
+// apiTokenBytes is the number of random bytes in api.token, hex-encoded to
+// 64 characters (SPEC.md §3).
+const apiTokenBytes = 32
+
+// LoadOrCreateAPIToken loads the REST API auth token from path, generating
+// and persisting a new random 64-hex-character token (mode 0600) if none
+// exists. Regenerating is a no-op if a valid token is already present.
+func LoadOrCreateAPIToken(path string) (string, error) {
+	if data, err := os.ReadFile(path); err == nil {
+		tok := strings.TrimSpace(string(data))
+		if _, err := hex.DecodeString(tok); err != nil || len(tok) != apiTokenBytes*2 {
+			return "", fmt.Errorf("config: api token %s is malformed (want %d hex chars)", path, apiTokenBytes*2)
+		}
+		return tok, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("config: read api token %s: %w", path, err)
+	}
+
+	raw := make([]byte, apiTokenBytes)
+	if _, err := rand.Read(raw); err != nil {
+		return "", fmt.Errorf("config: generate api token: %w", err)
+	}
+	tok := hex.EncodeToString(raw)
+	if err := writeFileAtomic(path, []byte(tok), 0600); err != nil {
+		return "", fmt.Errorf("config: save api token %s: %w", path, err)
+	}
+	return tok, nil
+}
+
+// NewShareID returns a random 8-byte hex-encoded (16 character) share id,
+// generated at share creation and stable for the share's life (SPEC.md §3).
+func NewShareID() (string, error) {
+	raw := make([]byte, 8)
+	if _, err := rand.Read(raw); err != nil {
+		return "", fmt.Errorf("config: generate share id: %w", err)
+	}
+	return hex.EncodeToString(raw), nil
 }

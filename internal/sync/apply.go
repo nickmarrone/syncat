@@ -14,7 +14,7 @@ import (
 	"github.com/nickmarrone/syncat/internal/protocol"
 )
 
-// applyAction executes one 5a Action against the filesystem, returning the
+// applyAction executes one reconciled Action against the filesystem, returning the
 // index.FileRow(s) that must now be persisted (empty/nil if nothing
 // changed — e.g. ActionNone, ActionLocallyModified, or a non-empty
 // directory delete that was skipped). The caller (handleIndexUpdate)
@@ -205,7 +205,7 @@ func (s *Session) applyConflictCopy(ctx context.Context, cfg ShareConfig, a Acti
 		// gaining a new conflict-copy path). a.ConflictInfo.Version is used
 		// verbatim as the wire version — unlike a.Resolved, ConflictInfo is
 		// never rewritten with a merged/bumped version (see its doc
-		// comment in action.go), so it's already exactly what the peer
+		// comment in reconcile.go), so it's already exactly what the peer
 		// advertised.
 		if err := s.pullAndInstall(ctx, cfg.ShareID, cfg.Root, a.RelPath, a.ConflictRelPath, a.ConflictInfo, a.ConflictInfo.Version); err != nil {
 			return []index.FileRow{winnerRow}, fmt.Errorf("sync: conflict copy %s: pull loser: %w", a.RelPath, err)
@@ -275,7 +275,7 @@ func (s *Session) applyConflictCopy(ctx context.Context, cfg ShareConfig, a Acti
 // locally (for a conflict resolution, Merge(local, remote) plus a local
 // Bump — see Action.Resolved's doc comment), while wireVersion must be the
 // version the peer actually advertised, or the peer's own freshness check
-// (handleFileRequest's Equal(row.Version, req.Version) in transfer.go) can
+// (handleFileRequest's Equal(row.Version, req.Version) in session.go) can
 // never match. Every caller passes the right one via Action.SourceVersion
 // (or, for a conflict copy's loser, ConflictInfo.Version, which is never
 // rewritten in the first place). The temp file is removed on every error

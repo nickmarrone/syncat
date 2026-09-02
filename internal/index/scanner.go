@@ -22,12 +22,11 @@ import (
 // caller passes it to Store.ApplyScanResult.
 //
 // None of the rows here carry a bumped version vector: Scanner has no
-// opinion on version-vector algebra (that's Phase 5). For an existing
-// file, a row's Version is copied unchanged from the index's current
-// entry; for a brand-new or resurrected path, Version is nil. Phase 5's
-// apply step decides how to bump local counters before these rows become
-// durable via ApplyScanResult (or is expected to bump them itself before
-// storing, if it needs different behavior).
+// opinion on version-vector algebra — that lives in internal/sync. For an
+// existing file, a row's Version is copied unchanged from the index's
+// current entry; for a brand-new or resurrected path, Version is nil. The
+// caller bumps local counters (internal/core's rescanShare does) before
+// these rows become durable via ApplyScanResult.
 type ScanResult struct {
 	ShareID string
 
@@ -52,7 +51,7 @@ type ScanResult struct {
 	// this scan but were not found on disk (or now resolve to an ignored
 	// or symlink path). Directories are only tombstoned when they
 	// disappear entirely; SPEC.md §5's "keep non-empty locally-modified
-	// dirs" rule belongs to Phase 5's apply step, not here.
+	// dirs" rule belongs to internal/sync's apply step, not here.
 	Deleted []FileRow
 
 	// Warnings collects human-readable descriptions of entries the scan
@@ -63,20 +62,27 @@ type ScanResult struct {
 }
 
 // Scanner walks one share root, classifying every entry against the
-// index's current view of that share (SPEC.md §5 "Scanning"). It reads
-// the tree exclusively through FS (an fs.FS), not os.* directly, per
-// SPEC.md §12 — see fs.go.
+// index's current view of that share (SPEC.md §5 "Scanning").
+//
+// It reads the tree exclusively through an fs.FS, never os.* directly, so
+// a mobile port can supply its own sandboxed filesystem (SPEC.md §12).
+// fs.FS is all the scanner needs: Open covers streaming reads for
+// hashing, and fs.WalkDir type-asserts to fs.ReadDirFS for efficient
+// directory listing when the value supports it. os.DirFS(shareRoot)
+// satisfies both, so production needs no adapter and tests can substitute
+// fstest.MapFS. There is deliberately no write-side interface: nothing
+// here writes into a share tree — that belongs to internal/sync.
 //
 // The zero value is not usable; construct with NewScanner.
 type Scanner struct {
-	fsys   FS
+	fsys   fs.FS
 	ignore *Matcher // nil means nothing is ignored
 }
 
 // NewScanner returns a Scanner that reads share contents through fsys
 // (typically os.DirFS(shareRoot) in production) and excludes paths
 // matched by ignore (nil is fine — nothing is ignored).
-func NewScanner(fsys FS, ignore *Matcher) *Scanner {
+func NewScanner(fsys fs.FS, ignore *Matcher) *Scanner {
 	return &Scanner{fsys: fsys, ignore: ignore}
 }
 
@@ -90,8 +96,8 @@ func (sc *Scanner) warnf(format string, args ...any) string {
 // Store.ListShareMap). It does not write anything to the index; the
 // caller applies the result explicitly (e.g. via Store.ApplyScanResult)
 // once it's ready to make the change durable. This split matters because
-// Phase 5's reconciler needs to see a scan's outcome before it becomes the
-// new source of truth (e.g. to fold in version-vector bumps).
+// the caller needs to see a scan's outcome before it becomes the new
+// source of truth (e.g. to fold in version-vector bumps).
 //
 // Scan is robust to the tree changing underneath it: a file or directory
 // that vanishes, or a file that shrinks/errors out while being hashed,
@@ -212,7 +218,7 @@ func (sc *Scanner) Scan(ctx context.Context, shareID string, existing map[string
 		// SPEC.md §5: "A file is 'changed' when size or mtime differs
 		// from the index; then hash (sha256) to confirm. Hash-equal =>
 		// metadata-only update, no transfer." This is the load-bearing
-		// distinction the phase brief calls out for explicit testing.
+		// distinction; see scanner_test.go for the case that pins it.
 		sha, err := sc.hashFile(relpath)
 		if err != nil {
 			result.Warnings = append(result.Warnings, sc.warnf("index: scan %s: skip %s (read failed, likely changed/vanished mid-scan): %v", shareID, relpath, err))
@@ -253,7 +259,7 @@ func (sc *Scanner) Scan(ctx context.Context, shareID string, existing map[string
 
 // carriedVersion returns the version vector a newly-classified "Added" row
 // should carry: nil for a genuinely new path, or the prior tombstone's
-// vector (unchanged — Phase 5 decides how to bump it) for a resurrection.
+// vector (unchanged — the caller decides how to bump it) for a resurrection.
 func carriedVersion(old FileRow, existed bool) protocol.VersionVector {
 	if !existed {
 		return nil
@@ -275,4 +281,76 @@ func (sc *Scanner) hashFile(relpath string) ([]byte, error) {
 		return nil, err
 	}
 	return h.Sum(nil), nil
+}
+
+// Matcher decides whether a share-relative path should be excluded from
+// scanning, per SPEC.md §5's ignore-rules MVP subset. Full gitignore-style
+// `.syncatignore` matching (also described in SPEC.md §5) is explicitly
+// deferred — implementing it would pull in a gitignore-syntax library,
+// which is outside SPEC.md §10's dependency budget. Matcher covers only:
+//
+//   - Built-in always-ignored names: our own temp-file prefix
+//     (.syncat.tmp.*) and common OS junk files (.DS_Store, Thumbs.db,
+//     desktop.ini).
+//   - config.Config.GlobalIgnores: user-supplied glob patterns.
+//
+// Matching semantics, stated precisely because the web UI and the README
+// both have to describe them exactly:
+//
+//   - Every pattern is a path.Match pattern: '*' matches any sequence of
+//     non-'/' characters, '?' matches any single non-'/' character, and
+//     '[...]' is a character class. There is no '**' — a pattern cannot
+//     cross a '/' boundary by itself (path.Match's ErrBadPattern aside,
+//     unmatched pattern syntax is treated as "does not match", not an
+//     error — see path.Match's own doc comment).
+//   - A path is ignored if the pattern matches EITHER the entry's base
+//     name (path.Base(relpath)) OR the full share-relative path
+//     (forward-slash separated, no leading '/'), tried independently. A
+//     pattern with no '/' in it (e.g. "*.log") therefore matches a file
+//     of that name at any depth, because it always matches the base-name
+//     comparison; a pattern containing '/' (e.g. "build/output") only
+//     matches when compared against the full relpath.
+//   - relpath is always expected in forward-slash form (as produced by
+//     the scanner — see scanner.go), regardless of host OS.
+type Matcher struct {
+	patterns []string
+}
+
+// builtinIgnorePatterns are always excluded, regardless of config
+// (SPEC.md §5). ".syncat.tmp.*" is our own in-flight-download naming
+// scheme (SPEC.md §5 "Applying remote changes"); the rest are common OS
+// metadata files that should never be synced.
+var builtinIgnorePatterns = []string{
+	".syncat.tmp.*",
+	".DS_Store",
+	"Thumbs.db",
+	"desktop.ini",
+}
+
+// NewMatcher builds a Matcher from a share's global ignore list (typically
+// config.Config.GlobalIgnores). The built-ins are always included in
+// addition to globalIgnores.
+func NewMatcher(globalIgnores []string) *Matcher {
+	patterns := make([]string, 0, len(builtinIgnorePatterns)+len(globalIgnores))
+	patterns = append(patterns, builtinIgnorePatterns...)
+	patterns = append(patterns, globalIgnores...)
+	return &Matcher{patterns: patterns}
+}
+
+// Match reports whether relpath (forward-slash separated, share-relative,
+// no leading '/') should be excluded from scanning.
+func (m *Matcher) Match(relpath string) bool {
+	if m == nil {
+		return false
+	}
+	base := path.Base(relpath)
+	for _, pat := range m.patterns {
+		if ok, _ := path.Match(pat, base); ok {
+			return true
+		}
+		if ok, _ := path.Match(pat, relpath); ok {
+			return true
+		}
+	}
+	return false
 }

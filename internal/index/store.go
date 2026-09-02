@@ -1,10 +1,29 @@
+// Package index keeps this node's view of what is on disk (SPEC.md §5):
+// durable storage in SQLite ([Store], store.go), change detection and
+// ignore matching ([Scanner], [Matcher], scanner.go), and a debounced
+// fsnotify [Watcher] (watcher.go).
+//
+// This package is one of the gomobile-safe leaves called out in SPEC.md
+// §12: it imports no UI/CLI/HTTP packages, builds with CGO_ENABLED=0 (the
+// SQLite driver is modernc.org/sqlite, a pure-Go implementation), and the
+// scanner reads share contents through an fs.FS rather than calling os.*
+// directly, so a future mobile port can supply its own sandboxed
+// filesystem.
+//
+// Version vectors are opaque here: this package copies a row's
+// protocol.VersionVector through unchanged and never compares or bumps
+// one. That algebra lives in internal/sync.
 package index
 
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"time"
 
+	"github.com/nickmarrone/syncat/internal/protocol"
 	_ "modernc.org/sqlite" // registers the "sqlite" driver; pure Go, no cgo (SPEC.md §12)
 )
 
@@ -12,7 +31,8 @@ import (
 // <datadir>/db/index.db (SPEC.md §3, §5). It holds this node's own view of
 // each share's files (the `files` table), the latest IndexUpdate mirrored
 // from each peer (`peer_files`), and resumable-transfer bookkeeping
-// (`pending_transfers`, schema only in this phase — Phase 5 populates it).
+// (`pending_transfers`, schema only — nothing writes it yet; see
+// migrateV1).
 //
 // Concurrency model: a single *sql.DB in WAL mode (see openPragmas), shared
 // by the scanner, the watcher's rescan trigger, and (in later phases) the
@@ -168,11 +188,11 @@ func migrateV1(ctx context.Context, tx *sql.Tx) error {
 			PRIMARY KEY (peer_key, share_id, relpath)
 		)`,
 		`CREATE INDEX peer_files_share ON peer_files (peer_key, share_id, deleted)`,
-		// pending_transfers: created now so Phase 5's resume support has a
-		// stable schema to migrate onto later, per the phase brief. Not
-		// used by this phase. One row per (share_id, relpath, peer_key,
-		// direction) in-flight transfer; offset is the resume point
-		// (SPEC.md §4's FileRequest.offset).
+		// pending_transfers: nothing reads or writes this table yet. It
+		// exists so resumable transfers have a stable schema to migrate
+		// onto rather than needing a new migration. One row per (share_id,
+		// relpath, peer_key, direction) in-flight transfer; offset is the
+		// resume point (SPEC.md §4's FileRequest.offset, currently always 0).
 		`CREATE TABLE pending_transfers (
 			share_id     TEXT    NOT NULL,
 			relpath      TEXT    NOT NULL,
@@ -198,4 +218,354 @@ func (s *Store) Close() error {
 		return fmt.Errorf("index: close database: %w", err)
 	}
 	return nil
+}
+
+// FileRow is the index's on-disk representation of one file/dir/symlink
+// entry within a share: protocol.FileInfo (the wire shape) plus the local
+// bookkeeping columns SPEC.md §5 assigns to the `files` table (share_id,
+// deleted, updated_at). Callers that need the wire shape use [FileRow.Info];
+// callers building a row from a wire message use [FileRowFromInfo].
+//
+// Keeping this as an explicit, richer type — rather than reusing
+// protocol.FileInfo directly as the row shape — means a schema change here
+// (e.g. adding a local-only column) never risks leaking onto the wire, and
+// vice versa; the conversion between the two is small and tested (see
+// store_test.go).
+type FileRow struct {
+	ShareID   string
+	RelPath   string
+	Type      protocol.FileType
+	Size      int64
+	MTimeNS   int64
+	Mode      uint32
+	SHA256    []byte
+	Version   protocol.VersionVector
+	Deleted   bool
+	UpdatedAt time.Time
+}
+
+// Info converts the row to its wire shape.
+func (r FileRow) Info() protocol.FileInfo {
+	return protocol.FileInfo{
+		RelPath: r.RelPath,
+		Type:    r.Type,
+		Size:    r.Size,
+		MTimeNS: r.MTimeNS,
+		Mode:    r.Mode,
+		SHA256:  r.SHA256,
+		Version: r.Version,
+		Deleted: r.Deleted,
+	}
+}
+
+// FileRowFromInfo builds a FileRow from a wire FileInfo plus the local
+// columns the wire message doesn't carry.
+func FileRowFromInfo(shareID string, info protocol.FileInfo, updatedAt time.Time) FileRow {
+	return FileRow{
+		ShareID:   shareID,
+		RelPath:   info.RelPath,
+		Type:      info.Type,
+		Size:      info.Size,
+		MTimeNS:   info.MTimeNS,
+		Mode:      info.Mode,
+		SHA256:    info.SHA256,
+		Version:   info.Version,
+		Deleted:   info.Deleted,
+		UpdatedAt: updatedAt,
+	}
+}
+
+// cloneVersion returns a copy of v so callers can hand out a row's version
+// vector without letting the recipient mutate the row's own map.
+func cloneVersion(v protocol.VersionVector) protocol.VersionVector {
+	if v == nil {
+		return nil
+	}
+	out := make(protocol.VersionVector, len(v))
+	for k, val := range v {
+		out[k] = val
+	}
+	return out
+}
+
+// ErrNotFound is returned by lookups (GetFile) when no row matches.
+var ErrNotFound = errors.New("index: not found")
+
+// GetFile returns the row for one (shareID, relpath), including tombstones
+// (rows with Deleted=true).
+func (s *Store) GetFile(ctx context.Context, shareID, relpath string) (FileRow, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT relpath, type, size, mtime_ns, mode, sha256, version_json, deleted, updated_at
+		FROM files WHERE share_id = ? AND relpath = ?`, shareID, relpath)
+	fr, err := scanFileRow(row, shareID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return FileRow{}, fmt.Errorf("index: get %s/%s: %w", shareID, relpath, ErrNotFound)
+	}
+	if err != nil {
+		return FileRow{}, fmt.Errorf("index: get %s/%s: %w", shareID, relpath, err)
+	}
+	return fr, nil
+}
+
+// PutFile upserts one row into the files table.
+func (s *Store) PutFile(ctx context.Context, row FileRow) error {
+	vj, err := versionJSON(row.Version)
+	if err != nil {
+		return fmt.Errorf("index: put %s/%s: %w", row.ShareID, row.RelPath, err)
+	}
+	if _, err := s.db.ExecContext(ctx, putFileSQL,
+		row.ShareID, row.RelPath, string(row.Type), row.Size, row.MTimeNS, row.Mode,
+		row.SHA256, vj, boolInt(row.Deleted), timeNS(row.UpdatedAt),
+	); err != nil {
+		return fmt.Errorf("index: put %s/%s: %w", row.ShareID, row.RelPath, err)
+	}
+	return nil
+}
+
+// ListShare returns every row for a share, in relpath order.
+// includeDeleted controls whether tombstones are included.
+func (s *Store) ListShare(ctx context.Context, shareID string, includeDeleted bool) ([]FileRow, error) {
+	query := `SELECT relpath, type, size, mtime_ns, mode, sha256, version_json, deleted, updated_at
+		FROM files WHERE share_id = ?`
+	if !includeDeleted {
+		query += ` AND deleted = 0`
+	}
+	query += ` ORDER BY relpath`
+	rows, err := s.db.QueryContext(ctx, query, shareID)
+	if err != nil {
+		return nil, fmt.Errorf("index: list share %s: %w", shareID, err)
+	}
+	defer rows.Close()
+	return collectFileRows(rows, shareID)
+}
+
+// ListShareMap is a convenience wrapper around ListShare for the common
+// case of diffing a scan against the index: a relpath -> FileRow lookup,
+// including tombstones (the scanner needs to see them, to distinguish a
+// brand-new file from one being resurrected — see scanner.go).
+func (s *Store) ListShareMap(ctx context.Context, shareID string) (map[string]FileRow, error) {
+	rows, err := s.ListShare(ctx, shareID, true)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]FileRow, len(rows))
+	for _, r := range rows {
+		out[r.RelPath] = r
+	}
+	return out, nil
+}
+
+// ApplyScanResult persists a Scanner diff in one transaction: every added,
+// content-changed, and metadata-only row is upserted, and every deleted
+// row is written back as a tombstone (Deleted=true, other columns
+// unchanged from what the scanner reported). Applying is a separate,
+// explicit step from scanning (see scanner.go's doc comment) so a caller
+// can inspect or filter a ScanResult — e.g. skip files ignored mid-flight,
+// or hand it to internal/sync's reconciler first — before it becomes durable.
+func (s *Store) ApplyScanResult(ctx context.Context, result *ScanResult) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("index: apply scan result: begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+
+	stmt, err := tx.PrepareContext(ctx, putFileSQL)
+	if err != nil {
+		return fmt.Errorf("index: apply scan result: prepare: %w", err)
+	}
+	defer stmt.Close()
+
+	apply := func(rows []FileRow) error {
+		for _, row := range rows {
+			vj, err := versionJSON(row.Version)
+			if err != nil {
+				return fmt.Errorf("row %s/%s: %w", row.ShareID, row.RelPath, err)
+			}
+			if _, err := stmt.ExecContext(ctx,
+				row.ShareID, row.RelPath, string(row.Type), row.Size, row.MTimeNS, row.Mode,
+				row.SHA256, vj, boolInt(row.Deleted), timeNS(row.UpdatedAt),
+			); err != nil {
+				return fmt.Errorf("row %s/%s: %w", row.ShareID, row.RelPath, err)
+			}
+		}
+		return nil
+	}
+	for _, rows := range [][]FileRow{result.Added, result.ContentChanged, result.MetadataOnly, result.Deleted} {
+		if err := apply(rows); err != nil {
+			return fmt.Errorf("index: apply scan result: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("index: apply scan result: commit: %w", err)
+	}
+	return nil
+}
+
+const putFileSQL = `
+	INSERT INTO files (share_id, relpath, type, size, mtime_ns, mode, sha256, version_json, deleted, updated_at)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	ON CONFLICT (share_id, relpath) DO UPDATE SET
+		type = excluded.type,
+		size = excluded.size,
+		mtime_ns = excluded.mtime_ns,
+		mode = excluded.mode,
+		sha256 = excluded.sha256,
+		version_json = excluded.version_json,
+		deleted = excluded.deleted,
+		updated_at = excluded.updated_at`
+
+// rowScanner is satisfied by both *sql.Row and *sql.Rows, letting
+// scanFileRow serve GetFile (single row) and the List* methods (many rows)
+// with one implementation.
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanFileRow(row rowScanner, shareID string) (FileRow, error) {
+	var (
+		relpath, typ, versionJSONStr string
+		size, mtimeNS                int64
+		mode                         uint32
+		sha256                       []byte
+		deleted                      int
+		updatedAtNS                  int64
+	)
+	if err := row.Scan(&relpath, &typ, &size, &mtimeNS, &mode, &sha256, &versionJSONStr, &deleted, &updatedAtNS); err != nil {
+		return FileRow{}, err
+	}
+	version, err := unmarshalVersion(versionJSONStr)
+	if err != nil {
+		return FileRow{}, fmt.Errorf("decode version for %s/%s: %w", shareID, relpath, err)
+	}
+	return FileRow{
+		ShareID:   shareID,
+		RelPath:   relpath,
+		Type:      protocol.FileType(typ),
+		Size:      size,
+		MTimeNS:   mtimeNS,
+		Mode:      mode,
+		SHA256:    sha256,
+		Version:   version,
+		Deleted:   deleted != 0,
+		UpdatedAt: time.Unix(0, updatedAtNS).UTC(),
+	}, nil
+}
+
+func collectFileRows(rows *sql.Rows, shareID string) ([]FileRow, error) {
+	var out []FileRow
+	for rows.Next() {
+		fr, err := scanFileRow(rows, shareID)
+		if err != nil {
+			return nil, fmt.Errorf("scan row: %w", err)
+		}
+		out = append(out, fr)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate rows: %w", err)
+	}
+	return out, nil
+}
+
+// versionJSON encodes a version vector for storage. Marshaling
+// map[string]uint64 cannot practically fail, but we still propagate the
+// error rather than panicking (no panics in library code).
+func versionJSON(v protocol.VersionVector) (string, error) {
+	if v == nil {
+		return "{}", nil
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return "", fmt.Errorf("marshal version vector: %w", err)
+	}
+	return string(b), nil
+}
+
+func unmarshalVersion(s string) (protocol.VersionVector, error) {
+	if s == "" || s == "{}" {
+		return nil, nil
+	}
+	var v protocol.VersionVector
+	if err := json.Unmarshal([]byte(s), &v); err != nil {
+		return nil, err
+	}
+	return v, nil
+}
+
+func boolInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+func timeNS(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+	return t.UnixNano()
+}
+
+// UpsertPeerFiles replaces this peer's known state for the given rows, in
+// one transaction. Each row's ShareID/RelPath identifies which file it
+// describes; PeerKey is passed once for the whole batch since an
+// IndexUpdate always arrives from a single peer connection.
+//
+// This mirrors ApplyScanResult's shape (bulk, transactional) but for the
+// peer_files side of the schema. internal/sync's Session calls it on
+// every IndexUpdate it receives.
+func (s *Store) UpsertPeerFiles(ctx context.Context, peerKey string, rows []FileRow) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("index: upsert peer files: begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+
+	stmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO peer_files (peer_key, share_id, relpath, type, size, mtime_ns, mode, sha256, version_json, deleted, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT (peer_key, share_id, relpath) DO UPDATE SET
+			type = excluded.type,
+			size = excluded.size,
+			mtime_ns = excluded.mtime_ns,
+			mode = excluded.mode,
+			sha256 = excluded.sha256,
+			version_json = excluded.version_json,
+			deleted = excluded.deleted,
+			updated_at = excluded.updated_at`)
+	if err != nil {
+		return fmt.Errorf("index: upsert peer files: prepare: %w", err)
+	}
+	defer stmt.Close()
+
+	for _, row := range rows {
+		vj, err := versionJSON(row.Version)
+		if err != nil {
+			return fmt.Errorf("index: upsert peer files: row %s/%s: %w", row.ShareID, row.RelPath, err)
+		}
+		if _, err := stmt.ExecContext(ctx,
+			peerKey, row.ShareID, row.RelPath, string(row.Type), row.Size, row.MTimeNS, row.Mode,
+			row.SHA256, vj, boolInt(row.Deleted), timeNS(row.UpdatedAt),
+		); err != nil {
+			return fmt.Errorf("index: upsert peer files: row %s/%s: %w", row.ShareID, row.RelPath, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("index: upsert peer files: commit: %w", err)
+	}
+	return nil
+}
+
+// ListPeerFiles returns everything known about one peer's view of a share,
+// in relpath order, including tombstones.
+func (s *Store) ListPeerFiles(ctx context.Context, peerKey, shareID string) ([]FileRow, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT relpath, type, size, mtime_ns, mode, sha256, version_json, deleted, updated_at
+		FROM peer_files WHERE peer_key = ? AND share_id = ? ORDER BY relpath`, peerKey, shareID)
+	if err != nil {
+		return nil, fmt.Errorf("index: list peer files %s/%s: %w", peerKey, shareID, err)
+	}
+	defer rows.Close()
+	return collectFileRows(rows, shareID)
 }

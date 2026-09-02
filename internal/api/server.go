@@ -2,15 +2,15 @@
 //
 // internal/core deliberately imports neither encoding/json nor any HTTP
 // package (SPEC.md §12), so this package owns all JSON marshaling (see
-// dto.go) and all HTTP concerns: routing, auth, request size limits, and
+// handlers.go) and all HTTP concerns: routing, auth, request size limits, and
 // error shaping.
 //
 // Auth: every request under /api/ must carry header
 // "X-Syncat-Token: <api.token contents>", compared with
 // crypto/subtle.ConstantTimeCompare so a wrong guess can't be timed. The
 // one exception is GET /ui-token, a login-less same-origin bootstrap the
-// (future, Phase 9) web UI uses to fetch the token before it can set the
-// header itself — see handleUIToken's doc comment for its defenses.
+// embedded web UI uses to fetch the token before it can set the header
+// itself — see handleUIToken's doc comment for its defenses.
 //
 // The listener itself is loopback-only (ListenLoopback refuses to bind
 // anything else) so the API is never reachable from the LAN even if the
@@ -27,9 +27,8 @@ import (
 	"net/http"
 	"strings"
 
-	syncsvc "github.com/nickmarrone/syncat/internal/sync"
-
 	"github.com/nickmarrone/syncat/internal/core"
+	syncsvc "github.com/nickmarrone/syncat/internal/sync"
 	"github.com/nickmarrone/syncat/internal/webui"
 )
 
@@ -118,11 +117,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /ui-token", s.handleUIToken)
 
 	s.mux.HandleFunc("GET /api/status", s.auth(s.handleStatus))
-	// core.Node.RenameNode already existed for Phase 9's editable
-	// dashboard node-name field (SPEC.md §9) but Phase 8 never wired a
-	// route to it — added here since it's the smallest reasonable place
-	// for it (peer with GET /api/status, which is where node_name is
-	// read from).
+	// Backs the dashboard's editable node-name field (SPEC.md §9). It
+	// sits beside GET /api/status, which is where node_name is read from.
 	s.mux.HandleFunc("PATCH /api/node", s.auth(s.handleNodePatch))
 
 	s.mux.HandleFunc("GET /api/peers", s.auth(s.handlePeersList))
@@ -153,10 +149,9 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/shares/{id}/trash", s.auth(s.handleTrashList))
 	s.mux.HandleFunc("POST /api/shares/{id}/trash/restore", s.auth(s.handleTrashRestore))
 
-	// GET /api/events (SSE) is explicitly deferred by SPEC.md's Phase 8
-	// scope for this build; the UI polls /api/status instead. Not
-	// registered at all, so it 404s like any other unknown route rather
-	// than pretending to stream.
+	// GET /api/events (SSE) is deliberately not implemented; the UI polls
+	// /api/status instead. Not registered at all, so it 404s like any
+	// other unknown route rather than pretending to stream.
 
 	// Embedded web UI (internal/webui, go:embed) — see webui.Handler's
 	// doc comment for its own path-traversal and auth reasoning.
@@ -278,7 +273,7 @@ func mutationError(err error) (status int, code, message string) {
 
 	msg := err.Error()
 	switch {
-	// "no share matches" is internal/core/resolve.go's phrasing for a share
+	// "no share matches" is internal/core's matchRef phrasing for a share
 	// ref that names nothing. Every path that produces it is addressing a
 	// share by URL — /api/shares/{id} and /api/shares/{id}/trash — so it is
 	// the addressed resource being absent, i.e. a 404, exactly like the

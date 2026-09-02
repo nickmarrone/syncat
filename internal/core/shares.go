@@ -160,9 +160,9 @@ func (n *Node) propagateShare(ctx context.Context, shareID string) {
 
 // RescanShare runs an immediate, synchronous full scan of shareID and
 // propagates the result, exactly like the periodic/fsnotify-triggered
-// path. Exposed for Phase 8's CLI/API (a manual "rescan now") and for
-// tests that want deterministic sync timing without waiting on the
-// watcher's real debounce/periodic timers.
+// path. Exported for tests that want deterministic sync timing without
+// waiting on the watcher's real debounce/periodic timers, and as the entry
+// point a manual "rescan now" would call.
 func (n *Node) RescanShare(ctx context.Context, shareID string) error {
 	return n.rescanShare(ctx, shareID)
 }

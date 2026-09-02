@@ -29,9 +29,9 @@ import (
 // Two in-process nodes over transport.PipeTransport (SPEC.md §10's
 // in-memory stand-in for the real tailcat carrier), each with its own
 // temp dir, index, and identity, wired into a pair of Sessions that talk
-// to each other exactly the way two peers would once Phase 3's handshake
-// and Phase 6's share negotiation already happened. Rather than reaching
-// for the real fsnotify/Scanner pipeline (Phase 4, already covered by its
+// to each other exactly the way two peers would once internal/protocol's
+// handshake and the share negotiation already happened. Rather than
+// reaching for the real fsnotify/Scanner pipeline (already covered by its
 // own tests), local "edits" here go straight through the index Store:
 // write the bytes, then record a hashed, version-bumped FileRow for them.
 // That keeps these tests focused on what 5b actually owns — reconcile
@@ -77,7 +77,7 @@ func writeFile(t *testing.T, root, relpath, content string) string {
 // indexFile stats+hashes root/relpath (already written via writeFile) and
 // upserts a FileRow for it, bumping nodeID's counter on top of whatever
 // version the store already has for that relpath (0 if none) — standing
-// in for what Phase 4's scanner+ApplyScanResult would have recorded after
+// in for what internal/index's scanner+ApplyScanResult would have recorded after
 // a real local edit.
 func indexFile(t *testing.T, store *index.Store, nodeID, relpath string, root string) index.FileRow {
 	t.Helper()
@@ -259,11 +259,11 @@ func treesEqual(a, b map[string][32]byte) bool {
 // package's tests (including internal/transport's real network I/O) on CPU
 // at once:
 //
-//  1. A genuine production bug (fixed in reconcile.go/apply.go/action.go):
+//  1. A genuine production bug (fixed in reconcile.go/apply.go):
 //     resolving a delete-vs-modify or concurrent-conflict case whose winner
 //     needed fetching from the peer sent the FileRequest carrying the
 //     *merged, locally-bumped* version instead of the version the peer
-//     actually advertised, so the peer's freshness check (transfer.go's
+//     actually advertised, so the peer's freshness check (session.go's
 //     handleFileRequest) could never match. This wasted one full request/
 //     error round trip on *every* such resolution, unconditionally — not a
 //     race, reproduced deterministically pre-fix. See Action.SourceVersion.
@@ -695,10 +695,8 @@ func TestIntegration_ConcurrentPullLimit(t *testing.T) {
 	b := newTestNode(t, "bbbbbbbbbbbbbbbb")
 
 	const numFiles = 10
-	var names []string
 	for i := 0; i < numFiles; i++ {
 		rel := fmt.Sprintf("file%02d.txt", i)
-		names = append(names, rel)
 		writeFile(t, a.root, rel, fmt.Sprintf("content of file %d", i))
 		indexFile(t, a.store, a.id, rel, a.root)
 	}
@@ -798,7 +796,7 @@ func TestIntegration_ReceiveOnlyRevertsLocalEditViaTrash(t *testing.T) {
 		t.Fatalf("trashed content = %q, want the subscriber's local edit", trashedData)
 	}
 
-	// And a warning was recorded for the UI (Phase 8).
+	// And a warning was recorded for the UI to surface.
 	warnings := sSubscriber.LocallyModifiedWarnings()
 	if len(warnings) == 0 {
 		t.Fatal("expected at least one LocallyModifiedWarning to be recorded")
@@ -875,7 +873,7 @@ func TestIntegration_RestorePropagatesAsNewChange(t *testing.T) {
 	}
 
 	// Propagate the restore, exactly as a real daemon's own
-	// change-detection (Phase 4's watcher/scanner, not wired into this
+	// change-detection (internal/index's watcher/scanner, not wired into this
 	// package's own tests — see indexFile's doc comment) would trigger a
 	// SyncShare after noticing the local change.
 	mustSync(t, sa, testShareID)

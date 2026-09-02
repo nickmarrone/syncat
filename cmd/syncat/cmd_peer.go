@@ -108,10 +108,10 @@ func cmdPeerRm(paths *config.Paths, args []string) error {
 	return nil
 }
 
-// cmdPeerApprove hits the peer-approval endpoint, which is deferred past
-// this build (SPEC.md §2.3's pending-peer queue — see internal/core's
+// cmdPeerApprove hits the peer-approval endpoint, which this build does
+// not implement (SPEC.md §2.3's pending-peer queue — see internal/core's
 // package doc comment); the server's 501 response message explains that
-// to the user rather than the CLI pretending it doesn't exist.
+// to the user rather than the CLI pretending the subcommand doesn't exist.
 func cmdPeerApprove(paths *config.Paths, args []string) error {
 	fs := flag.NewFlagSet("peer approve", flag.ContinueOnError)
 	if err := fs.Parse(args); err != nil {
@@ -126,4 +126,60 @@ func cmdPeerApprove(paths *config.Paths, args []string) error {
 		return err
 	}
 	return c.do(context.Background(), http.MethodPost, "/api/peers/"+url.PathEscape(fs.Arg(0))+"/approve", nil, nil)
+}
+
+// cmdRemote implements `syncat remote ls` (SPEC.md §8): everything
+// configured peers offer us, with our access state to each.
+func cmdRemote(paths *config.Paths, args []string) error {
+	if len(args) == 0 || args[0] != "ls" {
+		return fmt.Errorf("usage: syncat remote ls")
+	}
+	fs := flag.NewFlagSet("remote ls", flag.ContinueOnError)
+	asJSON := fs.Bool("json", false, "output raw JSON")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+
+	c, err := newAPIClient(paths)
+	if err != nil {
+		return err
+	}
+	var resp struct {
+		RemoteShares []remoteShareView `json:"remote_shares"`
+	}
+	if err := c.do(context.Background(), http.MethodGet, "/api/remote-shares", nil, &resp); err != nil {
+		return err
+	}
+	if *asJSON {
+		return printJSON(resp.RemoteShares)
+	}
+	if len(resp.RemoteShares) == 0 {
+		fmt.Println("no remote shares seen yet")
+		return nil
+	}
+	for _, rs := range resp.RemoteShares {
+		fmt.Printf("%s\t%-20s\tfrom %s (%s)\t%s\taccess=%s\tapproval=%v\n",
+			rs.ShareID, rs.Name, rs.PeerName, rs.PeerKey, rs.Permission, rs.Access, rs.ApprovalRequired)
+	}
+	return nil
+}
+
+// cmdApprovals implements `syncat approvals [grant|deny ID]` (SPEC.md
+// §8). The approval queue itself (SPEC.md §2.3/§6) is not implemented —
+// see internal/core's package doc comment and internal/api's routes — so
+// both the list and grant/deny paths simply surface the server's 501
+// "not implemented" response rather than duplicating that decision here.
+func cmdApprovals(paths *config.Paths, args []string) error {
+	c, err := newAPIClient(paths)
+	if err != nil {
+		return err
+	}
+	if len(args) == 0 {
+		return c.do(context.Background(), http.MethodGet, "/api/approvals", nil, nil)
+	}
+	if len(args) != 2 || (args[0] != "grant" && args[0] != "deny") {
+		return fmt.Errorf("usage: syncat approvals [grant|deny ID]")
+	}
+	decision, id := args[0], args[1]
+	return c.do(context.Background(), http.MethodPost, "/api/approvals/"+url.PathEscape(id), map[string]string{"decision": decision}, nil)
 }

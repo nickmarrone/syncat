@@ -655,7 +655,7 @@ func TestSubscriptionsAddRejectsUnknownPeer(t *testing.T) {
 }
 
 // TestSubscriptionsList covers the GET that completes the collection:
-// /api/peers and /api/shares have had one since Phase 8, and subscriptions
+// /api/peers and /api/shares have always had one, and subscriptions
 // were the one collection you could create, modify and delete but never
 // enumerate — so `syncat subscription ls` had nothing to call.
 func TestSubscriptionsList(t *testing.T) {

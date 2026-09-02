@@ -11,7 +11,7 @@ import (
 
 // fakeClock is a manually-driven Clock for deterministic debounce tests:
 // nothing here ever sleeps on a wall clock to produce a debounce flush.
-// Mirrors internal/protocol's keepalive_test.go fakeClock (see its doc
+// Mirrors internal/protocol's handshake_test.go fakeClock (see its doc
 // comment for the full rationale); duplicated rather than imported
 // because internal/index defines its own local Clock interface for the
 // same layering reason protocol.Clock is local to internal/protocol.
@@ -86,7 +86,7 @@ func (c *fakeClock) waiterCount() int {
 }
 
 // waitForWaiters blocks until at least min goroutines are parked on
-// clock.After, or timeout elapses. See keepalive_test.go's identical
+// clock.After, or timeout elapses. See handshake_test.go's identical
 // helper for why this matters: without it, an Advance can race a
 // not-yet-registered timer.
 func (c *fakeClock) waitForWaiters(min int, timeout time.Duration) bool {
@@ -289,7 +289,7 @@ func TestWatcherAddsWatchesForNewSubdirectories(t *testing.T) {
 // instant Advance fires the current timer, Go's select is free to pick
 // either ready case. Picking the incoming mark over the already-fired
 // timer is not a bug — the debouncer is meant to treat that as "activity
-// within the window" and extend it (see debouncer.go's re-registration
+// within the window" and extend it (see the debouncer's re-registration
 // comment, and SPEC.md §5: "batches of events collapse into one scan") —
 // but it means the fired timer's flush is superseded rather than
 // delivered, and waiterCount is right back at baseline+1 with a *new*

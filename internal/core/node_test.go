@@ -116,7 +116,7 @@ func peerToken(t *testing.T, n *Node) string {
 // defines its own rather than sharing one — see protocol.Clock's doc
 // comment for why); core needs the same pattern for the same reason.
 //
-// A single Options.Clock drives every timer Node starts (see clock.go's
+// A single Options.Clock drives every timer Node starts (see core.Clock's
 // doc comment), so the test's own peer-dial backoff waits share this
 // clock with, at minimum, the trash janitor's 24h sweep interval
 // (Node.Open starts the janitor before anything else). isBackoffDelay
@@ -1041,7 +1041,7 @@ func TestRemovePeerRevokesShareAccess(t *testing.T) {
 }
 
 // TestAddSubscriptionRejectsUnknownPeer covers the failure that motivated
-// resolve.go. The subscribe command used to take only a hex
+// mutations.go's ref resolvers. The subscribe command used to take only a hex
 // peer key while reading as though it took a display name, so "subscribe
 // nishinomiya test ./test/" is the natural thing to type — and it was
 // accepted verbatim. The resulting subscription was inert and silently so:
@@ -1220,7 +1220,7 @@ func connectedPairWithShare(t *testing.T, shareName string) (nodeA, nodeB *Node,
 }
 
 // TestTrashResolvesShareRef covers the case that exposed how narrowly
-// resolve.go had been wired in: `syncat share ls` prints a share's name
+// the ref resolvers had been wired in: `syncat share ls` prints a share's name
 // right next to its id, but `syncat trash ls <name>` answered "share test is
 // not a local share or subscription" — because trash resolution was exact-id
 // only. Every ref form the rest of the CLI accepts has to work here too.

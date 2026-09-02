@@ -7,7 +7,7 @@ import (
 )
 
 // Paths resolves the on-disk layout described in SPEC.md §3 (config.json in
-// place of the spec's config.toml — see the deviation note in schema.go):
+// place of the spec's config.toml — see the deviation note in config.go):
 //
 //	~/.config/syncat/config.json
 //	~/.config/syncat/api.token
@@ -73,7 +73,7 @@ func defaultDataDir() (string, error) {
 }
 
 // ConfigFile returns the path to config.json (see the deviation note in
-// schema.go for why this is .json rather than the .toml SPEC.md describes).
+// config.go for why this is .json rather than the .toml SPEC.md describes).
 func (p *Paths) ConfigFile() string { return filepath.Join(p.ConfigDir, "config.json") }
 
 // APITokenFile returns the path to api.token.

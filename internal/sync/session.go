@@ -3,9 +3,12 @@ package sync
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"net"
+	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/nickmarrone/syncat/internal/index"
@@ -16,7 +19,7 @@ import (
 // outstanding to one peer at once (SPEC.md §4: "max 4 concurrent pulls per
 // peer"). Additional pulls queue on pullSem until a slot frees; chunks for
 // every in-flight pull are interleaved on the one underlying stream
-// (protocol.Writer is safe for concurrent writers — see frame.go), which
+// (protocol.Writer is safe for concurrent writers — see message.go), which
 // is what lets several transfers make progress at once without their own
 // separate connections.
 const maxConcurrentPulls = 4
@@ -64,18 +67,19 @@ type pullEntry struct {
 
 // Session drives sync for one already-authenticated peer connection:
 // exchanging IndexUpdate for each configured share, pulling and serving
-// file content, and applying the resulting actions (5a's Reconcile
-// output) to the local filesystem and index. One Session corresponds to
+// file content, and applying the resulting actions ([Reconcile]'s output)
+// to the local filesystem and index. One Session corresponds to
 // one net.Conn (SPEC.md §4: a single stream carries every share synced
 // with that peer) and can hold any number of shares.
 //
-// Session assumes the handshake (Phase 3) and share/access negotiation
-// (Phase 6) already happened and handles only IndexUpdate, FileRequest,
-// FileChunk, and file-transfer-scoped Error from that point on — other
-// message types arriving on the stream are ignored, since driving those
-// exchanges is Phase 7's job (wiring Session into the peer connection
-// lifecycle). This keeps Session fully driveable from a test with a bare
-// net.Conn (e.g. transport.PipeTransport) and no real peer manager.
+// Session assumes internal/protocol's handshake and the share/access
+// negotiation already happened, and handles only IndexUpdate, FileRequest,
+// FileChunk, and file-transfer-scoped Error from that point on. Other
+// message types arriving on the stream are handed to the control handler
+// internal/core registers (see SetControlHandler), because driving those
+// exchanges is the peer manager's job. This keeps Session fully driveable
+// from a test with a bare net.Conn (e.g. transport.PipeTransport) and no
+// real peer manager.
 //
 // Every background goroutine Session starts is tied to the context passed
 // to Start and unwound by Close, which cancels that context, closes the
@@ -95,7 +99,7 @@ type Session struct {
 	// trash is this Session's trash can (SPEC.md §7). Set via SetTrash;
 	// nil until then, in which case trashHook is a no-op (see apply.go) —
 	// so a Session is still fully usable in tests/contexts that don't
-	// care about trash, exactly as before Phase 6.
+	// care about trash.
 	trash *Trash
 
 	// warningsMu/warnings record every LocallyModifiedWarning this Session
@@ -106,14 +110,13 @@ type Session struct {
 
 	logger *log.Logger
 
-	// ctrlMu guards controlHandler/frameObserver, Phase 7's hooks for
+	// ctrlMu guards controlHandler/frameObserver, internal/core's hooks for
 	// driving the parts of the connection lifecycle Session itself doesn't
 	// own: ShareList/SubscribeRequest/AccessUpdate/Ping/Pong (see readLoop's
 	// default case) and keepalive activity tracking (frameObserver fires
 	// for every frame this Session reads, of any type, matching
 	// protocol.Keepalive's "any frame counts as received traffic"
-	// contract). Both are nil-safe (a Session with neither set behaves
-	// exactly as before Phase 7): set them before calling Start to avoid
+	// contract). Both are nil-safe: set them before calling Start to avoid
 	// racing the read loop's first frame.
 	ctrlMu         sync.Mutex
 	controlHandler func(typ protocol.MsgType, payload []byte)
@@ -161,7 +164,7 @@ type Session struct {
 }
 
 // NewSession constructs a Session over conn. nodeID is this node's own
-// ShortID (used to bump version vectors on conflict resolution, per 5a);
+// ShortID (used to bump version vectors on conflict resolution);
 // peerID is the ShortID of the node at the other end of conn, used to key
 // its mirrored index rows (index.Store.UpsertPeerFiles/ListPeerFiles). If
 // clock is nil, time.Now is used (see reconcile.go's Clock). If logger is
@@ -208,8 +211,8 @@ func (s *Session) SetTrash(tr *Trash) {
 // SetControlHandler registers fn to be called, synchronously from the read
 // loop, for every frame type this Session doesn't itself handle: Hello,
 // Auth, ShareList, SubscribeRequest, AccessUpdate, Ping, and Pong (see
-// readLoop's default case). This is Phase 7's hook for driving the peering
-// flow (SPEC.md §2, §4, §6) on the same connection Session already reads
+// readLoop's default case). This is internal/core's hook for driving the
+// peering flow (SPEC.md §2, §4, §6) on the same connection Session reads
 // exclusively — Session remains "the single reader of the connection"
 // (readLoop's own invariant); fn just gets a look at what readLoop would
 // otherwise silently drop. fn should not block for long (it runs on the
@@ -223,7 +226,7 @@ func (s *Session) SetControlHandler(fn func(typ protocol.MsgType, payload []byte
 }
 
 // SetFrameObserver registers fn to be called once per frame read, of any
-// type, before dispatch — Phase 7's hook for driving
+// type, before dispatch — internal/core's hook for driving
 // protocol.Keepalive.RecordReceived, since SPEC.md §4's "90s without
 // traffic" dead-connection rule counts every message, not just Ping/Pong,
 // and only Session's read loop ever sees the IndexUpdate/FileRequest/
@@ -235,10 +238,10 @@ func (s *Session) SetFrameObserver(fn func(typ protocol.MsgType)) {
 	s.ctrlMu.Unlock()
 }
 
-// Writer returns this Session's underlying protocol.Writer, so Phase 7's
-// peer manager can send ShareList/SubscribeRequest/AccessUpdate/Ping
+// Writer returns this Session's underlying protocol.Writer, so
+// internal/core's peer manager can send ShareList/SubscribeRequest/AccessUpdate/Ping
 // frames on the same connection Session writes IndexUpdate/FileRequest/
-// FileChunk/Error to. Writer is safe for concurrent use (see frame.go), so
+// FileChunk/Error to. Writer is safe for concurrent use (see message.go), so
 // sharing it this way never risks torn or interleaved frames.
 func (s *Session) Writer() *protocol.Writer {
 	return s.writer
@@ -302,9 +305,8 @@ func (s *Session) logf(format string, args ...any) {
 // SyncShare sends a full snapshot IndexUpdate (Full: true) for shareID to
 // the peer, unless the share's Direction blocks outbound updates
 // (receive-only subscription). This is what a caller uses to kick off the
-// initial sync after connecting, and — since this phase has no live
-// filesystem watcher wired in (that's Phase 7) — to notify the peer of a
-// local change a test (or a future watcher) just made.
+// initial sync after connecting, and what internal/core's share watcher
+// calls (via propagateShare) to notify the peer of a local change.
 func (s *Session) SyncShare(ctx context.Context, shareID string) error {
 	cfg, ok := s.getShare(shareID)
 	if !ok {
@@ -402,10 +404,10 @@ func (s *Session) readLoop() {
 			}
 
 		default:
-			// Handshake/share-list/access/ping-pong messages: other
-			// phases' concern (this Session assumes the handshake already
-			// happened; everything else here is Phase 7's peer manager,
-			// via SetControlHandler, if it registered one).
+			// Handshake/share-list/access/ping-pong messages: not this
+			// type's concern. Session assumes the handshake already
+			// happened, and hands the rest to internal/core's peer
+			// manager via SetControlHandler, if it registered one.
 			if ctrlHandler != nil {
 				ctrlHandler(typ, payload)
 			}
@@ -434,7 +436,7 @@ func (s *Session) routeChunk(shareID, relpath string, c pullChunk) {
 // handleIndexUpdate is the core reconcile-and-apply pass, run in its own
 // goroutine per incoming IndexUpdate (see readLoop). It folds the peer's
 // reported files into our mirror of their view (peer_files), reconciles
-// that against our own current view (5a's Reconcile), executes every
+// that against our own current view ([Reconcile]), executes every
 // resulting Action against the filesystem and index, and — unless this
 // share's direction blocks outbound updates — reports back whatever
 // actually changed locally so the peer's own reconcile pass converges too.
@@ -522,4 +524,214 @@ func rowsToInfos(rows []index.FileRow) []protocol.FileInfo {
 		out[i] = r.Info()
 	}
 	return out
+}
+
+// pullFile fetches wireRelPath's content (as shareID's holder — the peer
+// at the other end of this Session — currently has it under version) and
+// streams it into dst as chunks arrive, never buffering more than one
+// chunk (<=1 MiB, protocol.MaxFileChunkData) at a time. It returns the
+// total number of bytes written.
+//
+// Concurrency: pullFile blocks until a slot is free in s.pullSem, which
+// has capacity maxConcurrentPulls — this is the "max 4 concurrent pulls
+// per peer" enforcement point (SPEC.md §4). Any number of goroutines may
+// call pullFile at once; excess callers simply queue on the semaphore.
+// While waiting for chunks, pullFile is fed by the Session's single read
+// loop via routeChunk, which demultiplexes interleaved FileChunk frames
+// for every concurrently in-flight pull by (shareID, relpath).
+func (s *Session) pullFile(ctx context.Context, shareID, wireRelPath string, version protocol.VersionVector, dst io.Writer) (int64, error) {
+	select {
+	case s.pullSem <- struct{}{}:
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+	defer func() { <-s.pullSem }()
+
+	active := atomic.AddInt32(&s.pullActive, 1)
+	defer atomic.AddInt32(&s.pullActive, -1)
+	for {
+		peak := atomic.LoadInt32(&s.pullPeak)
+		if active <= peak || atomic.CompareAndSwapInt32(&s.pullPeak, peak, active) {
+			break
+		}
+	}
+
+	key := transferKey{shareID, wireRelPath}
+	entry := &pullEntry{ch: make(chan pullChunk, 8)}
+	s.pullMu.Lock()
+	if _, exists := s.pullTbl[key]; exists {
+		s.pullMu.Unlock()
+		return 0, fmt.Errorf("sync: pull %s/%s: already in flight", shareID, wireRelPath)
+	}
+	s.pullTbl[key] = entry
+	s.pullMu.Unlock()
+	defer func() {
+		s.pullMu.Lock()
+		delete(s.pullTbl, key)
+		s.pullMu.Unlock()
+	}()
+
+	if err := s.writer.WriteMessage(protocol.MsgFileRequest, protocol.FileRequest{
+		ShareID: shareID,
+		RelPath: wireRelPath,
+		Version: version,
+		// Offset is always 0: resume is deferred (SPEC.md §4 keeps the
+		// field on the wire for a later phase to populate).
+		Offset: 0,
+	}); err != nil {
+		return 0, fmt.Errorf("sync: pull %s/%s: send file request: %w", shareID, wireRelPath, err)
+	}
+
+	var total int64
+	for {
+		select {
+		case c, ok := <-entry.ch:
+			if !ok {
+				return total, fmt.Errorf("sync: pull %s/%s: transfer channel closed", shareID, wireRelPath)
+			}
+			if c.err != nil {
+				return total, fmt.Errorf("sync: pull %s/%s: %w", shareID, wireRelPath, c.err)
+			}
+			if len(c.data) > 0 {
+				n, err := dst.Write(c.data)
+				total += int64(n)
+				if err != nil {
+					return total, fmt.Errorf("sync: pull %s/%s: write: %w", shareID, wireRelPath, err)
+				}
+			}
+			if c.eof {
+				return total, nil
+			}
+		case <-ctx.Done():
+			return total, ctx.Err()
+		}
+	}
+}
+
+// handleFileRequest serves one incoming FileRequest from our own share
+// content, respecting maxConcurrentServes. A file we no longer have, or
+// whose current version differs from what the requester asked for, gets
+// an Error reply (SPEC.md §4/§5) rather than a hung or truncated stream.
+func (s *Session) handleFileRequest(ctx context.Context, req protocol.FileRequest) {
+	select {
+	case s.serveSem <- struct{}{}:
+	case <-ctx.Done():
+		return
+	}
+	defer func() { <-s.serveSem }()
+
+	cfg, ok := s.getShare(req.ShareID)
+	if !ok {
+		s.sendFileError(req, protocol.ErrCodeFileNotFound, "unknown share")
+		return
+	}
+
+	row, err := s.store.GetFile(ctx, req.ShareID, req.RelPath)
+	if err != nil || row.Deleted {
+		s.sendFileError(req, protocol.ErrCodeFileNotFound, "file not found")
+		return
+	}
+	if !Equal(row.Version, req.Version) {
+		s.sendFileError(req, protocol.ErrCodeVersionChanged, "version has moved on")
+		return
+	}
+
+	absPath, err := JoinSharePath(cfg.Root, req.RelPath)
+	if err != nil {
+		// Should be unreachable in practice: an invalid relpath can't have
+		// made it into the index (ValidateRelPath gates every wire path
+		// before it becomes an Action — see reconcile.go/path.go). Treat
+		// it the same as "not found" rather than ever touching the
+		// filesystem with it.
+		s.sendFileError(req, protocol.ErrCodeFileNotFound, "invalid path")
+		return
+	}
+
+	if s.testServeDelay > 0 {
+		select {
+		case <-time.After(s.testServeDelay):
+		case <-ctx.Done():
+			return
+		}
+	}
+
+	if row.Type == protocol.FileTypeSymlink {
+		s.serveSymlink(absPath, req, row.Version)
+		return
+	}
+
+	f, err := os.Open(absPath)
+	if err != nil {
+		s.sendFileError(req, protocol.ErrCodeFileNotFound, "open: "+err.Error())
+		return
+	}
+	defer f.Close()
+
+	if err := s.streamFile(f, req, row.Version); err != nil {
+		s.logf("serve %s/%s: %v", req.ShareID, req.RelPath, err)
+	}
+}
+
+// streamFile sends f's contents as a sequence of FileChunk frames of at
+// most protocol.MaxFileChunkData bytes each — f is never read into memory
+// beyond one chunk at a time — followed by one final zero-length,
+// EOF-marked chunk. Sending the EOF marker as its own frame (rather than
+// trying to detect end-of-file on the same read that returned the last
+// data) keeps the read side's contract simple: EOF is only ever true, and
+// only needs handling, on a frame it already received.
+func (s *Session) streamFile(f *os.File, req protocol.FileRequest, version protocol.VersionVector) error {
+	buf := make([]byte, protocol.MaxFileChunkData)
+	var offset int64
+	for {
+		n, readErr := f.Read(buf)
+		if n > 0 {
+			if err := s.writer.WriteFileChunk(protocol.FileChunkHeader{
+				ShareID: req.ShareID, RelPath: req.RelPath, Version: version, Offset: offset, EOF: false,
+			}, buf[:n]); err != nil {
+				return fmt.Errorf("write chunk at offset %d: %w", offset, err)
+			}
+			offset += int64(n)
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return fmt.Errorf("read at offset %d: %w", offset, readErr)
+		}
+	}
+	if err := s.writer.WriteFileChunk(protocol.FileChunkHeader{
+		ShareID: req.ShareID, RelPath: req.RelPath, Version: version, Offset: offset, EOF: true,
+	}, nil); err != nil {
+		return fmt.Errorf("write eof chunk: %w", err)
+	}
+	return nil
+}
+
+// serveSymlink sends a symlink's target path as its "content" (SPEC.md
+// §5: "the symlink entry itself (target string) syncs on Unix"), using
+// the same chunk framing as a regular file.
+func (s *Session) serveSymlink(absPath string, req protocol.FileRequest, version protocol.VersionVector) {
+	target, err := os.Readlink(absPath)
+	if err != nil {
+		s.sendFileError(req, protocol.ErrCodeFileNotFound, "readlink: "+err.Error())
+		return
+	}
+	data := []byte(target)
+	if err := s.writer.WriteFileChunk(protocol.FileChunkHeader{
+		ShareID: req.ShareID, RelPath: req.RelPath, Version: version, Offset: 0, EOF: false,
+	}, data); err != nil {
+		s.logf("serve symlink %s/%s: %v", req.ShareID, req.RelPath, err)
+		return
+	}
+	if err := s.writer.WriteFileChunk(protocol.FileChunkHeader{
+		ShareID: req.ShareID, RelPath: req.RelPath, Version: version, Offset: int64(len(data)), EOF: true,
+	}, nil); err != nil {
+		s.logf("serve symlink %s/%s: eof: %v", req.ShareID, req.RelPath, err)
+	}
+}
+
+func (s *Session) sendFileError(req protocol.FileRequest, code, msg string) {
+	_ = s.writer.WriteMessage(protocol.MsgError, protocol.Error{
+		Code: code, Msg: msg, ShareID: req.ShareID, RelPath: req.RelPath,
+	})
 }

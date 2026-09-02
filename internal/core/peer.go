@@ -71,7 +71,7 @@ const dialTimeout = 30 * time.Second
 // §2/§4): it drives the dial-with-backoff loop, adopts whichever
 // connection (dialed or accepted) wins SPEC.md §2.4's dedup rule, and
 // wires that connection's syncsvc.Session together with a
-// protocol.Keepalive and Phase 7's own control-message handling for
+// protocol.Keepalive and this file's control-message handling for
 // ShareList/SubscribeRequest/AccessUpdate.
 //
 // At most one connection is ever active at a time, guarded by mu.
@@ -243,7 +243,7 @@ func (pc *peerConn) dialAttempt(ctx context.Context) error {
 // offer applies SPEC.md §2.4's dedup rule to one authenticated connection
 // (dialed=true for our own outbound dial, false for an inbound accept)
 // and, if it wins, adopts it as this peer's active connection: wires a
-// syncsvc.Session with Phase 7's control-message and keepalive hooks,
+// syncsvc.Session with this file's control-message and keepalive hooks,
 // starts it, and sends our initial ShareList/SubscribeRequests. Returns
 // whether this connection was adopted; a losing connection is closed here
 // and never touches pc's state.
@@ -604,7 +604,7 @@ func (n *Node) provisionShareForRequest(pc *peerConn, sess *syncsvc.Session, sha
 // SubscribeRequest: persisting the grant and notifying the peer
 // (SetShareAccess also re-applies the same sess.AddShare provisionShareForRequest
 // already did — a harmless idempotent overwrite — since SetShareAccess is
-// also Phase 8's direct API entry point and shouldn't have a
+// also the REST API's direct entry point and shouldn't have a
 // provision-already-done special case).
 func (n *Node) finishSubscribeRequest(pc *peerConn, share config.Share) {
 	if err := n.SetShareAccess(share.ID, pc.peerKeyHex, protocol.AccessGranted); err != nil {
