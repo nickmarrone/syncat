@@ -100,7 +100,7 @@ anyone until alice comes back; they do not sync with each other in the
 meantime.
 
 **A directory synced down from a peer cannot be re-shared.** Config validation
-(`internal/config/overlap.go`) rejects offering a share whose path is, contains,
+(`internal/config/config.go`) rejects offering a share whose path is, contains,
 or is contained by an existing subscription's local path. This isn't
 arbitrary: syncat's index is keyed by `(share_id, relpath)`, so re-offering a
 subscribed directory as a new share would track the same files under two
@@ -139,7 +139,7 @@ text, and why:
   To stay inside that budget, config is encoded with the stdlib
   `encoding/json` instead and the file is named `config.json`. Field names,
   defaults, and validation are otherwise exactly as specified
-  (`internal/config/schema.go`, `serialize.go`).
+  (`internal/config/config.go`).
 - **`protocol.Error` gained optional `share_id`/`rel_path` fields.** SPEC.md
   §4's message table has a bare `Error{code, msg}`, with no way to say which
   in-flight request an error is about. With up to 4 concurrent pulls per
@@ -149,12 +149,19 @@ text, and why:
 - **`PATCH /api/node` was added.** SPEC.md §8's endpoint list omits it, but
   §9's dashboard requires an editable node name, and `core.Node` already
   exposed `RenameNode`. Wired up in `internal/api/server.go`/`handlers.go`.
+- **The in-memory test transport is not `net.Pipe`.** SPEC.md §10/§13 name
+  `net.Pipe` for the test transport, but the stdlib pipe is synchronous and
+  unbuffered: a write blocks until the other end reads. SPEC.md §4 has both
+  sides of the handshake send `Hello` before either reads, which deadlocks
+  on a bare `net.Pipe`. `transport.PipeTransport` is therefore backed by a
+  buffered in-memory `net.Conn` that behaves like a real socket's send
+  buffer (`internal/transport/pipe.go`).
 - **`syncat trash` now requires a running daemon.** SPEC.md's original phase
   plan had it operate directly on the on-disk trash/index, independent of a
   daemon (like `init`/`token`). Once the REST API existed, that would have
   been a second code path touching SQLite directly — and would race a live
   daemon's own index access if one happened to be running. `trash` is now an
-  API client like every other subcommand (`cmd/syncat/cmd_trash.go`).
+  API client like every other subcommand (`cmd/syncat/cmd_share.go`).
 
 ## Deferred past the MVP
 
@@ -171,14 +178,22 @@ don't work:
   always-ignored patterns (`.syncat.tmp.*`, OS junk files, global config
   ignores) is implemented; full gitignore syntax was deferred to avoid
   pulling in a matcher library before it was load-bearing
-  (`internal/index/ignore.go`).
+  (`internal/index/scanner.go`).
 - **Symlink syncing.** Symlinks are detected during scanning and skipped
   entirely, with a warning — never entering the index or syncing to peers
   (`internal/index/scanner.go`). SPEC.md §5's "symlink entry itself syncs on
   Unix" is not implemented in this build.
 - **Transfer resume.** `FileRequest.offset` is always sent as 0; an
   interrupted transfer restarts from the beginning rather than resuming
-  (`internal/sync/transfer.go`).
+  (`internal/sync/session.go`). The `pending_transfers` table exists in the
+  schema for it, but nothing reads or writes it yet.
+- **Transfer progress in the status surface.** SPEC.md §8 lists transfer
+  stats on `GET /api/status` and §9 wants progress bars on the dashboard.
+  `internal/sync.Session` exposes no per-transfer byte counters, so nothing
+  could populate them. The field and the dashboard card existed but were
+  always empty, so both were removed rather than shipped as a permanent
+  blank — `/api/status` has no `transfers` key and `syncat status` prints
+  no transfer section.
 - **Tombstone purging.** Deleted-file tombstones are kept in the index
   indefinitely; the 180-day purge described in SPEC.md §4 has no janitor.
 - **`GET /api/events` (SSE).** The web UI polls the REST API instead of
@@ -216,14 +231,20 @@ daemons on any exit path and dumps the relevant daemon log tail on failure.
 
 ## Project layout
 
-| Package | Contents |
+Nine packages, 29 source files. Every package is small enough to list in full:
+
+| Package | Files |
 |---|---|
-| `cmd/syncat/` | CLI entry point and subcommand dispatch (stdlib `flag`, no cobra) |
-| `internal/core/` | Node lifecycle, peer manager, share/subscription mutation, status snapshot — gomobile-safe, no UI/CLI deps |
-| `internal/transport/` | `Transport` interface; tailcat server+client wrapper; dial/backoff/dedup; in-memory `net.Pipe` test transport |
-| `internal/protocol/` | Wire frame codec, message types, mutual-auth handshake, fuzzed decoder |
-| `internal/index/` | SQLite index, directory scanner, `fsnotify` watcher, ignore matching |
-| `internal/sync/` | Version vectors, reconciler, transfer manager, atomic apply, trash + janitor |
-| `internal/config/` | `config.json` load/save, key management, node token codec, re-share guard |
-| `internal/api/` | REST handlers, request auth, DTOs |
-| `internal/webui/` | `go:embed`-ed static single-page web UI (vanilla HTML/CSS/JS, no build step) |
+| `cmd/syncat/` | `main.go` (subcommand dispatch, stdlib `flag`, no cobra) · `client.go` (REST client + response shapes) · `cmd_node.go` (`init`/`token`/`daemon`/`status`/`config`) · `cmd_peer.go` (`peer`/`remote`/`approvals`) · `cmd_share.go` (`share`/`subscription`/`trash`) |
+| `internal/core/` | `node.go` (lifecycle, accept path, clock adapters) · `mutations.go` (the config-mutation API the REST layer calls, plus name/prefix reference resolution) · `peer.go` (per-peer dial/dedup/keepalive state machine) · `shares.go` (share dirs → scanner/watcher) · `status.go` (the read-only snapshot) — gomobile-safe, no UI/CLI deps |
+| `internal/transport/` | `transport.go` (`Transport` interface, backoff/supervisor, dedup tie-break) · `tailcat.go` (production carrier) · `pipe.go` (in-memory transport used by every package's tests) |
+| `internal/protocol/` | `message.go` (message types + frame codec) · `handshake.go` (mutual Ed25519 auth + keepalive) |
+| `internal/index/` | `store.go` (SQLite schema, `files`, `peer_files`) · `scanner.go` (tree walk, hashing, ignore matching) · `watcher.go` (`fsnotify` + debounce + periodic rescan) |
+| `internal/sync/` | `reconcile.go` (version vectors, actions, conflict naming, the reconciler — all pure, no I/O) · `session.go` (one peer connection: index exchange, pulls, serving) · `apply.go` (writing results to disk) · `path.go` (the single validation gate for peer-supplied relpaths) · `trash.go` (trash can + janitor) |
+| `internal/config/` | `config.go` (schema, JSON encoding, load/save, re-share guard, atomic writes) · `keys.go` (identity key, tailcat key, `sc1` tokens, API token, share ids) · `paths.go` (XDG layout) |
+| `internal/api/` | `server.go` (routing, auth, HTTP concerns) · `handlers.go` (endpoint handlers + JSON DTOs) |
+| `internal/webui/` | `embed.go` + `static/` — `go:embed`-ed single-page UI (vanilla HTML/CSS/JS, no build step) |
+
+Files long enough to need it open their sections with `// --- name ---`
+markers, so `grep '^// --- ' internal/sync/reconcile.go` prints that file's
+table of contents.

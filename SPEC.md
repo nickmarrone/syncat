@@ -287,17 +287,22 @@ internal/core/        # engine wiring: node lifecycle, peer manager  ← gomobil
 internal/transport/   # tailcat server+client wrapper, dial/backoff/dedup, Transport interface
 internal/protocol/    # frame codec, message types, handshake
 internal/index/       # SQLite index, scanner, fsnotify watcher, ignore matching
-internal/sync/        # version vectors, reconciler, transfer manager, trash
-internal/config/      # config.toml load/save, keys
-internal/api/         # REST handlers + SSE
+internal/sync/        # version vectors, reconciler, whole-file transfer, atomic apply, trash
+internal/config/      # config load/save, keys, node tokens
+internal/api/         # REST handlers, auth, DTOs
 internal/webui/       # go:embed static assets
 ```
 
+Each package is a handful of files, and any file long enough to need it opens its
+sections with `// --- name ---` markers — `grep '^// --- ' <file>` gives a table of
+contents. See the README's project-layout table for the file-level map.
+
 `internal/transport` defines a `Transport` interface (Dial/Accept returning
-`net.Conn`s) with the tailcat implementation behind it — integration tests use an
-in-memory `net.Pipe` implementation, and the future mobile apps reuse everything
-above the interface. Dependency budget: tailcat, modernc.org/sqlite, fsnotify,
-fxamacker/cbor, a gitignore matcher, x/crypto. Nothing else without cause.
+`net.Conn`s) with the tailcat implementation behind it — tests use an in-memory
+implementation, and the future mobile apps reuse everything above the interface.
+
+Dependency budget: tailcat, modernc.org/sqlite, fsnotify, fxamacker/cbor, a
+gitignore matcher, x/crypto. Nothing else without cause.
 
 ## 11. Block-level delta transfer (v2 — design now, build later)
 
@@ -324,14 +329,22 @@ Written up so v1 choices don't paint us into a corner:
 ## 12. Future: iOS/Android
 
 - Everything under `internal/core` + `sync` + `index` + `protocol` + `transport`
-  compiles without cgo (hence modernc sqlite) and behind interfaces for filesystem
-  access — mobile filesystem sandboxes differ, so file I/O goes through an `fs.FS`-ish
-  read side and a small write interface from day one.
+  compiles without cgo (hence modernc sqlite). Mobile filesystem sandboxes differ, so
+  the read side is already abstracted: `index.Scanner` walks a share through a plain
+  `fs.FS` and never calls `os.*` itself. The matching write interface is *not* built —
+  `internal/sync`'s apply path writes with `os.*` directly, and that is the one place a
+  mobile port will have to grow an interface.
 - Bind via gomobile; native UIs replace the web UI, talking to the same core API surface.
 - Not in scope for v1; the constraint it imposes now is only "no cgo, no
   CLI/HTTP imports inside core packages."
 
 ## 13. Milestones (implementation order)
+
+All nine landed. This section is kept as the plan of record, not a status
+board — for what is actually built versus deferred, see the README's
+"Deviations from SPEC.md" and "Deferred past the MVP". (The code itself no
+longer refers to these milestone numbers; comments name the package or
+function they mean.)
 
 1. **Skeleton** — repo, go.mod, config load/save, key generation, `init`/`token` commands.
 2. **Transport** — tailcat wrapper, dial/backoff/dedup, `net.Pipe` test transport.
@@ -346,10 +359,14 @@ Written up so v1 choices don't paint us into a corner:
 ## 14. Verification
 
 - `go test ./...` — unit tests: version-vector algebra, ignore matching, frame
-  codec (incl. fuzz), scanner on temp dirs, trash janitor.
-- Integration tests over the in-memory transport: full bidirectional sync, one-way
-  push, backup mode, conflict copy creation, resume after interrupted transfer,
-  approval grant/deny, receive-only revert.
-- Manual end-to-end on one machine: two daemons with separate `--config`/data dirs and
-  API ports, exchange tokens, share a directory, watch it sync through real tailcat;
-  verify the web UI on both.
+  codec (incl. `FuzzDecode`), handshake and keepalive, scanner/watcher on temp dirs,
+  trash and its janitor, config schema and overlap rules, REST handlers.
+- Integration tests over the in-memory transport (`internal/sync/integration_test.go`):
+  bidirectional sync over a nested tree, one-way read-only shares, receive-only revert
+  via trash, conflict copy creation, delete-vs-modify resurrect, hostile relpath
+  rejection, sha256 mismatch leaving the destination untouched, the concurrent-pull
+  limit, and restore propagating as a new change. Resume and approval grant/deny are
+  not covered, because neither is implemented (see the README).
+- `scripts/e2e.sh` — two real daemons over live tailcat, asserting bidirectional sync,
+  delete+trash, and a two-sided conflict all converge on disk.
+- Manual end-to-end: MANUAL-TESTS.md, including the web UI on both nodes.

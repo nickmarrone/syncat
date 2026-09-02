@@ -176,7 +176,8 @@ across two real machines.
 ## 10. Web UI
 
 - [ ] Loads at the configured `api_addr`.
-- [ ] Peers, shares, subscriptions, and transfers all render and refresh.
+- [ ] Peers, shares, and subscriptions all render and refresh. (There is no
+      transfer view — see the known gaps below.)
 - [ ] Adding a peer, share, and subscription through the UI produces the
       same result as the CLI.
 - [ ] The subscribe dialog rejects bad input with a readable message rather
@@ -235,6 +236,8 @@ testers recognise them on sight:
 - `.syncatignore` gitignore syntax — only a fixed ignore set exists.
 - Symlink syncing — detected and skipped.
 - Transfer resume — interrupted transfers restart from zero.
+- Transfer progress — no per-transfer byte counters exist, so `/api/status`
+  has no `transfers` key and the dashboard has no progress bars.
 - Tombstone purging — deleted-file tombstones are kept indefinitely.
 - `GET /api/events` (SSE) — the UI polls instead.
 - The Settings view — config-file only.
