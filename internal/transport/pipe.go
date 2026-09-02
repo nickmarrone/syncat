@@ -1,30 +1,49 @@
 package transport
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"net"
-	"os"
 	"sync"
-	"time"
 )
 
-// --- PipeTransport: the in-memory Transport used by tests --------------
+// --- PipeTransport: the loopback Transport used by tests ---------------
 
-// PipeTransport is an in-memory [Transport] for tests (SPEC.md §10): two
-// PipeTransports sharing the same process find each other by address string
-// through a package-level registry, the same way tailcat peers find each
-// other by ConnBlob. See bufConn below for why connections are a buffered
-// in-memory pipe rather than the stdlib's net.Pipe.
+// PipeTransport is the [Transport] tests use in place of
+// [TailcatTransport] (SPEC.md §10). Two PipeTransports in the same process
+// find each other by address string through a package-level registry, the
+// same way tailcat peers find each other by ConnBlob; the connections
+// themselves are ordinary TCP connections over the loopback interface.
+//
+// Loopback sockets rather than an in-process pipe, deliberately.
+// Everything above this package is written against net.Conn's whole
+// contract, and three parts of it carry real weight here:
+//
+//   - A deadline set on a Read that is *already blocked* must interrupt
+//     it. internal/protocol's Handshake cancels a stalled handshake by
+//     exactly that move — its ctx watcher calls conn.SetDeadline(now) on
+//     a connection some other goroutine is blocked reading.
+//   - A Write to a peer that has gone away must eventually fail, so the
+//     error paths above this package are reachable at all.
+//   - The send buffer must be finite, so backpressure exists and a test
+//     can observe a stalled transfer instead of quietly growing a heap.
+//
+// The stdlib's net.Pipe honours deadlines but is synchronous and
+// unbuffered — a Write blocks until the peer Reads, which deadlocks
+// SPEC.md §4's "both sides immediately send Hello". A hand-rolled
+// buffered net.Conn fixes that one problem and must then re-earn all
+// three properties above; the ones it gets wrong fail silently, leaving a
+// green test suite that never exercised the behaviour it was written to
+// pin. A kernel socket costs a few microseconds per connection and gets
+// every one of them right for free.
 //
 // The zero value is not usable; construct with [NewPipeTransport].
 type PipeTransport struct {
 	addr string
 
 	mu      sync.Mutex
+	ln      net.Listener
 	onConn  func(net.Conn)
 	started bool
 	closed  bool
@@ -60,9 +79,49 @@ func (t *PipeTransport) Start(ctx context.Context, onConn func(net.Conn)) error 
 	if _, loaded := pipeRegistry.LoadOrStore(t.addr, t); loaded {
 		return fmt.Errorf("transport: pipe: address %q is already registered", t.addr)
 	}
+
+	ln, err := listenLoopback()
+	if err != nil {
+		pipeRegistry.CompareAndDelete(t.addr, t)
+		return fmt.Errorf("transport: pipe: listen: %w", err)
+	}
+
+	t.ln = ln
 	t.onConn = onConn
 	t.started = true
+	go acceptLoop(ln, onConn)
 	return nil
+}
+
+// listenLoopback binds a listener on the loopback interface, on a port the
+// kernel picks. IPv4 loopback is tried first and IPv6 is the fallback, so
+// this works on hosts configured for either.
+func listenLoopback() (net.Listener, error) {
+	ln, err4 := net.Listen("tcp", "127.0.0.1:0")
+	if err4 == nil {
+		return ln, nil
+	}
+	ln, err6 := net.Listen("tcp", "[::1]:0")
+	if err6 == nil {
+		return ln, nil
+	}
+	return nil, fmt.Errorf("no loopback listener: IPv4: %v; IPv6: %w", err4, err6)
+}
+
+// acceptLoop hands every accepted connection to onConn on its own
+// goroutine, per [Transport.Start]'s contract, until ln is closed (which
+// is how [PipeTransport.Close] stops it).
+func acceptLoop(ln net.Listener, onConn func(net.Conn)) {
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			// The only expected error is the listener being closed; any
+			// other is equally terminal for a loopback listener, and this
+			// is a test transport with nowhere useful to report it.
+			return
+		}
+		go onConn(conn)
+	}
 }
 
 // DiscardPeer implements Transport. PipeTransport caches nothing per peer
@@ -77,22 +136,25 @@ func (t *PipeTransport) Dial(ctx context.Context, addr string) (net.Conn, error)
 	peer := v.(*PipeTransport)
 
 	peer.mu.Lock()
-	onConn := peer.onConn
-	closed := peer.closed
+	ln, onConn, closed := peer.ln, peer.onConn, peer.closed
 	peer.mu.Unlock()
-	if closed || onConn == nil {
+	if closed || ln == nil || onConn == nil {
 		return nil, fmt.Errorf("transport: pipe: dial %q: peer is not accepting connections", addr)
 	}
 
-	t.mu.Lock()
-	localAddr := t.addr
-	t.mu.Unlock()
-
-	ours, theirs := newBufConnPair(pipeAddr(localAddr), pipeAddr(addr))
-	go onConn(theirs)
-	return ours, nil
+	// Dialling the peer's real listener address means ctx bounds the dial
+	// itself, the same way it does for TailcatTransport.Dial.
+	var d net.Dialer
+	conn, err := d.DialContext(ctx, ln.Addr().Network(), ln.Addr().String())
+	if err != nil {
+		return nil, fmt.Errorf("transport: pipe: dial %q: %w", addr, err)
+	}
+	return conn, nil
 }
 
+// LocalAddress implements Transport. It returns the registry key — the
+// address peers dial, and the tailcat ConnBlob's stand-in inside a node
+// token — not the loopback host:port the listener happens to hold.
 func (t *PipeTransport) LocalAddress() (string, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -109,8 +171,8 @@ func (t *PipeTransport) Close() error {
 		return nil
 	}
 	t.closed = true
-	addr := t.addr
-	started := t.started
+	addr, ln, started := t.addr, t.ln, t.started
+	t.ln = nil
 	t.mu.Unlock()
 
 	if started {
@@ -120,182 +182,13 @@ func (t *PipeTransport) Close() error {
 		// that concurrently with our own Close.
 		pipeRegistry.CompareAndDelete(addr, t)
 	}
-	return nil
-}
-
-// pipeAddr is a net.Addr for PipeTransport connections; its String is the
-// registry address string.
-type pipeAddr string
-
-func (a pipeAddr) Network() string { return "pipe" }
-func (a pipeAddr) String() string  { return string(a) }
-
-// --- bufConn: the buffered in-memory net.Conn behind a pipe ------------
-
-// bufConn is a net.Conn backed by an unbounded, in-memory byte queue in
-// each direction.
-//
-// This is deliberately not the stdlib's net.Pipe: that pipe is synchronous
-// and unbuffered, meaning a Write blocks until a concurrent Read on the
-// other end drains it. SPEC.md §4's handshake has both sides write their
-// Hello before either has read anything ("Both sides immediately send
-// Hello..."); wired together with a bare net.Pipe, two goroutines doing
-// that in the obvious write-then-read order deadlock, because each side's
-// Write blocks waiting for a Read the peer hasn't reached yet. Buffering
-// each direction avoids relying on the caller always having a concurrent
-// reader in flight: Write returns as soon as the bytes are queued, the
-// same way a real TCP socket's send buffer behaves. Deadlines are
-// supported (Read waits on the queue, a timer, or the connection's own
-// Close, whichever comes first); Write never blocks, so a write deadline
-// is accepted but has nothing to enforce against.
-type bufConn struct {
-	local, remote net.Addr
-	in            *byteQueue // bytes the peer wrote to us; we read from here
-	out           *byteQueue // bytes we write; the peer reads them from here
-
-	closeOnce sync.Once
-	closed    chan struct{}
-
-	deadlineMu   sync.Mutex
-	readDeadline time.Time
-}
-
-// newBufConnPair returns two ends of an in-memory connection, as if `a`
-// dialed `b`.
-func newBufConnPair(aAddr, bAddr net.Addr) (a, b *bufConn) {
-	aToB := newByteQueue()
-	bToA := newByteQueue()
-	a = &bufConn{local: aAddr, remote: bAddr, in: bToA, out: aToB, closed: make(chan struct{})}
-	b = &bufConn{local: bAddr, remote: aAddr, in: aToB, out: bToA, closed: make(chan struct{})}
-	return a, b
-}
-
-func (c *bufConn) Read(p []byte) (int, error) {
-	select {
-	case <-c.closed:
-		return 0, net.ErrClosed
-	default:
-	}
-	return c.in.read(p, c.readDeadlineChan(), c.closed)
-}
-
-func (c *bufConn) Write(p []byte) (int, error) {
-	select {
-	case <-c.closed:
-		return 0, net.ErrClosed
-	default:
-	}
-	return c.out.write(p)
-}
-
-// Close closes this end of the connection: further Reads and Writes on it
-// fail, and the peer's Read observes io.EOF once it has drained whatever
-// was already queued. It is idempotent.
-func (c *bufConn) Close() error {
-	c.closeOnce.Do(func() {
-		close(c.closed)
-		c.out.close()
-	})
-	return nil
-}
-
-func (c *bufConn) LocalAddr() net.Addr  { return c.local }
-func (c *bufConn) RemoteAddr() net.Addr { return c.remote }
-
-func (c *bufConn) SetDeadline(t time.Time) error {
-	c.SetReadDeadline(t)
-	return nil // no-op for writes; see the bufConn doc comment
-}
-
-func (c *bufConn) SetReadDeadline(t time.Time) error {
-	c.deadlineMu.Lock()
-	c.readDeadline = t
-	c.deadlineMu.Unlock()
-	return nil
-}
-
-func (c *bufConn) SetWriteDeadline(t time.Time) error {
-	return nil // no-op; Write never blocks (unbounded queue)
-}
-
-func (c *bufConn) readDeadlineChan() <-chan time.Time {
-	c.deadlineMu.Lock()
-	d := c.readDeadline
-	c.deadlineMu.Unlock()
-	if d.IsZero() {
-		return nil
-	}
-	return time.After(time.Until(d))
-}
-
-// byteQueue is an unbounded, closable, concurrency-safe byte buffer used
-// to implement one direction of a bufConn. Waiting readers are woken via
-// the channel-swap idiom: notifyCh is closed (broadcasting to everyone
-// currently waiting) and replaced whenever new data arrives or the queue
-// is closed.
-type byteQueue struct {
-	mu       sync.Mutex
-	buf      bytes.Buffer
-	closed   bool
-	notifyCh chan struct{}
-}
-
-func newByteQueue() *byteQueue {
-	return &byteQueue{notifyCh: make(chan struct{})}
-}
-
-func (q *byteQueue) write(p []byte) (int, error) {
-	q.mu.Lock()
-	if q.closed {
-		q.mu.Unlock()
-		return 0, net.ErrClosed
-	}
-	n, _ := q.buf.Write(p) // bytes.Buffer.Write never fails except on OOM
-	old := q.notifyCh
-	q.notifyCh = make(chan struct{})
-	q.mu.Unlock()
-	close(old)
-	return n, nil
-}
-
-func (q *byteQueue) close() {
-	q.mu.Lock()
-	if q.closed {
-		q.mu.Unlock()
-		return
-	}
-	q.closed = true
-	old := q.notifyCh
-	q.notifyCh = make(chan struct{})
-	q.mu.Unlock()
-	close(old)
-}
-
-// read reads whatever is available into p, blocking until there is data,
-// the queue is closed (io.EOF), deadlineCh fires (os.ErrDeadlineExceeded),
-// or connClosed fires (net.ErrClosed).
-func (q *byteQueue) read(p []byte, deadlineCh <-chan time.Time, connClosed <-chan struct{}) (int, error) {
-	for {
-		q.mu.Lock()
-		if q.buf.Len() > 0 {
-			n, _ := q.buf.Read(p)
-			q.mu.Unlock()
-			return n, nil
-		}
-		if q.closed {
-			q.mu.Unlock()
-			return 0, io.EOF
-		}
-		ch := q.notifyCh
-		q.mu.Unlock()
-
-		select {
-		case <-ch:
-			// New data or a close arrived; loop and re-check.
-		case <-deadlineCh:
-			return 0, os.ErrDeadlineExceeded
-		case <-connClosed:
-			return 0, net.ErrClosed
+	if ln != nil {
+		// Closing the listener ends acceptLoop. Connections already
+		// accepted, or already returned by Dial, are the caller's to close
+		// — see Transport.Close.
+		if err := ln.Close(); err != nil {
+			return fmt.Errorf("transport: pipe: close listener: %w", err)
 		}
 	}
+	return nil
 }

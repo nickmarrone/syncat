@@ -27,7 +27,7 @@ import (
 // --- test harness -----------------------------------------------------
 //
 // Two in-process nodes over transport.PipeTransport (SPEC.md §10's
-// in-memory stand-in for the real tailcat carrier), each with its own
+// loopback stand-in for the real tailcat carrier), each with its own
 // temp dir, index, and identity, wired into a pair of Sessions that talk
 // to each other exactly the way two peers would once internal/protocol's
 // handshake and the share negotiation already happened. Rather than
