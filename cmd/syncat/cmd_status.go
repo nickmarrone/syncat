@@ -71,12 +71,6 @@ func printStatus(c *apiClient, asJSON bool) error {
 		}
 	}
 
-	if len(st.Transfers) > 0 {
-		fmt.Printf("transfers (%d):\n", len(st.Transfers))
-		for _, t := range st.Transfers {
-			fmt.Printf("  %s %s/%s\t%d/%d bytes\n", t.Direction, t.ShareID, t.RelPath, t.BytesTransferred, t.TotalBytes)
-		}
-	}
 	if len(st.Rejected) > 0 {
 		fmt.Printf("rejected connections (%d):\n", len(st.Rejected))
 		for _, r := range st.Rejected {

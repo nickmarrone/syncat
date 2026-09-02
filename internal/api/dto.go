@@ -36,7 +36,6 @@ type statusResponse struct {
 	Shares        []shareDTO        `json:"shares"`
 	RemoteShares  []remoteShareDTO  `json:"remote_shares"`
 	Subscriptions []subscriptionDTO `json:"subscriptions"`
-	Transfers     []transferDTO     `json:"transfers"`
 	Rejected      []rejectedConnDTO `json:"rejected_connections"`
 }
 
@@ -100,16 +99,6 @@ type subscriptionDTO struct {
 	Warnings  []warningDTO `json:"warnings,omitempty"`
 }
 
-type transferDTO struct {
-	PeerKey          string    `json:"peer_key"`
-	ShareID          string    `json:"share_id"`
-	RelPath          string    `json:"rel_path"`
-	Direction        string    `json:"direction"`
-	BytesTransferred int64     `json:"bytes_transferred"`
-	TotalBytes       int64     `json:"total_bytes"`
-	StartedAt        time.Time `json:"started_at"`
-}
-
 type rejectedConnDTO struct {
 	PeerKey  string    `json:"peer_key,omitempty"`
 	PeerName string    `json:"peer_name,omitempty"`
@@ -166,13 +155,6 @@ func toSubscriptionDTO(s core.SubscriptionStatus) subscriptionDTO {
 	}
 }
 
-func toTransferDTO(t core.TransferStatus) transferDTO {
-	return transferDTO{
-		PeerKey: t.PeerKey, ShareID: t.ShareID, RelPath: t.RelPath, Direction: t.Direction,
-		BytesTransferred: t.BytesTransferred, TotalBytes: t.TotalBytes, StartedAt: t.StartedAt,
-	}
-}
-
 func toRejectedConnDTO(r core.RejectedConnection) rejectedConnDTO {
 	return rejectedConnDTO{PeerKey: r.PeerKey, PeerName: r.PeerName, At: r.At, Reason: r.Reason}
 }
@@ -198,10 +180,6 @@ func toStatusResponse(st core.Status) statusResponse {
 	for _, s := range st.Subscriptions {
 		subs = append(subs, toSubscriptionDTO(s))
 	}
-	transfers := make([]transferDTO, 0, len(st.Transfers))
-	for _, t := range st.Transfers {
-		transfers = append(transfers, toTransferDTO(t))
-	}
 	rejected := make([]rejectedConnDTO, 0, len(st.RejectedConnections))
 	for _, r := range st.RejectedConnections {
 		rejected = append(rejected, toRejectedConnDTO(r))
@@ -210,7 +188,7 @@ func toStatusResponse(st core.Status) statusResponse {
 		NodeName: st.NodeName, NodeToken: st.NodeToken, ShortID: st.ShortID, PeerKey: st.PeerKey,
 		StartedAt: st.StartedAt, UptimeSeconds: st.UptimeSeconds,
 		Peers: peers, Shares: shares, RemoteShares: remoteShares, Subscriptions: subs,
-		Transfers: transfers, Rejected: rejected,
+		Rejected: rejected,
 	}
 }
 

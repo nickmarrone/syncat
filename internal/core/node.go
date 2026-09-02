@@ -23,8 +23,6 @@
 //     since internal/sync.Session exposes no share-removal call. A fresh
 //     connection never re-adds a removed/revoked share, so this converges
 //     on reconnect either way.
-//   - Status.Transfers is always empty: internal/sync.Session doesn't
-//     expose per-transfer byte-progress introspection yet (see status.go).
 package core
 
 import (
@@ -89,23 +87,12 @@ type Options struct {
 	DisableJitter bool
 }
 
-// shareRole distinguishes a share we offer from a peer's share we
-// subscribe to, for logging only — the sync mechanics (Direction, watcher,
-// scanner) are identical either way (see shares.go).
-type shareRole int
-
-const (
-	roleOffered shareRole = iota
-	roleSubscription
-)
-
 // shareWatch is one local directory Node keeps indexed: either a share we
 // offer (root = config.Share.Path) or a subscription's local copy (root =
 // config.Subscription.LocalPath). See shares.go.
 type shareWatch struct {
 	shareID string
 	root    string
-	role    shareRole
 	scanner *index.Scanner
 	watcher *index.Watcher
 }
@@ -272,7 +259,7 @@ func Open(ctx context.Context, opts Options) (*Node, error) {
 	n.token = tok
 
 	for _, s := range cfg.Shares {
-		if _, err := n.startShareWatch(s.ID, s.Path, roleOffered); err != nil {
+		if _, err := n.startShareWatch(s.ID, s.Path); err != nil {
 			logger.Printf("core: open: start watcher for share %s: %v", s.ID, err)
 			continue
 		}
@@ -284,7 +271,7 @@ func Open(ctx context.Context, opts Options) (*Node, error) {
 		if sub.Paused {
 			continue
 		}
-		if _, err := n.startShareWatch(sub.ShareID, sub.LocalPath, roleSubscription); err != nil {
+		if _, err := n.startShareWatch(sub.ShareID, sub.LocalPath); err != nil {
 			logger.Printf("core: open: start watcher for subscription %s: %v", sub.ShareID, err)
 			continue
 		}
@@ -724,7 +711,7 @@ func (n *Node) AddShare(path, name, permission string, approvalRequired bool) (s
 		return "", fmt.Errorf("core: add share: %w", err)
 	}
 
-	if _, err := n.startShareWatch(id, path, roleOffered); err != nil {
+	if _, err := n.startShareWatch(id, path); err != nil {
 		n.logger.Printf("core: add share: start watcher for %s: %v", id, err)
 	} else if err := n.rescanShare(n.ctx, id); err != nil {
 		n.logger.Printf("core: add share: initial scan for %s: %v", id, err)
@@ -981,7 +968,7 @@ func (n *Node) AddSubscription(peerRef, shareRef, localPath, mode string) error 
 		return fmt.Errorf("core: add subscription: %w", err)
 	}
 
-	if _, err := n.startShareWatch(shareID, localPath, roleSubscription); err != nil {
+	if _, err := n.startShareWatch(shareID, localPath); err != nil {
 		n.logger.Printf("core: add subscription: start watcher for %s: %v", shareID, err)
 	}
 
@@ -1075,7 +1062,7 @@ func (n *Node) PauseSubscription(peerRef, shareRef string, paused bool) error {
 		return nil
 	}
 
-	if _, err := n.startShareWatch(shareID, sub.LocalPath, roleSubscription); err != nil {
+	if _, err := n.startShareWatch(shareID, sub.LocalPath); err != nil {
 		n.logger.Printf("core: resume subscription: start watcher for %s: %v", shareID, err)
 	}
 	if pc != nil {

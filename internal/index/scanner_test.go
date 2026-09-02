@@ -354,11 +354,7 @@ func TestScanSkipsSymlinks(t *testing.T) {
 		t.Skipf("symlinks not supported on this platform: %v", err)
 	}
 
-	var warnings []string
 	sc := NewScanner(os.DirFS(root), nil)
-	sc.SetWarnFunc(func(format string, args ...any) {
-		warnings = append(warnings, format)
-	})
 
 	result, err := sc.Scan(context.Background(), "share1", nil)
 	if err != nil {

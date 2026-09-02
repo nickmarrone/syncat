@@ -2,18 +2,8 @@ package index
 
 import (
 	"context"
-	"database/sql"
-	"errors"
 	"fmt"
 )
-
-// PeerRow is one entry in a peer's mirrored index: the local record of
-// what protocol.IndexUpdate last told us about one of a peer's files
-// (SPEC.md §5's peer_files table).
-type PeerRow struct {
-	PeerKey string // peer's node short id (see config.IdentityKey.ShortID)
-	FileRow
-}
 
 // UpsertPeerFiles replaces this peer's known state for the given rows, in
 // one transaction. Each row's ShareID/RelPath identifies which file it
@@ -78,19 +68,4 @@ func (s *Store) ListPeerFiles(ctx context.Context, peerKey, shareID string) ([]F
 	}
 	defer rows.Close()
 	return collectFileRows(rows, shareID)
-}
-
-// GetPeerFile returns one row from a peer's mirrored index.
-func (s *Store) GetPeerFile(ctx context.Context, peerKey, shareID, relpath string) (FileRow, error) {
-	row := s.db.QueryRowContext(ctx, `
-		SELECT relpath, type, size, mtime_ns, mode, sha256, version_json, deleted, updated_at
-		FROM peer_files WHERE peer_key = ? AND share_id = ? AND relpath = ?`, peerKey, shareID, relpath)
-	fr, err := scanFileRow(row, shareID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return FileRow{}, fmt.Errorf("index: get peer file %s/%s/%s: %w", peerKey, shareID, relpath, ErrNotFound)
-	}
-	if err != nil {
-		return FileRow{}, fmt.Errorf("index: get peer file %s/%s/%s: %w", peerKey, shareID, relpath, err)
-	}
-	return fr, nil
 }

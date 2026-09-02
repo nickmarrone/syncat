@@ -75,7 +75,6 @@ func (n *Node) Status() Status {
 		Shares:        shares,
 		RemoteShares:  remoteShares,
 		Subscriptions: subs,
-		Transfers:     nil, // see status.go's doc comment on TransferStatus
 
 		RejectedConnections: rejected,
 	}

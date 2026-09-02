@@ -25,7 +25,7 @@ import (
 // truth (SPEC.md §5). It does not itself perform the first scan — callers
 // that want one immediately (Open, AddShare, AddSubscription) call
 // rescanShare explicitly afterward.
-func (n *Node) startShareWatch(shareID, root string, role shareRole) (*shareWatch, error) {
+func (n *Node) startShareWatch(shareID, root string) (*shareWatch, error) {
 	n.cfgMu.RLock()
 	ignores := append([]string(nil), n.cfg.GlobalIgnores...)
 	rescanSeconds := n.cfg.RescanIntervalSeconds
@@ -48,7 +48,7 @@ func (n *Node) startShareWatch(shareID, root string, role shareRole) (*shareWatc
 		return nil, fmt.Errorf("core: start watcher for %s: %w", shareID, err)
 	}
 
-	sw := &shareWatch{shareID: shareID, root: root, role: role, scanner: scanner, watcher: watcher}
+	sw := &shareWatch{shareID: shareID, root: root, scanner: scanner, watcher: watcher}
 	n.sharesMu.Lock()
 	if old, ok := n.shareWatches[shareID]; ok {
 		// Replacing an existing watch (e.g. AddShare called again for a

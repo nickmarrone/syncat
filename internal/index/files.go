@@ -45,17 +45,6 @@ func (s *Store) PutFile(ctx context.Context, row FileRow) error {
 	return nil
 }
 
-// DeleteFileRow permanently removes a row (used by the eventual trash
-// janitor's 180-day tombstone purge, SPEC.md §4 — not called by this
-// phase). To record a delete as a tombstone instead, apply a ScanResult
-// whose Deleted list contains the row, or call PutFile with Deleted=true.
-func (s *Store) DeleteFileRow(ctx context.Context, shareID, relpath string) error {
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM files WHERE share_id = ? AND relpath = ?`, shareID, relpath); err != nil {
-		return fmt.Errorf("index: delete row %s/%s: %w", shareID, relpath, err)
-	}
-	return nil
-}
-
 // ListShare returns every row for a share, in relpath order.
 // includeDeleted controls whether tombstones are included.
 func (s *Store) ListShare(ctx context.Context, shareID string, includeDeleted bool) ([]FileRow, error) {
@@ -87,18 +76,6 @@ func (s *Store) ListShareMap(ctx context.Context, shareID string) (map[string]Fi
 		out[r.RelPath] = r
 	}
 	return out, nil
-}
-
-// ListTombstones returns the deleted rows for a share, in relpath order.
-func (s *Store) ListTombstones(ctx context.Context, shareID string) ([]FileRow, error) {
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT relpath, type, size, mtime_ns, mode, sha256, version_json, deleted, updated_at
-		FROM files WHERE share_id = ? AND deleted = 1 ORDER BY relpath`, shareID)
-	if err != nil {
-		return nil, fmt.Errorf("index: list tombstones %s: %w", shareID, err)
-	}
-	defer rows.Close()
-	return collectFileRows(rows, shareID)
 }
 
 // ApplyScanResult persists a Scanner diff in one transaction: every added,

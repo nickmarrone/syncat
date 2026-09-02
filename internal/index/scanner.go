@@ -71,7 +71,6 @@ type ScanResult struct {
 type Scanner struct {
 	fsys   FS
 	ignore *Matcher // nil means nothing is ignored
-	warn   func(format string, args ...any)
 }
 
 // NewScanner returns a Scanner that reads share contents through fsys
@@ -81,20 +80,9 @@ func NewScanner(fsys FS, ignore *Matcher) *Scanner {
 	return &Scanner{fsys: fsys, ignore: ignore}
 }
 
-// SetWarnFunc installs a callback invoked once per skipped entry (in
-// addition to the same message being appended to the returned
-// ScanResult.Warnings). Passing nil (the default) means warnings are only
-// available via ScanResult.Warnings.
-func (sc *Scanner) SetWarnFunc(fn func(format string, args ...any)) {
-	sc.warn = fn
-}
-
+// warnf formats one skipped-entry message for ScanResult.Warnings.
 func (sc *Scanner) warnf(format string, args ...any) string {
-	msg := fmt.Sprintf(format, args...)
-	if sc.warn != nil {
-		sc.warn("%s", msg)
-	}
-	return msg
+	return fmt.Sprintf(format, args...)
 }
 
 // Scan walks the share and classifies every entry against existing (the

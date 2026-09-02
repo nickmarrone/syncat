@@ -197,12 +197,8 @@ func TestTombstoneSurvives(t *testing.T) {
 		t.Fatalf("ListShare(includeDeleted=true) = %d rows, want 1", len(all))
 	}
 
-	tombstones, err := s.ListTombstones(ctx, "s1")
-	if err != nil {
-		t.Fatalf("ListTombstones: %v", err)
-	}
-	if len(tombstones) != 1 || tombstones[0].RelPath != "gone.txt" {
-		t.Errorf("ListTombstones = %+v, want [gone.txt]", tombstones)
+	if all[0].RelPath != "gone.txt" || !all[0].Deleted {
+		t.Errorf("ListShare(includeDeleted=true) = %+v, want [gone.txt tombstone]", all)
 	}
 }
 
@@ -301,12 +297,8 @@ func TestUpsertAndListPeerFiles(t *testing.T) {
 		t.Fatalf("len(got) = %d, want 2", len(got))
 	}
 
-	single, err := s.GetPeerFile(ctx, "peer1", "share1", "a.txt")
-	if err != nil {
-		t.Fatalf("GetPeerFile: %v", err)
-	}
-	if single.Version["peer1"] != 1 {
-		t.Errorf("GetPeerFile version = %v, want peer1:1", single.Version)
+	if got[0].RelPath != "a.txt" || got[0].Version["peer1"] != 1 {
+		t.Errorf("ListPeerFiles[0] = %+v, want a.txt at peer1:1", got[0])
 	}
 
 	// Re-upserting one row updates it in place without touching the other.

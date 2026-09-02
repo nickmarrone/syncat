@@ -129,23 +129,6 @@ type SubscriptionStatus struct {
 	Warnings  []WarningStatus
 }
 
-// TransferStatus describes one in-flight file transfer. SPEC.md §8/§9 asks
-// for transfer progress in the status surface; internal/sync.Session does
-// not yet expose per-transfer byte counters (only aggregate concurrency
-// instrumentation used by its own tests), so Node.Status always reports an
-// empty Transfers slice today. The field is kept in the snapshot shape so
-// Phase 8/9 can render it as soon as Session grows that hook — see the
-// package doc comment.
-type TransferStatus struct {
-	PeerKey          string
-	ShareID          string
-	RelPath          string
-	Direction        string // "pull" or "push"
-	BytesTransferred int64
-	TotalBytes       int64
-	StartedAt        time.Time
-}
-
 // RejectedConnection records one inbound connection whose handshake
 // authenticated as an Ed25519 key that is not a configured peer (SPEC.md
 // §2.3's pending-peer queue is deferred past the MVP — see Node's doc
@@ -160,10 +143,10 @@ type RejectedConnection struct {
 
 // Status is Node's complete read-only snapshot: node identity, uptime,
 // every peer's connection state, our shares and who has access to them,
-// what peers offer us, our subscriptions and their sync state, in-flight
-// transfers, and recent warnings. Every field is plain, JSON-friendly data
-// (SPEC.md §12: no encoding/json import here) — Phase 8 marshals this
-// directly for GET /api/status and friends.
+// what peers offer us, our subscriptions and their sync state, and recent
+// warnings. Every field is plain, JSON-friendly data (SPEC.md §12: no
+// encoding/json import here) — internal/api marshals this directly for
+// GET /api/status and friends.
 type Status struct {
 	NodeName  string
 	NodeToken string
@@ -177,7 +160,6 @@ type Status struct {
 	Shares        []ShareStatus
 	RemoteShares  []RemoteShareStatus
 	Subscriptions []SubscriptionStatus
-	Transfers     []TransferStatus
 
 	RejectedConnections []RejectedConnection
 }

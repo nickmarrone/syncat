@@ -100,13 +100,9 @@ type Session struct {
 
 	// warningsMu/warnings record every LocallyModifiedWarning this Session
 	// has raised (SPEC.md §1/§5's receive-only "flagged as locally
-	// modified" UI warning), for a caller (Phase 8's API) to read back.
-	// onLocallyModified, if set via SetLocallyModifiedHandler, is called
-	// with each warning as it's recorded, in addition to it being kept
-	// here.
-	warningsMu        sync.Mutex
-	warnings          []LocallyModifiedWarning
-	onLocallyModified func(LocallyModifiedWarning)
+	// modified" UI warning), for a caller (the API layer) to read back.
+	warningsMu sync.Mutex
+	warnings   []LocallyModifiedWarning
 
 	logger *log.Logger
 
@@ -248,17 +244,6 @@ func (s *Session) Writer() *protocol.Writer {
 	return s.writer
 }
 
-// SetLocallyModifiedHandler registers fn to be called synchronously, from
-// whichever goroutine is applying the action, every time this Session
-// records a LocallyModifiedWarning (SPEC.md §1/§5). Phase 8's API layer
-// uses this to surface the warning live rather than only polling
-// LocallyModifiedWarnings. Safe to call before or after Start.
-func (s *Session) SetLocallyModifiedHandler(fn func(LocallyModifiedWarning)) {
-	s.warningsMu.Lock()
-	s.onLocallyModified = fn
-	s.warningsMu.Unlock()
-}
-
 // LocallyModifiedWarnings returns a snapshot of every LocallyModifiedWarning
 // recorded so far, oldest first.
 func (s *Session) LocallyModifiedWarnings() []LocallyModifiedWarning {
@@ -269,16 +254,11 @@ func (s *Session) LocallyModifiedWarnings() []LocallyModifiedWarning {
 	return out
 }
 
-// recordWarning appends w to the session's warning log and, if set, calls
-// the registered handler.
+// recordWarning appends w to the session's warning log.
 func (s *Session) recordWarning(w LocallyModifiedWarning) {
 	s.warningsMu.Lock()
 	s.warnings = append(s.warnings, w)
-	handler := s.onLocallyModified
 	s.warningsMu.Unlock()
-	if handler != nil {
-		handler(w)
-	}
 }
 
 func (s *Session) getShare(shareID string) (ShareConfig, bool) {

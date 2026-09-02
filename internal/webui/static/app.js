@@ -374,31 +374,6 @@ function renderPeerCard(peer) {
   return card;
 }
 
-function renderTransfersCard(status) {
-  const card = el('div', { class: 'card' });
-  card.append(el('h2', {}, 'Active transfers'));
-  const transfers = status.transfers || [];
-  if (transfers.length === 0) {
-    card.append(el('p', { class: 'empty-state' }, 'No active transfers.'));
-    return card;
-  }
-  const list = el('ul', { class: 'plain' });
-  for (const t of transfers) {
-    const pct = t.total_bytes > 0 ? Math.min(100, Math.round((t.bytes_transferred / t.total_bytes) * 100)) : 0;
-    const bar = el('div', { class: 'progress-bar' }, [el('div')]);
-    bar.firstChild.style.width = pct + '%';
-    list.append(el('li', {}, [
-      el('div', { class: 'stack' }, [
-        el('span', {}, (t.direction === 'push' ? '↑ ' : '↓ ') + t.rel_path + ' (' + t.share_id + ')'),
-        el('span', { class: 'faint' }, formatBytes(t.bytes_transferred) + ' / ' + formatBytes(t.total_bytes) + ' — ' + pct + '%'),
-      ]),
-      bar,
-    ]));
-  }
-  card.append(list);
-  return card;
-}
-
 function renderRejectedCard(status) {
   const rejected = status.rejected_connections || [];
   if (rejected.length === 0) return null;
@@ -427,7 +402,6 @@ function renderDashboard(status) {
     peersSection.append(grid);
   }
   wrap.append(peersSection);
-  wrap.append(renderTransfersCard(status));
   const rejected = renderRejectedCard(status);
   if (rejected) wrap.append(rejected);
   return wrap;

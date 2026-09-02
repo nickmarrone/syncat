@@ -66,15 +66,6 @@ type subscriptionView struct {
 	Warnings  []warningView `json:"warnings"`
 }
 
-type transferView struct {
-	PeerKey          string `json:"peer_key"`
-	ShareID          string `json:"share_id"`
-	RelPath          string `json:"rel_path"`
-	Direction        string `json:"direction"`
-	BytesTransferred int64  `json:"bytes_transferred"`
-	TotalBytes       int64  `json:"total_bytes"`
-}
-
 type rejectedView struct {
 	PeerKey  string    `json:"peer_key"`
 	PeerName string    `json:"peer_name"`
@@ -102,6 +93,5 @@ type statusView struct {
 	Shares        []shareView        `json:"shares"`
 	RemoteShares  []remoteShareView  `json:"remote_shares"`
 	Subscriptions []subscriptionView `json:"subscriptions"`
-	Transfers     []transferView     `json:"transfers"`
 	Rejected      []rejectedView     `json:"rejected_connections"`
 }
