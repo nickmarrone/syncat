@@ -12,6 +12,8 @@ import (
 	"time"
 )
 
+// --- PipeTransport: the in-memory Transport used by tests --------------
+
 // PipeTransport is an in-memory [Transport] for tests (SPEC.md §10): two
 // PipeTransports sharing the same process find each other by address string
 // through a package-level registry, the same way tailcat peers find each
@@ -127,6 +129,8 @@ type pipeAddr string
 
 func (a pipeAddr) Network() string { return "pipe" }
 func (a pipeAddr) String() string  { return string(a) }
+
+// --- bufConn: the buffered in-memory net.Conn behind a pipe ------------
 
 // bufConn is a net.Conn backed by an unbounded, in-memory byte queue in
 // each direction.

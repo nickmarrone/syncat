@@ -15,6 +15,8 @@ import (
 	"time"
 )
 
+// --- the Transport interface -------------------------------------------
+
 // Transport abstracts peer connectivity (SPEC.md §10) so the sync core and
 // everything above it never talks to tailcat, or any other carrier,
 // directly. [TailcatTransport] is the production implementation; a
@@ -73,6 +75,8 @@ const (
 	// [(1-j)*d, d].
 	DefaultBackoffJitter = 0.5
 )
+
+// --- reconnect scheduling (SPEC.md §2.2) -------------------------------
 
 // Backoff computes the reconnect delay schedule from SPEC.md §2.2. It is a
 // pure, stateless value: [Backoff.NextDelay] takes the failure count and a
@@ -228,6 +232,8 @@ func (s Supervisor) Run(ctx context.Context, dial func(ctx context.Context) erro
 		}
 	}
 }
+
+// --- duplicate-connection tie-break (SPEC.md §2.4) ---------------------
 
 // KeepConnection reports, per SPEC.md §2.4, whether a connection should
 // survive when a duplicate exists: if both sides of a peering dial each

@@ -77,8 +77,8 @@ func writeFile(t *testing.T, root, relpath, content string) string {
 // indexFile stats+hashes root/relpath (already written via writeFile) and
 // upserts a FileRow for it, bumping nodeID's counter on top of whatever
 // version the store already has for that relpath (0 if none) — standing
-// in for what internal/index's scanner+ApplyScanResult would have recorded after
-// a real local edit.
+// in for what internal/index's scanner+ApplyScanResult would have
+// recorded after a real local edit.
 func indexFile(t *testing.T, store *index.Store, nodeID, relpath string, root string) index.FileRow {
 	t.Helper()
 	full := filepath.Join(root, filepath.FromSlash(relpath))

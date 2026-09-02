@@ -48,9 +48,9 @@ func dialWithRetry(ctx context.Context, t *testing.T, tr *TailcatTransport, addr
 }
 
 // TestTailcatTransportEndToEnd exercises the production transport against
-// the real Tailscale DERP relays (confirmed reachable from this sandbox in
-// Verified by hand: all four *.ipn.dev relays reachable, Server.Start comes up with
-// a live home region). It's guarded by -short: DERP setup plus a
+// the real Tailscale DERP relays. Reachability was confirmed from this
+// sandbox by hand: all four *.ipn.dev relays respond, and Server.Start
+// comes up with a live home region. It's guarded by -short: DERP setup plus a
 // netcheck-based region pick takes a few real seconds, and this
 // environment's netcheck reports udp=false, so every byte here is relayed
 // rather than direct — hence the generous timeout.

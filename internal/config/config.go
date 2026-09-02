@@ -41,6 +41,8 @@ const (
 	ModeReceiveOnly = "receive-only"
 )
 
+// --- the config schema (SPEC.md §3) ------------------------------------
+
 // Config is the top-level shape of config.json (SPEC.md §3).
 type Config struct {
 	NodeName              string
@@ -146,9 +148,10 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	// A directory synced down from a peer must not be offered back out as one
-	// of our own shares; see pathsOverlap's block comment for why. Checked here as well as at
-	// the API layer so a hand-edited config.json cannot smuggle it past.
+	// A directory synced down from a peer must not be offered back out as
+	// one of our own shares; see pathsOverlap's block comment for why.
+	// Checked here as well as at the API layer so a hand-edited config.json
+	// cannot smuggle it past.
 	for i, s := range c.Shares {
 		if s.Path == "" {
 			continue
@@ -167,10 +170,12 @@ func (c *Config) Validate() error {
 	return errors.Join(errs...)
 }
 
-// This file is the only place that knows the on-disk encoding of Config.
-// Swapping the wire format later (see the deviation note at the top of this file)
-// should only require changes here: Marshal/Unmarshal's signatures, and the
-// rest of the package's use of them, stay the same.
+// The rest of this file is the only place that knows the on-disk encoding
+// of Config. Swapping the wire format later (see the deviation note at the
+// top of the file) should only require changes here: Marshal/Unmarshal's
+// signatures, and the rest of the package's use of them, stay the same.
+
+// --- on-disk encoding --------------------------------------------------
 
 // configDoc mirrors Config for JSON encoding, using SPEC.md §3's
 // snake_case field names.
@@ -296,6 +301,8 @@ func docToConfig(doc *configDoc) *Config {
 	return cfg
 }
 
+// --- loading and saving ------------------------------------------------
+
 // Load reads and parses config.json at path, applying defaults for absent
 // fields and validating the result. The returned error wraps os.ErrNotExist
 // when the file doesn't exist, so callers can use errors.Is.
@@ -346,6 +353,8 @@ func Save(path string, cfg *Config) error {
 // The rule is symmetric and covers nesting in both directions, because sharing
 // a parent of a subscribed directory re-exports its contents just as surely as
 // sharing the directory itself.
+
+// --- share/subscription overlap (see the block comment below) ----------
 
 // pathContains reports whether child is parent or lies beneath it. The
 // comparison is lexical after cleaning, so it is not fooled by "/a/code"
@@ -404,6 +413,8 @@ func (c *Config) CheckSubscriptionPath(localPath string) error {
 	}
 	return nil
 }
+
+// --- atomic file writes ------------------------------------------------
 
 // writeFileAtomic writes data to path with the given permissions by writing
 // to a temp file in the same directory and renaming it into place, so a

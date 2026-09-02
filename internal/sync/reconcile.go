@@ -20,9 +20,9 @@ import (
 	"github.com/nickmarrone/syncat/internal/protocol"
 )
 
-// This file implements the version-vector algebra SPEC.md §5 rests on:
-// Dominates, Concurrent, Equal, Merge, and Bump over protocol.VersionVector
-// (map[string]uint64, keyed by node-short-id).
+// The version-vector algebra SPEC.md §5 rests on: Dominates, Concurrent,
+// Equal, Merge, and Bump over protocol.VersionVector (map[string]uint64,
+// keyed by node-short-id).
 //
 // Missing-key convention: a key absent from a VersionVector is an implicit
 // zero counter, exactly as Go's map indexing already treats it (v[k] on a
@@ -33,6 +33,8 @@ import (
 // from that key being absent. Bump never removes keys and Merge never invents
 // zero entries, so in practice explicit zeros never appear — but the
 // functions here are correct either way.
+
+// --- version vectors (SPEC.md §5) --------------------------------------
 
 // Equal reports whether a and b represent the same version vector, treating
 // a missing key in either as an implicit zero.
@@ -112,6 +114,8 @@ func Bump(v protocol.VersionVector, nodeID string) protocol.VersionVector {
 	out[nodeID] = out[nodeID] + 1
 	return out
 }
+
+// --- the decisions Reconcile emits -------------------------------------
 
 // LocallyModifiedWarning records one receive-only "locally modified" event
 // (SPEC.md §1, §5): a subscriber's local edit that diverged from the
@@ -311,6 +315,8 @@ type Direction struct {
 	OutboundBlocked bool
 }
 
+// --- conflict-copy filenames (SPEC.md §5) ------------------------------
+
 // conflictMarkerRe matches an existing ".sync-conflict-YYYYMMDD-HHMMSS-<hex>"
 // marker anywhere it appears in a filename, so ConflictRelPath can strip a
 // prior marker before appending a fresh one. See ConflictRelPath's doc
@@ -375,6 +381,8 @@ func splitExt(base string) (name, ext string) {
 	}
 	return base[:i], base[i:]
 }
+
+// --- the reconciler ----------------------------------------------------
 
 // Clock returns the current time. Production callers pass time.Now; tests
 // inject a fixed or stepped function so conflict-filename timestamps (and
@@ -524,9 +532,10 @@ func reconcileConcurrent(relpath string, l, r protocol.FileInfo, nodeID string, 
 	// copy are "detected, logged as warnings... and overwritten... after a
 	// trash copy is taken" the next time the offerer changes the file. The
 	// actual revert-via-trash happens in apply.go; here we only raise the
-	// flag, carrying what the peer currently holds for it to apply. (If l.Deleted is true instead, the peer holding
-	// live content is a legitimate incoming resurrect, not a local
-	// misdeed — that falls through to the normal handling below.)
+	// flag, carrying what the peer currently holds for it to apply. (If
+	// l.Deleted is true instead, the peer holding live content is a
+	// legitimate incoming resurrect, not a local misdeed — that falls
+	// through to the normal handling below.)
 	if dir.OutboundBlocked && !l.Deleted {
 		return Action{Kind: ActionLocallyModified, RelPath: relpath, Resolved: r, Source: SourceRemote,
 			SourceVersion: r.Version, LocallyModified: true, Reason: "concurrent local change under receive-only subscription"}

@@ -21,6 +21,8 @@ const (
 	DefaultRescanInterval = 300 * time.Second
 )
 
+// --- the watcher: fsnotify plus a periodic full rescan -----------------
+
 // Clock abstracts wall-clock time so debounce timing can be driven
 // deterministically in tests, with no real sleeping (see debouncer and
 // watcher_test.go's fakeClock). Defined locally rather than imported from
@@ -282,6 +284,8 @@ func addTreeWatches(fsw *fsnotify.Watcher, dir string) error {
 		return nil
 	})
 }
+
+// --- the debouncer: collapsing event bursts ----------------------------
 
 // debouncer collapses a stream of dirty-path marks arriving within
 // `window` of each other into a single onFlush call carrying the

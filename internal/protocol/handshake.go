@@ -31,6 +31,8 @@ const nonceSize = 32
 // protocol that might reuse the same key.
 const authContext = "syncat-auth-v1"
 
+// --- the mutually-authenticated handshake (SPEC.md §4) -----------------
+
 // HandshakeConfig parameterizes one [Handshake] run.
 type HandshakeConfig struct {
 	// IdentityKey is this node's Ed25519 application identity keypair
@@ -421,6 +423,8 @@ const (
 	DefaultPingInterval = 30 * time.Second
 	DefaultDeadAfter    = 90 * time.Second
 )
+
+// --- keepalive: Ping/Pong idle and dead-connection timing --------------
 
 // Clock abstracts wall-clock time so [Keepalive.Run] can be driven
 // deterministically in tests, with no real sleeping. [RealClock] is the

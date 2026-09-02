@@ -27,6 +27,8 @@ import (
 	_ "modernc.org/sqlite" // registers the "sqlite" driver; pure Go, no cgo (SPEC.md §12)
 )
 
+// --- the database: opening and migrating -------------------------------
+
 // Store is the durable index: one SQLite database per node, at
 // <datadir>/db/index.db (SPEC.md §3, §5). It holds this node's own view of
 // each share's files (the `files` table), the latest IndexUpdate mirrored
@@ -220,6 +222,8 @@ func (s *Store) Close() error {
 	return nil
 }
 
+// --- FileRow: the index's row shape ------------------------------------
+
 // FileRow is the index's on-disk representation of one file/dir/symlink
 // entry within a share: protocol.FileInfo (the wire shape) plus the local
 // bookkeeping columns SPEC.md §5 assigns to the `files` table (share_id,
@@ -290,6 +294,8 @@ func cloneVersion(v protocol.VersionVector) protocol.VersionVector {
 
 // ErrNotFound is returned by lookups (GetFile) when no row matches.
 var ErrNotFound = errors.New("index: not found")
+
+// --- the files table: this node's own view -----------------------------
 
 // GetFile returns the row for one (shareID, relpath), including tombstones
 // (rows with Deleted=true).
@@ -505,6 +511,8 @@ func timeNS(t time.Time) int64 {
 	}
 	return t.UnixNano()
 }
+
+// --- the peer_files table: each peer's mirrored index ------------------
 
 // UpsertPeerFiles replaces this peer's known state for the given rows, in
 // one transaction. Each row's ShareID/RelPath identifies which file it

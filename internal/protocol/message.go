@@ -20,6 +20,8 @@ import (
 	"github.com/fxamacker/cbor/v2"
 )
 
+// --- message types (SPEC.md §4) ----------------------------------------
+
 // MsgType is the 1-byte frame type tag (SPEC.md §4).
 type MsgType byte
 
@@ -279,6 +281,8 @@ const (
 	// small FileChunkHeader is added.
 	MaxFileChunkData = 1 * 1024 * 1024
 )
+
+// --- framing: length-prefixed frames on the wire -----------------------
 
 // Writer encodes messages onto an underlying io.Writer as length-prefixed
 // frames (SPEC.md §4).

@@ -22,7 +22,8 @@ import (
 	"github.com/nickmarrone/syncat/internal/protocol"
 )
 
-// This file implements SPEC.md §7's trash can.
+// This file implements SPEC.md §7's trash can and the janitor that
+// expires its entries.
 //
 // Structural local-vs-remote enforcement: Put (the only thing that ever
 // writes into the trash) is called from exactly two places in this
@@ -37,11 +38,13 @@ import (
 // cannot reach Trash.Put even by mistake. See trash_test.go for a test
 // exercising both paths side by side.
 
+// --- the trash can: put, list, restore ---------------------------------
+
 // ErrRestoreDestExists is returned by Trash.Restore when the destination
 // relpath is already occupied by something on disk. Restore refuses to
-// clobber it silently; the caller must move/remove
-// the conflicting path (or, in a future UI, offer to write the restore
-// under a conflict-copy name) and retry.
+// clobber it silently; the caller must move/remove the conflicting path
+// (or, in a future UI, offer to write the restore under a conflict-copy
+// name) and retry.
 var ErrRestoreDestExists = errors.New("sync: trash: restore destination already exists")
 
 // trashSuffixRe recognizes the "<ts>" or "<ts>-<n>" suffix Trash.Put
@@ -427,6 +430,8 @@ func buildRestoredRow(ctx context.Context, store *index.Store, nodeID, shareID, 
 		UpdatedAt: time.Now(),
 	}, nil
 }
+
+// --- the janitor: purging expired entries ------------------------------
 
 // DefaultJanitorInterval is how often the janitor sweeps the trash for
 // expired entries in production (SPEC.md §7: "a daily janitor purges older

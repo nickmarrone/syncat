@@ -18,7 +18,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, toStatusResponse(s.node.Status()))
 }
 
-// --- node (PATCH /api/node, wired to the already-existing core.Node.RenameNode) ---
+// --- node (PATCH /api/node) -----------------------------------------------
 
 type patchNodeRequest struct {
 	Name *string `json:"name"`
@@ -454,7 +454,7 @@ func errInvalidf(format string, args ...any) error {
 	return fmt.Errorf(format, args...)
 }
 
-// This file is the JSON marshaling internal/core deliberately doesn't do
+// Below is the JSON marshaling internal/core deliberately doesn't do
 // itself (SPEC.md §12): one DTO type per core.Status subtype, snake_case
 // tags matching the wire-protocol field naming SPEC.md §4 already uses
 // (share_id, approval_required, ...), plus the conversion functions that
@@ -468,6 +468,8 @@ func errInvalidf(format string, args ...any) error {
 // pair as "<peer-key-hex>:<share-id>" for the {id} path segment. Both
 // halves are always plain hex, so splitting on the first ':' is
 // unambiguous.
+
+// --- DTOs: the JSON shapes every response goes through -----------------
 
 type statusResponse struct {
 	NodeName  string `json:"node_name"`

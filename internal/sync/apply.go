@@ -14,9 +14,9 @@ import (
 	"github.com/nickmarrone/syncat/internal/protocol"
 )
 
-// applyAction executes one reconciled Action against the filesystem, returning the
-// index.FileRow(s) that must now be persisted (empty/nil if nothing
-// changed — e.g. ActionNone, ActionLocallyModified, or a non-empty
+// applyAction executes one reconciled Action against the filesystem,
+// returning the index.FileRow(s) that must now be persisted (empty/nil
+// if nothing changed — e.g. ActionNone, ActionLocallyModified, or a non-empty
 // directory delete that was skipped). The caller (handleIndexUpdate)
 // persists the returned rows via Store.PutFile and, unless outbound is
 // blocked, reports them back to the peer.

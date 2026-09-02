@@ -17,6 +17,8 @@ import (
 	"github.com/tailscale/tailcat"
 )
 
+// --- the Ed25519 application identity key (SPEC.md §2) -----------------
+
 // IdentityKey is the node's Ed25519 application identity keypair (SPEC.md
 // §2), used to sign the syncat protocol handshake independent of whatever
 // the tailcat transport itself authenticates.
@@ -92,6 +94,8 @@ func saveIdentityKey(path string, key *IdentityKey) error {
 	return nil
 }
 
+// --- the tailcat transport key -----------------------------------------
+
 // LoadTailcatKey reads an existing tailcat saved key from path. It returns
 // an error wrapping os.ErrNotExist if the file doesn't exist.
 func LoadTailcatKey(path string) (*tailcat.PrivateKey, error) {
@@ -160,6 +164,8 @@ func LoadOrCreateTailcatKey(ctx context.Context, path string) (key *tailcat.Priv
 // TokenPrefix versions the syncat node token format (SPEC.md §2).
 const TokenPrefix = "sc1"
 
+// --- sc1 node tokens (SPEC.md §2) --------------------------------------
+
 // tokenPayload is the CBOR body of a node token. It's encoded as a CBOR map
 // (not an array) keyed by these short field names so that decoding ignores
 // unknown fields going forward (SPEC.md §11 forward-compat obligation).
@@ -226,6 +232,8 @@ func ParseToken(token string) (*NodeToken, error) {
 // 64 characters (SPEC.md §3).
 const apiTokenBytes = 32
 
+// --- the REST API token (SPEC.md §3) -----------------------------------
+
 // LoadOrCreateAPIToken loads the REST API auth token from path, generating
 // and persisting a new random 64-hex-character token (mode 0600) if none
 // exists. Regenerating is a no-op if a valid token is already present.
@@ -250,6 +258,8 @@ func LoadOrCreateAPIToken(path string) (string, error) {
 	}
 	return tok, nil
 }
+
+// --- share ids ---------------------------------------------------------
 
 // NewShareID returns a random 8-byte hex-encoded (16 character) share id,
 // generated at share creation and stable for the share's life (SPEC.md §3).

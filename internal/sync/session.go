@@ -31,6 +31,8 @@ const maxConcurrentPulls = 4
 // unboundedly with however many requests the peer happens to send at once.
 const maxConcurrentServes = 4
 
+// --- the session: one authenticated peer connection --------------------
+
 // ShareConfig is one share this Session keeps in sync with the peer at the
 // other end of its connection: the local directory it maps to, and the
 // Direction (SPEC.md §5) constraining which way changes may flow. Build
@@ -239,10 +241,11 @@ func (s *Session) SetFrameObserver(fn func(typ protocol.MsgType)) {
 }
 
 // Writer returns this Session's underlying protocol.Writer, so
-// internal/core's peer manager can send ShareList/SubscribeRequest/AccessUpdate/Ping
-// frames on the same connection Session writes IndexUpdate/FileRequest/
-// FileChunk/Error to. Writer is safe for concurrent use (see message.go), so
-// sharing it this way never risks torn or interleaved frames.
+// internal/core's peer manager can send ShareList / SubscribeRequest /
+// AccessUpdate / Ping frames on the same connection Session writes
+// IndexUpdate/FileRequest/FileChunk/Error to. Writer is safe for
+// concurrent use (see message.go), so sharing it this way never risks
+// torn or interleaved frames.
 func (s *Session) Writer() *protocol.Writer {
 	return s.writer
 }
@@ -525,6 +528,8 @@ func rowsToInfos(rows []index.FileRow) []protocol.FileInfo {
 	}
 	return out
 }
+
+// --- file transfer: pulling and serving bytes --------------------------
 
 // pullFile fetches wireRelPath's content (as shareID's holder — the peer
 // at the other end of this Session — currently has it under version) and

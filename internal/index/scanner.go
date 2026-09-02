@@ -15,6 +15,8 @@ import (
 	"github.com/nickmarrone/syncat/internal/protocol"
 )
 
+// --- the scanner: classifying a share tree against the index -----------
+
 // ScanResult is a Scanner.Scan diff against the index's current view of a
 // share, bucketed by the classification SPEC.md §5 asks for. Scanning
 // never mutates the index itself — see Scanner.Scan's doc comment for why
@@ -282,6 +284,8 @@ func (sc *Scanner) hashFile(relpath string) ([]byte, error) {
 	}
 	return h.Sum(nil), nil
 }
+
+// --- ignore matching (SPEC.md §5) --------------------------------------
 
 // Matcher decides whether a share-relative path should be excluded from
 // scanning, per SPEC.md §5's ignore-rules MVP subset. Full gitignore-style

@@ -319,13 +319,13 @@ func subscriptionPath(peer, shareID string) string {
 // SHARE PATH` (SPEC.md §7/§8).
 //
 // This used to operate directly on the on-disk trash and index,
-// independent of whether a daemon was running (the same way `syncat token`/`syncat init` work
-// offline against config and keys alone). Now that the REST API exists,
-// trash is rebuilt as a thin API client like every other syncat
-// subcommand (SPEC.md §1) rather than a second, divergent code path that
-// touches the SQLite index directly — which would also race a live
-// daemon's own index access if one happened to be running at the same
-// time. The user-visible change: `syncat trash` now requires the daemon
+// independent of whether a daemon was running (the same way `syncat
+// token`/`syncat init` work offline against config and keys alone). Now
+// that the REST API exists, trash is a thin API client like every other
+// syncat subcommand (SPEC.md §1) rather than a second, divergent code
+// path that touches the SQLite index directly — which would also race a
+// live daemon's own index access if one happened to be running at the
+// same time. The user-visible change: `syncat trash` now requires the daemon
 // to be running, same as `peer`/`share`/`status`/etc.
 func cmdTrash(paths *config.Paths, args []string) error {
 	if len(args) == 0 {
