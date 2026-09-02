@@ -119,6 +119,10 @@ C` through a node that was only ever supposed to be a spoke.
   *some* endpoint; syncat's own handshake (Ed25519 challenge/response over
   that pipe) is what proves it's the peer you actually added. An inbound
   connection from an unrecognized key is rejected and recorded, not trusted.
+  Note the limit: the signed transcript covers both nonces but not the tunnel
+  it travelled over, so it authenticates the peer without ruling out a relay
+  by someone who tampered with a token's `tc` field before you pasted it —
+  see item 2 of "Transport and protocol: planned work".
 - **The REST API is loopback-only**, and every request (including the web
   UI's own `fetch` calls) requires the `X-Syncat-Token` header, checked with a
   constant-time comparison. The bootstrap `/ui-token` endpoint that hands the
@@ -149,13 +153,23 @@ text, and why:
 - **`PATCH /api/node` was added.** SPEC.md §8's endpoint list omits it, but
   §9's dashboard requires an editable node name, and `core.Node` already
   exposed `RenameNode`. Wired up in `internal/api/server.go`/`handlers.go`.
-- **The in-memory test transport is not `net.Pipe`.** SPEC.md §10/§13 name
-  `net.Pipe` for the test transport, but the stdlib pipe is synchronous and
-  unbuffered: a write blocks until the other end reads. SPEC.md §4 has both
-  sides of the handshake send `Hello` before either reads, which deadlocks
-  on a bare `net.Pipe`. `transport.PipeTransport` is therefore backed by a
-  buffered in-memory `net.Conn` that behaves like a real socket's send
-  buffer (`internal/transport/pipe.go`).
+- **The test transport is loopback TCP, not `net.Pipe`.** SPEC.md §10/§13
+  name `net.Pipe` for the test transport, but the stdlib pipe is synchronous
+  and unbuffered: a write blocks until the other end reads. SPEC.md §4 has
+  both sides of the handshake send `Hello` before either reads, which
+  deadlocks on a bare `net.Pipe`. `transport.PipeTransport` keeps SPEC's
+  address-registry shape — peers still find each other by an address string,
+  standing in for a tailcat ConnBlob — but each transport listens on
+  `127.0.0.1:0` and connections are real sockets
+  (`internal/transport/pipe.go`). A hand-rolled buffered `net.Conn` was
+  tried first and is what the loopback listener replaced: it has to
+  re-implement all of `net.Conn`, and the parts it got wrong were invisible
+  — a deadline armed against an already-blocked `Read` did nothing (which is
+  exactly how `protocol.Handshake` cancels), and writes to a departed peer
+  never failed. Both are now pinned by tests
+  (`TestPipeTransportReadDeadlineInterruptsBlockedRead`,
+  `TestPipeTransportWriteFailsAfterPeerClose`,
+  `TestHandshakeAbortsOnContextCancel`).
 - **`syncat trash` now requires a running daemon.** SPEC.md's original phase
   plan had it operate directly on the on-disk trash/index, independent of a
   daemon (like `init`/`token`). Once the REST API existed, that would have
@@ -207,6 +221,77 @@ don't work:
 - **Mobile bindings (SPEC.md §12).** The core packages are already cgo-free
   and gomobile-shaped, but no gomobile build or mobile UI exists yet.
 
+## Transport and protocol: planned work
+
+A review of the networking layer turned up the following. The test transport
+has been dealt with (see "Deviations from SPEC.md" above, and the `n.token`
+race it exposed in `core.Open`); these are what's left, in the order they're
+worth doing.
+
+1. **The keepalive can wedge behind a blocked write.** This one is a bug, not
+   a cleanup. `Keepalive.Run` checks `Dead()` and then calls `onPing`, and
+   `onPing` (`internal/core/peer.go`) writes a `Ping` through the session's
+   shared `protocol.Writer` mutex. A `FileChunk` write that blocks — the peer
+   has stopped draining, the send window is full — holds that mutex, so the
+   ping blocks, `Run`'s loop never comes round again, and SPEC.md §4's 90s
+   dead rule, the one thing that would close the connection, is never
+   evaluated. Asymmetrically the peer's own dead timer rescues us; with both
+   directions stalled at once nothing does, and the connection stays wedged
+   until shutdown. No write deadline is set anywhere on a live session
+   connection either. Fix: evaluate `Dead()` before attempting the ping, and
+   move every write onto one writer goroutine fed by a bounded queue with a
+   priority slot for control frames, so a `Ping` never queues behind a 1 MiB
+   chunk.
+
+2. **Bind the handshake to the tunnel it runs over.** The Ed25519 handshake
+   is not defence in depth over tailcat's — it is the *only* peer
+   authentication we have. tailcat accepts any client holding the ConnBlob
+   ("until a key is allowed, all clients are allowed"), and `AddAllowedClient`
+   is unavailable to us because client keys must be ephemeral for DERP
+   routing (see `TailcatTransport.clientFor`). The signed transcript is
+   `"syncat-auth-v1" || their_nonce || our_nonce` and names neither endpoint's
+   tailcat identity, so an attacker who alters the `tc` field of a token in
+   transit — tokens are pasted over chat and email — can relay both
+   handshakes between two honest nodes over two separate tunnels and sit in
+   the middle of everything that follows. Fix: fold the dialed ConnBlob and
+   our own `Server.ConnBlob()` into `authTranscript`, length-prefixed. That
+   is a wire break, so it wants `proto_version: 2` or a transitional
+   signature v1 peers still accept.
+
+3. **Buffer the frame codec's I/O.** `Reader.ReadFrame` does two bare
+   `io.ReadFull` calls straight onto tailcat's userspace socket and allocates
+   a fresh body for every frame; `Writer.WriteFrame` copies the entire
+   payload into a new buffer before writing, which for a 1 MiB `FileChunk` is
+   a full extra copy and allocation per chunk. Fix: one `bufio.Reader` per
+   session, a reusable body buffer for chunk-sized frames, and
+   `net.Buffers{lenAndType, cborHeader, data}` written under the existing
+   writer mutex — the mutex is what guarantees frames aren't interleaved, so
+   a vectored write is just as safe as the single `Write` it replaces.
+
+4. **Delete both `Clock` interfaces in favour of `testing/synctest`.**
+   `transport.Clock`, `protocol.Clock`, `core`'s `asProtocolClock` /
+   `asSyncClock` adapters, `Supervisor`'s injected `*rand.Rand`, and
+   `handshake_test.go`'s `fakeClock` all exist for one reason: making timing
+   fakeable. `go.mod` is on go 1.27 and `testing/synctest` has been stable
+   since 1.25 — inside a bubble the real `time` package is already fake, so
+   all of that collapses and the tests drive the production path instead of a
+   parallel one built for them.
+
+5. **Reconsider the hand-rolled stream multiplexer** (v2, and the structural
+   answer if item 1's mitigations prove insufficient). `Session` demuxes
+   interleaved `FileChunk`s by `(share_id, relpath)` into per-transfer
+   channels, with a 4-pull semaphore and a documented deadlock hazard —
+   `IndexUpdate` handling has to run off the read loop or a pull deadlocks
+   against the very loop that would feed it. But tailcat hands us a whole
+   userspace TCP stack, and `DialTCPPort` is callable more than once: a
+   stream per transfer would bring per-transfer flow control, independent
+   backpressure, and no head-of-line blocking of control frames behind file
+   bytes, deleting the demux table and the semaphore along with them. It
+   costs a stream-open token on the control stream, so a fresh stream can be
+   bound to an already-authenticated peer, and it contradicts SPEC.md §4's
+   single-stream framing.
+
+
 ## Development
 
 ```console
@@ -237,7 +322,7 @@ Nine packages, 29 source files. Every package is small enough to list in full:
 |---|---|
 | `cmd/syncat/` | `main.go` (subcommand dispatch, stdlib `flag`, no cobra) · `client.go` (REST client + response shapes) · `cmd_node.go` (`init`/`token`/`daemon`/`status`/`config`) · `cmd_peer.go` (`peer`/`remote`/`approvals`) · `cmd_share.go` (`share`/`subscription`/`trash`) |
 | `internal/core/` | `node.go` (lifecycle, accept path, clock adapters) · `mutations.go` (the config-mutation API the REST layer calls, plus name/prefix reference resolution) · `peer.go` (per-peer dial/dedup/keepalive state machine) · `shares.go` (share dirs → scanner/watcher) · `status.go` (the read-only snapshot) — gomobile-safe, no UI/CLI deps |
-| `internal/transport/` | `transport.go` (`Transport` interface, backoff/supervisor, dedup tie-break) · `tailcat.go` (production carrier) · `pipe.go` (in-memory transport used by every package's tests) |
+| `internal/transport/` | `transport.go` (`Transport` interface, backoff/supervisor, dedup tie-break) · `tailcat.go` (production carrier) · `pipe.go` (loopback-TCP transport used by every package's tests) |
 | `internal/protocol/` | `message.go` (message types + frame codec) · `handshake.go` (mutual Ed25519 auth + keepalive) |
 | `internal/index/` | `store.go` (SQLite schema, `files`, `peer_files`) · `scanner.go` (tree walk, hashing, ignore matching) · `watcher.go` (`fsnotify` + debounce + periodic rescan) |
 | `internal/sync/` | `reconcile.go` (version vectors, actions, conflict naming, the reconciler — all pure, no I/O) · `session.go` (one peer connection: index exchange, pulls, serving) · `apply.go` (writing results to disk) · `path.go` (the single validation gate for peer-supplied relpaths) · `trash.go` (trash can + janitor) |

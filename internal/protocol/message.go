@@ -4,8 +4,8 @@
 // idle/dead-connection timing logic (handshake.go).
 //
 // This package has no filesystem, UI, or HTTP dependencies (SPEC.md §12:
-// it must stay gomobile-safe) and is testable entirely over in-memory
-// connections; see internal/transport's PipeTransport for the in-memory
+// it must stay gomobile-safe) and is testable entirely over a bare
+// net.Conn; see internal/transport's PipeTransport for the loopback
 // Transport used by this package's own tests.
 package protocol
 

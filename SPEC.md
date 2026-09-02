@@ -298,7 +298,7 @@ sections with `// --- name ---` markers — `grep '^// --- ' <file>` gives a tab
 contents. See the README's project-layout table for the file-level map.
 
 `internal/transport` defines a `Transport` interface (Dial/Accept returning
-`net.Conn`s) with the tailcat implementation behind it — tests use an in-memory
+`net.Conn`s) with the tailcat implementation behind it — tests use a loopback-TCP
 implementation, and the future mobile apps reuse everything above the interface.
 
 Dependency budget: tailcat, modernc.org/sqlite, fsnotify, fxamacker/cbor, a
@@ -361,7 +361,7 @@ function they mean.)
 - `go test ./...` — unit tests: version-vector algebra, ignore matching, frame
   codec (incl. `FuzzDecode`), handshake and keepalive, scanner/watcher on temp dirs,
   trash and its janitor, config schema and overlap rules, REST handlers.
-- Integration tests over the in-memory transport (`internal/sync/integration_test.go`):
+- Integration tests over the loopback test transport (`internal/sync/integration_test.go`):
   bidirectional sync over a nested tree, one-way read-only shares, receive-only revert
   via trash, conflict copy creation, delete-vs-modify resurrect, hostile relpath
   rejection, sha256 mismatch leaving the destination untouched, the concurrent-pull

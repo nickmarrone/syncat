@@ -260,7 +260,17 @@ func Open(ctx context.Context, opts Options) (*Node, error) {
 		cancel()
 		return nil, fmt.Errorf("core: open: %w", err)
 	}
+	// Under tokenMu, not because anything else has started yet in Open,
+	// but because Transport.Start above is already accepting: an inbound
+	// connection landing in this window runs handleAccept, which reads
+	// this field via localToken. (Such a connection sees an empty token
+	// and is rejected by the peer's Hello validation; the peer's backoff
+	// redials into a fully-initialised node. The token can't be built any
+	// earlier — it embeds Transport.LocalAddress, which is only valid
+	// once Start has returned.)
+	n.tokenMu.Lock()
 	n.token = tok
+	n.tokenMu.Unlock()
 
 	for _, s := range cfg.Shares {
 		if _, err := n.startShareWatch(s.ID, s.Path); err != nil {

@@ -22,11 +22,9 @@ import (
 var pipeAddrCounter int64
 
 // newPipeConnPair returns two connected net.Conns, as if a dialed b, over
-// internal/transport's in-memory PipeTransport (backed by pipe.go's
-// buffered pipe — not a bare net.Pipe, which would deadlock on the
-// handshake's "both sides send Hello immediately" requirement, and which
-// doesn't support deadlines the way [TestHandshakeTimesOutOnSilence]
-// needs).
+// internal/transport's PipeTransport (a pair of loopback sockets — not a
+// bare net.Pipe, which would deadlock on the handshake's "both sides send
+// Hello immediately" requirement).
 func newPipeConnPair(t *testing.T) (a, b net.Conn) {
 	t.Helper()
 	ctx := context.Background()
@@ -587,6 +585,56 @@ func TestHandshakeTimesOutOnSilence(t *testing.T) {
 	}
 }
 
+// TestHandshakeAbortsOnContextCancel: cancelling the context aborts a
+// handshake that is already blocked reading, even though cfg.Timeout is
+// nowhere near expiring. Handshake implements this by pulling conn's
+// deadline in to "now" from a watcher goroutine, which only works if the
+// connection honours a deadline armed against a Read that has already
+// started.
+//
+// It could not be written before the pipe transport was backed by a real
+// socket: the buffered in-memory conn it used to use evaluated its read
+// deadline once, at the top of Read, so this cancellation never did
+// anything and the test would simply hang.
+func TestHandshakeAbortsOnContextCancel(t *testing.T) {
+	connA, connB := newPipeConnPair(t)
+	defer connA.Close()
+	defer connB.Close()
+
+	privA, pubA := newTestIdentity(t)
+	tokA := mustToken(t, pubA, "alice")
+	cfgA := HandshakeConfig{
+		IdentityKey: privA, NodeName: "alice", Token: tokA,
+		IsKnownPeer: acceptAll,
+		// Far enough out that only the context can end this handshake.
+		Timeout: time.Hour,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := Handshake(ctx, connA, cfgA)
+		done <- err
+	}()
+
+	// Drain A's Hello but never reply, so A is definitely parked in its
+	// read of ours before the cancel lands.
+	if _, _, err := NewReader(connB).ReadFrame(); err != nil {
+		t.Fatalf("read A's hello: %v", err)
+	}
+
+	cancel()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("Handshake succeeded against a peer that never replied")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Handshake did not return after its context was canceled; the ctx watcher's SetDeadline is not interrupting the blocked read")
+	}
+}
+
 // TestHandshakeRejectsOwnMismatchedToken checks the purely local
 // validation: a HandshakeConfig whose Token doesn't match its own
 // IdentityKey is rejected before anything is even written to the
@@ -645,10 +693,9 @@ func (c *deadlineRecorder) state() (current time.Time, sawArmed bool) {
 // peer was torn down by SPEC.md §4's 90s dead rule and redialed — forever,
 // at a steady ~90s period.
 //
-// Nothing caught it because bufConn's Write deadline is a no-op and its
-// read deadline is only consulted against real wall-clock time, which no
-// in-memory test runs long enough to reach. Hence asserting on the
-// deadline directly rather than on downstream I/O.
+// Nothing caught it because the deadline is 30s out by default and no test
+// runs long enough to reach it. Hence asserting on the deadline directly
+// rather than on downstream I/O.
 func TestHandshakeClearsDeadlineOnSuccess(t *testing.T) {
 	rawA, rawB := newPipeConnPair(t)
 	defer rawA.Close()
@@ -705,9 +752,9 @@ type fakeClock struct {
 	mu      sync.Mutex
 	now     time.Time
 	waiters []fakeWaiter
-	// notify is closed and replaced (the same channel-swap idiom used by
-	// transport's bufConn) every time a new waiter registers, so
-	// waitForWaiters can block on it instead of polling/sleeping.
+	// notify is closed and replaced (the standard channel-swap broadcast
+	// idiom) every time a new waiter registers, so waitForWaiters can
+	// block on it instead of polling/sleeping.
 	notify chan struct{}
 }
 

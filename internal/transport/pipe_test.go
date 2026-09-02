@@ -2,10 +2,13 @@ package transport
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -207,3 +210,111 @@ func TestPipeTransportLocalAddressBeforeStartFails(t *testing.T) {
 		t.Fatal("LocalAddress before Start succeeded, want error")
 	}
 }
+
+// --- net.Conn contract: what a real socket gives us for free -----------
+
+// TestPipeTransportReadDeadlineInterruptsBlockedRead pins the property
+// internal/protocol's Handshake depends on: a deadline set on a Read that
+// is *already* blocked interrupts it.
+//
+// This is a regression test for the pipe transport itself. The hand-rolled
+// buffered net.Conn this transport used to be evaluated its read deadline
+// once, at the top of Read, so a SetDeadline arriving afterwards could not
+// unblock anything — and Handshake's ctx watcher does precisely that, on a
+// connection another goroutine is already blocked reading. Nothing failed;
+// the cancellation path simply never worked over the test transport, and
+// no test could tell.
+func TestPipeTransportReadDeadlineInterruptsBlockedRead(t *testing.T) {
+	conn, peer := dialedPair(t)
+	defer conn.Close()
+	defer peer.Close()
+
+	readErr := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 1)
+		_, err := conn.Read(buf) // the peer never writes; this blocks
+		readErr <- err
+	}()
+
+	// Give the Read time to actually block before arming the deadline —
+	// the point of the test is the deadline landing on an in-flight Read,
+	// not on one that hasn't started.
+	time.Sleep(50 * time.Millisecond)
+	if err := conn.SetReadDeadline(time.Now()); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+
+	select {
+	case err := <-readErr:
+		if !errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("blocked Read returned %v, want os.ErrDeadlineExceeded", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("SetReadDeadline did not interrupt a Read that was already blocked")
+	}
+}
+
+// TestPipeTransportWriteFailsAfterPeerClose pins the other half of the
+// contract: writing to a peer that has gone away eventually fails, so the
+// error paths above this package are reachable from a test at all. The
+// previous in-memory pipe queued such writes forever and reported success.
+func TestPipeTransportWriteFailsAfterPeerClose(t *testing.T) {
+	conn, peer := dialedPair(t)
+	defer conn.Close()
+
+	if err := peer.Close(); err != nil {
+		t.Fatalf("peer Close: %v", err)
+	}
+
+	// The first write after the peer's close usually succeeds — it lands
+	// in the send buffer before the RST arrives — so keep writing until
+	// one fails. A write deadline keeps a wedged socket from hanging the
+	// test instead of failing it.
+	payload := make([]byte, 1024)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := conn.SetWriteDeadline(time.Now().Add(time.Second)); err != nil {
+			t.Fatalf("SetWriteDeadline: %v", err)
+		}
+		if _, err := conn.Write(payload); err != nil {
+			return // expected: EPIPE/ECONNRESET, or the deadline
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("writes to a closed peer kept succeeding; a broken connection must eventually report itself")
+}
+
+// dialedPair returns the two ends of one connection between a pair of
+// PipeTransports, as if `dialed` opened it and `accepted` received it.
+func dialedPair(t *testing.T) (dialed, accepted net.Conn) {
+	t.Helper()
+	ctx := context.Background()
+	n := atomic.AddInt64(&pairCounter, 1)
+
+	serverAddr := fmt.Sprintf("pipe-pair-server-%d", n)
+	server := NewPipeTransport(serverAddr)
+	inbound := make(chan net.Conn, 1)
+	if err := server.Start(ctx, func(c net.Conn) { inbound <- c }); err != nil {
+		t.Fatalf("server Start: %v", err)
+	}
+	t.Cleanup(func() { server.Close() })
+
+	client := NewPipeTransport(fmt.Sprintf("pipe-pair-client-%d", n))
+	if err := client.Start(ctx, func(net.Conn) {}); err != nil {
+		t.Fatalf("client Start: %v", err)
+	}
+	t.Cleanup(func() { client.Close() })
+
+	dialed, err := client.Dial(ctx, serverAddr)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	select {
+	case accepted = <-inbound:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the accept")
+	}
+	return dialed, accepted
+}
+
+var pairCounter int64

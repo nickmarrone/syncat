@@ -35,7 +35,7 @@ func newPipeAddr(t *testing.T) string {
 }
 
 // newTestNode builds and opens a fully running Node over a fresh
-// PipeTransport (SPEC.md §10's in-memory stand-in for tailcat), with its
+// PipeTransport (SPEC.md §10's loopback stand-in for tailcat), with its
 // own temp config/data dirs and identity, closed automatically via
 // t.Cleanup. Backoff jitter is disabled so timing-sensitive tests (see
 // TestBackoffRetryAndRecover) are deterministic.

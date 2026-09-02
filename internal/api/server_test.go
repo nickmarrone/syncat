@@ -27,7 +27,7 @@ const testSelfAddr = "127.0.0.1:8347"
 var testCounter int
 
 // newTestServer builds a Server over a freshly opened core.Node (PipeTransport,
-// temp config/data dirs — SPEC.md §10's in-memory transport stand-in),
+// temp config/data dirs — SPEC.md §10's loopback transport stand-in),
 // closed automatically via t.Cleanup.
 func newTestServer(t *testing.T) (*Server, *core.Node, *config.Paths) {
 	t.Helper()
