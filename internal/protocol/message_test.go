@@ -298,6 +298,29 @@ func TestFrameZeroLengthPayload(t *testing.T) {
 	}
 }
 
+// A broken io.Writer may accept fewer bytes than it was given without the
+// required error. A frame writer must still report io.ErrShortWrite rather
+// than claim it emitted a complete frame.
+func TestFrameWriterRejectsSilentShortWrite(t *testing.T) {
+	var dst bytes.Buffer
+	w := &shortWriter{w: &dst, max: 3}
+	if err := NewWriter(w).WriteFrame(MsgPing, []byte("payload")); !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("WriteFrame error = %v, want io.ErrShortWrite", err)
+	}
+}
+
+type shortWriter struct {
+	w   io.Writer
+	max int
+}
+
+func (w *shortWriter) Write(p []byte) (int, error) {
+	if len(p) > w.max {
+		p = p[:w.max]
+	}
+	return w.w.Write(p)
+}
+
 func TestFrameTruncatedHeader(t *testing.T) {
 	// Only 2 of the 4 length-header bytes.
 	r := NewReader(bytes.NewReader([]byte{0x00, 0x01}))

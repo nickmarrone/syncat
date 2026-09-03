@@ -2,6 +2,7 @@ package sync
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -30,6 +31,24 @@ const maxConcurrentPulls = 4
 // descriptors, goroutines) bounded symmetrically instead of growing
 // unboundedly with however many requests the peer happens to send at once.
 const maxConcurrentServes = 4
+
+// pullStallTimeout bounds how long one in-flight pull will wait for the
+// next FileChunk before giving up.
+//
+// SPEC.md §4/§5 promise that a peer which no longer has a requested file,
+// or whose version has moved on, answers with an Error rather than
+// silence — but that is a promise about a *well-behaved* peer, and
+// pullFile is what pays for it being broken. Without this, a FileRequest
+// answered with neither a chunk nor an Error parks its caller until the
+// whole session is torn down, holding one of the maxConcurrentPulls slots
+// the entire time. Four such requests wedge every transfer with that peer
+// while the connection still looks perfectly healthy: pings, index
+// updates and share lists keep flowing, so nothing ever declares it dead.
+//
+// The timer is reset by every chunk received, so it bounds the gap
+// between chunks rather than the transfer as a whole — a legitimately
+// slow but progressing transfer of any size is unaffected.
+const pullStallTimeout = 60 * time.Second
 
 // --- the session: one authenticated peer connection --------------------
 
@@ -91,7 +110,7 @@ type pullEntry struct {
 type Session struct {
 	conn   net.Conn
 	reader *protocol.Reader
-	writer *protocol.Writer
+	writer *protocol.StreamWriter
 
 	store  *index.Store
 	nodeID string // this node's ShortID
@@ -158,10 +177,22 @@ type Session struct {
 	// unexported and never set outside this package's own tests.
 	testServeDelay time.Duration
 
+	// testPullStallTimeout, if non-zero, replaces pullStallTimeout. Same
+	// deal as testServeDelay: a test can't wait a real minute to watch a
+	// silent peer time out.
+	testPullStallTimeout time.Duration
+
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
+	// done is closed when the read loop exits, i.e. the moment this session
+	// stops being usable — a peer that closed the connection, a broken
+	// socket, a frame we couldn't read. See [Session.Done]: the owner
+	// (internal/core's peer manager) watches it so a disconnect is acted on
+	// when it happens rather than when the keepalive's dead timer next
+	// notices.
+	done      chan struct{}
 	closeOnce sync.Once
 }
 
@@ -181,7 +212,7 @@ func NewSession(conn net.Conn, store *index.Store, nodeID, peerID string, clock 
 	return &Session{
 		conn:     conn,
 		reader:   protocol.NewReader(conn),
-		writer:   protocol.NewWriter(conn),
+		writer:   protocol.NewStreamWriter(conn, 0),
 		store:    store,
 		nodeID:   nodeID,
 		peerID:   peerID,
@@ -191,6 +222,7 @@ func NewSession(conn net.Conn, store *index.Store, nodeID, peerID string, clock 
 		pullSem:  make(chan struct{}, maxConcurrentPulls),
 		pullTbl:  make(map[transferKey]*pullEntry),
 		serveSem: make(chan struct{}, maxConcurrentServes),
+		done:     make(chan struct{}),
 	}
 }
 
@@ -240,13 +272,15 @@ func (s *Session) SetFrameObserver(fn func(typ protocol.MsgType)) {
 	s.ctrlMu.Unlock()
 }
 
-// Writer returns this Session's underlying protocol.Writer, so
-// internal/core's peer manager can send ShareList / SubscribeRequest /
-// AccessUpdate / Ping frames on the same connection Session writes
-// IndexUpdate/FileRequest/FileChunk/Error to. Writer is safe for
-// concurrent use (see message.go), so sharing it this way never risks
-// torn or interleaved frames.
-func (s *Session) Writer() *protocol.Writer {
+// Writer returns this Session's protocol.StreamWriter, so internal/core's
+// peer manager can send ShareList / SubscribeRequest / AccessUpdate / Ping
+// frames on the same connection Session writes
+// IndexUpdate/FileRequest/FileChunk/Error to. It is safe for concurrent
+// use, never tears or interleaves frames, and — because all of those are
+// control frames, which it drains ahead of file bytes — never makes its
+// caller wait behind a transfer. That last property is what lets the read
+// loop reply to a Ping inline (see SetControlHandler).
+func (s *Session) Writer() *protocol.StreamWriter {
 	return s.writer
 }
 
@@ -277,25 +311,50 @@ func (s *Session) getShare(shareID string) (ShareConfig, bool) {
 	return *cfg, true
 }
 
-// Start begins the session's read loop in a background goroutine and
-// returns immediately. ctx bounds the session's lifetime in addition to
-// Close: canceling ctx (or calling Close) stops all background work.
+// Start begins the session's read loop and its writer in background
+// goroutines and returns immediately. ctx bounds the session's lifetime in
+// addition to Close: canceling ctx (or calling Close) stops all background
+// work.
+//
+// Writes before Start fail with protocol.ErrWriterNotStarted — the writer
+// is started here rather than in NewSession so that a Session constructed
+// for something other than driving a connection (see internal/sync's own
+// tests, which build one over a nil conn purely to reach its trash
+// helpers) never starts a goroutine.
 func (s *Session) Start(ctx context.Context) {
 	s.ctx, s.cancel = context.WithCancel(ctx)
+	s.writer.Start()
 	s.wg.Add(1)
 	go s.readLoop()
 }
 
+// Done returns a channel closed when the session's read loop has exited:
+// the peer closed the connection, the socket broke, or Close was called.
+// It is the session's own "this connection is finished" signal, and the
+// owner is expected to watch it — nothing else in the session reacts to a
+// disconnect, so a caller that instead waits for protocol.Keepalive's dead
+// timer to notice pays SPEC.md §4's full 90s before it reconnects, even
+// when the peer said goodbye cleanly and immediately.
+//
+// The channel is never closed for a Session that was never started.
+func (s *Session) Done() <-chan struct{} {
+	return s.done
+}
+
 // Close stops the session: it cancels the internal context, closes the
 // underlying connection (unblocking any pending Read in the read loop),
-// and waits for every goroutine Session started to exit. Safe to call
-// more than once.
+// stops the writer, and waits for every goroutine Session started to
+// exit. Safe to call more than once.
 func (s *Session) Close() error {
 	s.closeOnce.Do(func() {
 		if s.cancel != nil {
 			s.cancel()
 		}
+		// Before the writer: closing the connection is what unblocks a
+		// write already in progress, and StreamWriter.Close waits for its
+		// goroutine to return.
 		_ = s.conn.Close()
+		_ = s.writer.Close()
 	})
 	s.wg.Wait()
 	return nil
@@ -346,8 +405,19 @@ func (s *Session) sendIndexUpdate(shareID string, rows []index.FileRow, full boo
 // so the read loop is never the thing a background operation is waiting
 // on — that would deadlock a pull against the loop that delivers its
 // chunks.
+//
+// The one thing dispatched inline is the control handler, which writes
+// (a Pong, in reply to a Ping). That is only safe because every frame it
+// writes takes protocol.StreamWriter's priority lane, so it cannot queue
+// behind a FileChunk: an inline write that could block on the network
+// would stop this loop draining the socket, which is precisely what makes
+// the peer's own writes stall, and two peers in that state deadlock.
+//
+// On exit — for any reason, including a clean io.EOF — it closes s.done,
+// which is how the owner learns the connection is over ([Session.Done]).
 func (s *Session) readLoop() {
 	defer s.wg.Done()
+	defer close(s.done)
 	for {
 		typ, payload, err := s.reader.ReadFrame()
 		if err != nil {
@@ -587,6 +657,17 @@ func (s *Session) pullFile(ctx context.Context, shareID, wireRelPath string, ver
 		return 0, fmt.Errorf("sync: pull %s/%s: send file request: %w", shareID, wireRelPath, err)
 	}
 
+	// Real time, not s.clock: syncsvc.Clock is a bare func() time.Time with
+	// no timer, and this bounds a network wait rather than anything a test
+	// drives. Every test transfer answers immediately, so nothing waits on
+	// it (see pullStallTimeout).
+	stallAfter := pullStallTimeout
+	if s.testPullStallTimeout > 0 {
+		stallAfter = s.testPullStallTimeout
+	}
+	stall := time.NewTimer(stallAfter)
+	defer stall.Stop()
+
 	var total int64
 	for {
 		select {
@@ -607,11 +688,32 @@ func (s *Session) pullFile(ctx context.Context, shareID, wireRelPath string, ver
 			if c.eof {
 				return total, nil
 			}
+			if !stall.Stop() {
+				// Already fired and its value is sitting in the channel;
+				// drain it so the reset below starts from empty.
+				select {
+				case <-stall.C:
+				default:
+				}
+			}
+			stall.Reset(stallAfter)
+		case <-stall.C:
+			return total, fmt.Errorf("sync: pull %s/%s: %w", shareID, wireRelPath, ErrTransferStalled)
 		case <-ctx.Done():
 			return total, ctx.Err()
 		}
 	}
 }
+
+// ErrTransferStalled is returned by a pull that went pullStallTimeout with
+// no chunk and no Error from the peer — a peer that answered a
+// FileRequest with silence. Wrapped, so callers can check it with
+// errors.Is.
+//
+// The message names no duration on purpose: this is a package-level value,
+// so it can't reflect testPullStallTimeout, and stating a timeout the pull
+// didn't actually wait would be worse than stating none.
+var ErrTransferStalled = errors.New("peer sent neither a chunk nor an error before the pull stall timeout")
 
 // handleFileRequest serves one incoming FileRequest from our own share
 // content, respecting maxConcurrentServes. A file we no longer have, or

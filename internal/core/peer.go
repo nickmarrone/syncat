@@ -251,10 +251,12 @@ func (pc *peerConn) dialAttempt(ctx context.Context) error {
 // transport.KeepConnection's outcome depends only on the two keys and
 // dialed, so this never needs to coordinate with a concurrent offer for
 // the same peer: at most one of {our dial, their dial} can ever compute
-// keep=true for a given key pair, so the defensive "already have a
-// session" check below is a correctness backstop (e.g. a stray duplicate
-// connection attempt), not something expected to fire in normal
-// operation.
+// keep=true for a given key pair, whichever order the dial and accept
+// complete in.
+//
+// That does not make the "already have a session" check below dead code.
+// It is where a winning connection lands when this side is still holding
+// a stale session for the same peer — see the comment at that branch.
 func (pc *peerConn) offer(ctx context.Context, conn net.Conn, result *protocol.HandshakeResult, dialed bool) (bool, error) {
 	keep := transport.KeepConnection(pc.node.identity.Public(), result.PeerPub, dialed)
 	if !keep {
@@ -269,6 +271,17 @@ func (pc *peerConn) offer(ctx context.Context, conn net.Conn, result *protocol.H
 	if pc.session != nil {
 		pc.mu.Unlock()
 		conn.Close()
+		// Same inference as the !keep branch above, and for a case that is
+		// anything but hypothetical. When the *higher*-keyed peer restarts,
+		// its fresh dial wins the rule on both ends, so on this (lower-keyed)
+		// side it sails past !keep and lands right here — where, if we are
+		// still holding a session from before its restart, we would silently
+		// drop the winning connection and then wait out the dead timer for a
+		// connection whose peer no longer exists. The peer, having adopted
+		// its own side, sees our close and waits out its timer too.
+		if !dialed {
+			pc.notePeerRedialed()
+		}
 		return false, nil
 	}
 
@@ -303,16 +316,42 @@ func (pc *peerConn) offer(ctx context.Context, conn net.Conn, result *protocol.H
 	node.requestSubscriptions(sess, pc.peerKeyHex)
 
 	node.goTracked(func() {
-		ka.Run(sessCtx, 0, func() {
-			if err := sess.Writer().WriteMessage(protocol.MsgPing, protocol.Ping{}); err != nil {
-				node.logger.Printf("core: peer %s: send ping: %v", pc.name, err)
-				return
-			}
-			ka.RecordSent()
-		}, func() {
-			conn.Close() // dead per SPEC.md §4's 90s rule; unblocks the session's read loop
-		})
+		// The keepalive runs alongside the wait below rather than being the
+		// wait itself. Its dead timer is the *backstop* for noticing this
+		// connection has ended, not the mechanism: a peer that closes
+		// cleanly, or a socket that breaks under a write, ends the session's
+		// read loop immediately, and waiting out SPEC.md §4's 90s instead
+		// (at the poll granularity, up to 120s) is 90s of a node reporting
+		// itself connected to something that is gone, and 90s before
+		// dialAttempt is released to redial. The check interval comes from
+		// protocol.DefaultKeepaliveCheckInterval.
+		kaDone := make(chan struct{})
+		go func() {
+			defer close(kaDone)
+			ka.Run(sessCtx, 0, func() {
+				if err := sess.Writer().WriteMessage(protocol.MsgPing, protocol.Ping{}); err != nil {
+					// Not a transient condition to log and retry in 30s: a
+					// ping is one small frame on the writer's priority lane,
+					// so a failure to even queue it means the connection is
+					// finished. Close it and let the read loop's EOF unwind
+					// the session, the same way a peer disconnecting does.
+					node.logger.Printf("core: peer %s: send ping, dropping connection: %v", pc.name, err)
+					conn.Close()
+					return
+				}
+				ka.RecordSent()
+			}, func() {
+				conn.Close() // dead per SPEC.md §4's 90s rule; unblocks the session's read loop
+			})
+		}()
+
+		select {
+		case <-sess.Done(): // the read loop ended: peer closed, or the link broke
+		case <-kaDone: // the dead rule fired, or the session context was cancelled
+		}
+
 		cancel()
+		<-kaDone // cancel() above is what unblocks ka.Run
 		sess.Close()
 		conn.Close()
 

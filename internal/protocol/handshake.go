@@ -422,6 +422,16 @@ func sendError(fw *Writer, code, msg string) {
 const (
 	DefaultPingInterval = 30 * time.Second
 	DefaultDeadAfter    = 90 * time.Second
+
+	// DefaultKeepaliveCheckInterval is how often [Keepalive.Run] evaluates
+	// NeedsPing and Dead. It is much shorter than DefaultPingInterval on
+	// purpose: the poll interval is the granularity of both decisions, so
+	// checking only once per ping interval meant SPEC.md §4's 90s dead rule
+	// actually fired somewhere between 90s and 120s. Ping timing is
+	// unaffected — NeedsPing is a comparison against lastSent, not a
+	// countdown, so a faster poll finds the same instant, just sooner after
+	// it passes.
+	DefaultKeepaliveCheckInterval = 5 * time.Second
 )
 
 // --- keepalive: Ping/Pong idle and dead-connection timing --------------
@@ -525,19 +535,22 @@ func (k *Keepalive) Dead() bool {
 	return !k.clock.Now().Before(k.lastRecv.Add(k.deadAfter))
 }
 
-// Run polls NeedsPing and Dead every checkInterval (pingInterval passed to
-// [NewKeepalive] if checkInterval <= 0) until ctx is done, calling onPing
-// each time a ping becomes due and onDead (once) the moment the
-// connection is judged dead, at which point Run returns — the caller is
-// expected to tear down and reconnect (SPEC.md §4), not keep polling a
+// Run polls NeedsPing and Dead every checkInterval
+// (DefaultKeepaliveCheckInterval if checkInterval <= 0) until ctx is done,
+// calling onPing each time a ping becomes due and onDead (once) the moment
+// the connection is judged dead, at which point Run returns — the caller
+// is expected to tear down and reconnect (SPEC.md §4), not keep polling a
 // connection already declared dead. onPing and onDead may be nil.
 //
 // Run does no I/O itself: onPing is expected to actually send a Ping
 // frame and then call RecordSent, and onDead to close the connection (and
 // whatever else internal/core's reconnect policy requires).
+//
+// Dead is evaluated before NeedsPing, so a connection that has gone quiet
+// is torn down rather than pinged one last time.
 func (k *Keepalive) Run(ctx context.Context, checkInterval time.Duration, onPing, onDead func()) {
 	if checkInterval <= 0 {
-		checkInterval = k.pingInterval
+		checkInterval = DefaultKeepaliveCheckInterval
 	}
 	for {
 		select {

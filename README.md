@@ -221,27 +221,20 @@ don't work:
 - **Mobile bindings (SPEC.md §12).** The core packages are already cgo-free
   and gomobile-shaped, but no gomobile build or mobile UI exists yet.
 
-## Transport and protocol: planned work
+## Transport and protocol
 
 A review of the networking layer turned up the following. The test transport
 has been dealt with (see "Deviations from SPEC.md" above, and the `n.token`
-race it exposed in `core.Open`); these are what's left, in the order they're
-worth doing.
+race it exposed in `core.Open`). The remaining work follows the completed
+item, in the order it is worth doing.
 
-1. **The keepalive can wedge behind a blocked write.** This one is a bug, not
-   a cleanup. `Keepalive.Run` checks `Dead()` and then calls `onPing`, and
-   `onPing` (`internal/core/peer.go`) writes a `Ping` through the session's
-   shared `protocol.Writer` mutex. A `FileChunk` write that blocks — the peer
-   has stopped draining, the send window is full — holds that mutex, so the
-   ping blocks, `Run`'s loop never comes round again, and SPEC.md §4's 90s
-   dead rule, the one thing that would close the connection, is never
-   evaluated. Asymmetrically the peer's own dead timer rescues us; with both
-   directions stalled at once nothing does, and the connection stays wedged
-   until shutdown. No write deadline is set anywhere on a live session
-   connection either. Fix: evaluate `Dead()` before attempting the ping, and
-   move every write onto one writer goroutine fed by a bounded queue with a
-   priority slot for control frames, so a `Ping` never queues behind a 1 MiB
-   chunk.
+1. **Completed: keepalives no longer wedge behind blocked writes.** Session
+   writes now go through one bounded, two-lane `protocol.StreamWriter` with
+   control-frame priority and a per-frame write deadline. `Keepalive.Run`
+   checks `Dead()` before attempting a ping, and the peer manager watches the
+   session read loop directly so EOF triggers reconnect immediately instead
+   of waiting for the dead timer. Silent file pulls also time out without
+   occupying one of the four pull slots forever.
 
 2. **Bind the handshake to the tunnel it runs over.** The Ed25519 handshake
    is not defence in depth over tailcat's — it is the *only* peer
@@ -316,14 +309,14 @@ daemons on any exit path and dumps the relevant daemon log tail on failure.
 
 ## Project layout
 
-Nine packages, 29 source files. Every package is small enough to list in full:
+Nine packages, 30 source files. Every package is small enough to list in full:
 
 | Package | Files |
 |---|---|
 | `cmd/syncat/` | `main.go` (subcommand dispatch, stdlib `flag`, no cobra) · `client.go` (REST client + response shapes) · `cmd_node.go` (`init`/`token`/`daemon`/`status`/`config`) · `cmd_peer.go` (`peer`/`remote`/`approvals`) · `cmd_share.go` (`share`/`subscription`/`trash`) |
 | `internal/core/` | `node.go` (lifecycle, accept path, clock adapters) · `mutations.go` (the config-mutation API the REST layer calls, plus name/prefix reference resolution) · `peer.go` (per-peer dial/dedup/keepalive state machine) · `shares.go` (share dirs → scanner/watcher) · `status.go` (the read-only snapshot) — gomobile-safe, no UI/CLI deps |
 | `internal/transport/` | `transport.go` (`Transport` interface, backoff/supervisor, dedup tie-break) · `tailcat.go` (production carrier) · `pipe.go` (loopback-TCP transport used by every package's tests) |
-| `internal/protocol/` | `message.go` (message types + frame codec) · `handshake.go` (mutual Ed25519 auth + keepalive) |
+| `internal/protocol/` | `message.go` (message types + frame codec) · `stream.go` (bounded, prioritized session writer) · `handshake.go` (mutual Ed25519 auth + keepalive) |
 | `internal/index/` | `store.go` (SQLite schema, `files`, `peer_files`) · `scanner.go` (tree walk, hashing, ignore matching) · `watcher.go` (`fsnotify` + debounce + periodic rescan) |
 | `internal/sync/` | `reconcile.go` (version vectors, actions, conflict naming, the reconciler — all pure, no I/O) · `session.go` (one peer connection: index exchange, pulls, serving) · `apply.go` (writing results to disk) · `path.go` (the single validation gate for peer-supplied relpaths) · `trash.go` (trash can + janitor) |
 | `internal/config/` | `config.go` (schema, JSON encoding, load/save, re-share guard, atomic writes) · `keys.go` (identity key, tailcat key, `sc1` tokens, API token, share ids) · `paths.go` (XDG layout) |
