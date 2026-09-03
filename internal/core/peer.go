@@ -251,10 +251,12 @@ func (pc *peerConn) dialAttempt(ctx context.Context) error {
 // transport.KeepConnection's outcome depends only on the two keys and
 // dialed, so this never needs to coordinate with a concurrent offer for
 // the same peer: at most one of {our dial, their dial} can ever compute
-// keep=true for a given key pair, so the defensive "already have a
-// session" check below is a correctness backstop (e.g. a stray duplicate
-// connection attempt), not something expected to fire in normal
-// operation.
+// keep=true for a given key pair, whichever order the dial and accept
+// complete in.
+//
+// That does not make the "already have a session" check below dead code.
+// It is where a winning connection lands when this side is still holding
+// a stale session for the same peer — see the comment at that branch.
 func (pc *peerConn) offer(ctx context.Context, conn net.Conn, result *protocol.HandshakeResult, dialed bool) (bool, error) {
 	keep := transport.KeepConnection(pc.node.identity.Public(), result.PeerPub, dialed)
 	if !keep {
@@ -269,6 +271,17 @@ func (pc *peerConn) offer(ctx context.Context, conn net.Conn, result *protocol.H
 	if pc.session != nil {
 		pc.mu.Unlock()
 		conn.Close()
+		// Same inference as the !keep branch above, and for a case that is
+		// anything but hypothetical. When the *higher*-keyed peer restarts,
+		// its fresh dial wins the rule on both ends, so on this (lower-keyed)
+		// side it sails past !keep and lands right here — where, if we are
+		// still holding a session from before its restart, we would silently
+		// drop the winning connection and then wait out the dead timer for a
+		// connection whose peer no longer exists. The peer, having adopted
+		// its own side, sees our close and waits out its timer too.
+		if !dialed {
+			pc.notePeerRedialed()
+		}
 		return false, nil
 	}
 
