@@ -2,6 +2,7 @@ package sync
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -30,6 +31,24 @@ const maxConcurrentPulls = 4
 // descriptors, goroutines) bounded symmetrically instead of growing
 // unboundedly with however many requests the peer happens to send at once.
 const maxConcurrentServes = 4
+
+// pullStallTimeout bounds how long one in-flight pull will wait for the
+// next FileChunk before giving up.
+//
+// SPEC.md §4/§5 promise that a peer which no longer has a requested file,
+// or whose version has moved on, answers with an Error rather than
+// silence — but that is a promise about a *well-behaved* peer, and
+// pullFile is what pays for it being broken. Without this, a FileRequest
+// answered with neither a chunk nor an Error parks its caller until the
+// whole session is torn down, holding one of the maxConcurrentPulls slots
+// the entire time. Four such requests wedge every transfer with that peer
+// while the connection still looks perfectly healthy: pings, index
+// updates and share lists keep flowing, so nothing ever declares it dead.
+//
+// The timer is reset by every chunk received, so it bounds the gap
+// between chunks rather than the transfer as a whole — a legitimately
+// slow but progressing transfer of any size is unaffected.
+const pullStallTimeout = 60 * time.Second
 
 // --- the session: one authenticated peer connection --------------------
 
@@ -386,8 +405,19 @@ func (s *Session) sendIndexUpdate(shareID string, rows []index.FileRow, full boo
 // so the read loop is never the thing a background operation is waiting
 // on — that would deadlock a pull against the loop that delivers its
 // chunks.
+//
+// The one thing dispatched inline is the control handler, which writes
+// (a Pong, in reply to a Ping). That is only safe because every frame it
+// writes takes protocol.StreamWriter's priority lane, so it cannot queue
+// behind a FileChunk: an inline write that could block on the network
+// would stop this loop draining the socket, which is precisely what makes
+// the peer's own writes stall, and two peers in that state deadlock.
+//
+// On exit — for any reason, including a clean io.EOF — it closes s.done,
+// which is how the owner learns the connection is over ([Session.Done]).
 func (s *Session) readLoop() {
 	defer s.wg.Done()
+	defer close(s.done)
 	for {
 		typ, payload, err := s.reader.ReadFrame()
 		if err != nil {
@@ -627,6 +657,17 @@ func (s *Session) pullFile(ctx context.Context, shareID, wireRelPath string, ver
 		return 0, fmt.Errorf("sync: pull %s/%s: send file request: %w", shareID, wireRelPath, err)
 	}
 
+	// Real time, not s.clock: syncsvc.Clock is a bare func() time.Time with
+	// no timer, and this bounds a network wait rather than anything a test
+	// drives. Every test transfer answers immediately, so nothing waits on
+	// it (see pullStallTimeout).
+	stallAfter := pullStallTimeout
+	if s.testPullStallTimeout > 0 {
+		stallAfter = s.testPullStallTimeout
+	}
+	stall := time.NewTimer(stallAfter)
+	defer stall.Stop()
+
 	var total int64
 	for {
 		select {
@@ -647,11 +688,32 @@ func (s *Session) pullFile(ctx context.Context, shareID, wireRelPath string, ver
 			if c.eof {
 				return total, nil
 			}
+			if !stall.Stop() {
+				// Already fired and its value is sitting in the channel;
+				// drain it so the reset below starts from empty.
+				select {
+				case <-stall.C:
+				default:
+				}
+			}
+			stall.Reset(stallAfter)
+		case <-stall.C:
+			return total, fmt.Errorf("sync: pull %s/%s: %w", shareID, wireRelPath, ErrTransferStalled)
 		case <-ctx.Done():
 			return total, ctx.Err()
 		}
 	}
 }
+
+// ErrTransferStalled is returned by a pull that went pullStallTimeout with
+// no chunk and no Error from the peer — a peer that answered a
+// FileRequest with silence. Wrapped, so callers can check it with
+// errors.Is.
+//
+// The message names no duration on purpose: this is a package-level value,
+// so it can't reflect testPullStallTimeout, and stating a timeout the pull
+// didn't actually wait would be worse than stating none.
+var ErrTransferStalled = errors.New("peer sent neither a chunk nor an error before the pull stall timeout")
 
 // handleFileRequest serves one incoming FileRequest from our own share
 // content, respecting maxConcurrentServes. A file we no longer have, or
