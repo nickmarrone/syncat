@@ -2,10 +2,13 @@ package sync
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/nickmarrone/syncat/internal/index"
@@ -97,8 +100,10 @@ type Session struct {
 	controlHandler func(typ protocol.MsgType, payload []byte)
 	frameObserver  func(typ protocol.MsgType)
 
-	sharesMu sync.RWMutex
-	shares   map[string]*ShareConfig
+	sharesMu   sync.RWMutex
+	shares     map[string]*ShareConfig
+	snapshotMu sync.Mutex
+	snapshots  map[string]protocol.IndexSnapshotBegin
 
 	// reconcileMu serializes Reconcile+apply+index-update passes across
 	// the whole session (all shares). IndexUpdates are handled
@@ -164,19 +169,20 @@ func NewSession(conn net.Conn, store *index.Store, nodeID, peerID string, clock 
 		logger = log.Default()
 	}
 	return &Session{
-		conn:     conn,
-		reader:   protocol.NewReader(conn),
-		writer:   protocol.NewStreamWriter(conn, 0),
-		store:    store,
-		nodeID:   nodeID,
-		peerID:   peerID,
-		clock:    clock,
-		logger:   logger,
-		shares:   make(map[string]*ShareConfig),
-		pullSem:  make(chan struct{}, maxConcurrentPulls),
-		pullTbl:  make(map[transferKey]*pullEntry),
-		serveSem: make(chan struct{}, maxConcurrentServes),
-		done:     make(chan struct{}),
+		conn:      conn,
+		reader:    protocol.NewReader(conn),
+		writer:    protocol.NewStreamWriter(conn, 0),
+		store:     store,
+		nodeID:    nodeID,
+		peerID:    peerID,
+		clock:     clock,
+		logger:    logger,
+		shares:    make(map[string]*ShareConfig),
+		snapshots: make(map[string]protocol.IndexSnapshotBegin),
+		pullSem:   make(chan struct{}, maxConcurrentPulls),
+		pullTbl:   make(map[transferKey]*pullEntry),
+		serveSem:  make(chan struct{}, maxConcurrentServes),
+		done:      make(chan struct{}),
 	}
 }
 
@@ -345,14 +351,103 @@ func (s *Session) SyncShare(ctx context.Context, shareID string) error {
 	if !ok {
 		return fmt.Errorf("sync: session: unknown share %s", shareID)
 	}
-	if cfg.Direction.OutboundBlocked {
+	if !cfg.Direction.OutboundBlocked {
+		out, err := s.store.Cursor(ctx, s.peerID, shareID, "outgoing")
+		if err != nil {
+			return err
+		}
+		return s.answerSyncRequest(ctx, protocol.IndexSyncRequest{ShareID: shareID, Epoch: out.Epoch, AppliedSeq: out.AppliedSeq})
+	}
+	c, err := s.store.Cursor(ctx, s.peerID, shareID, "incoming")
+	if err != nil {
+		return err
+	}
+	if err := s.writer.WriteMessage(protocol.MsgIndexSyncRequest, protocol.IndexSyncRequest{ShareID: shareID, Epoch: c.Epoch, AppliedSeq: c.AppliedSeq, SnapshotID: c.SnapshotID, SnapshotBatch: c.SnapshotBatch}); err != nil {
+		return err
+	}
+	return nil
+}
+
+func newSnapshotID() string { var b [16]byte; _, _ = rand.Read(b[:]); return hex.EncodeToString(b[:]) }
+
+func (s *Session) answerSyncRequest(ctx context.Context, req protocol.IndexSyncRequest) error {
+	epoch, high, err := s.store.ShareState(ctx, req.ShareID)
+	if err != nil {
+		return err
+	}
+	oldest, err := s.store.OldestJournalSeq(ctx, req.ShareID, epoch)
+	if err != nil {
+		return err
+	}
+	if req.Epoch == epoch && (oldest == 0 || req.AppliedSeq+1 >= oldest) {
+		rows, err := s.store.JournalSince(ctx, req.ShareID, epoch, req.AppliedSeq, 100000)
+		if err != nil {
+			return err
+		}
+		for len(rows) > 0 {
+			n := deltaBatchLen(req.ShareID, epoch, rows)
+			if n == 0 {
+				return fmt.Errorf("sync: journal entry %s cannot fit in a frame", rows[0].Row.RelPath)
+			}
+			entries := make([]protocol.IndexDeltaEntry, n)
+			for i := range entries {
+				entries[i] = protocol.IndexDeltaEntry{Seq: rows[i].Seq, File: rows[i].Row.Info()}
+			}
+			m := protocol.IndexDeltaBatch{ShareID: req.ShareID, Epoch: epoch, FromSeq: entries[0].Seq, ToSeq: entries[n-1].Seq, Entries: entries}
+			if err = s.writer.WriteMessage(protocol.MsgIndexDeltaBatch, m); err != nil {
+				return err
+			}
+			rows = rows[n:]
+		}
 		return nil
 	}
-	rows, err := s.store.ListShare(ctx, shareID, true)
+	rows, err := s.store.ListShare(ctx, req.ShareID, true)
 	if err != nil {
-		return fmt.Errorf("sync: session: list share %s: %w", shareID, err)
+		return err
 	}
-	return s.sendIndexUpdate(shareID, rows, true)
+	id := newSnapshotID()
+	if err = s.writer.WriteMessage(protocol.MsgIndexSnapshotBegin, protocol.IndexSnapshotBegin{ShareID: req.ShareID, SnapshotID: id, Epoch: epoch, HighSeq: high}); err != nil {
+		return err
+	}
+	var batch uint64
+	for len(rows) > 0 {
+		n := snapshotBatchLen(req.ShareID, id, batch, rows)
+		if n == 0 {
+			return fmt.Errorf("sync: index entry %s cannot fit in a frame", rows[0].RelPath)
+		}
+		files := make([]protocol.FileInfo, n)
+		for i := range files {
+			files[i] = rows[i].Info()
+		}
+		if err = s.writer.WriteMessage(protocol.MsgIndexSnapshotBatch, protocol.IndexSnapshotBatch{ShareID: req.ShareID, SnapshotID: id, Batch: batch, Files: files}); err != nil {
+			return err
+		}
+		batch++
+		rows = rows[n:]
+	}
+	return s.writer.WriteMessage(protocol.MsgIndexSnapshotEnd, protocol.IndexSnapshotEnd{ShareID: req.ShareID, SnapshotID: id, BatchCount: batch})
+}
+func snapshotBatchLen(share, id string, b uint64, rows []index.FileRow) int {
+	files := make([]protocol.FileInfo, 0)
+	for i, r := range rows {
+		files = append(files, r.Info())
+		n, e := protocol.EncodedMessageSize(protocol.MsgIndexSnapshotBatch, protocol.IndexSnapshotBatch{ShareID: share, SnapshotID: id, Batch: b, Files: files})
+		if e != nil || n > protocol.TargetIndexBatchSize {
+			return i
+		}
+	}
+	return len(rows)
+}
+func deltaBatchLen(share, epoch string, rows []index.JournalRow) int {
+	entries := make([]protocol.IndexDeltaEntry, 0)
+	for i, r := range rows {
+		entries = append(entries, protocol.IndexDeltaEntry{Seq: r.Seq, File: r.Row.Info()})
+		n, e := protocol.EncodedMessageSize(protocol.MsgIndexDeltaBatch, protocol.IndexDeltaBatch{ShareID: share, Epoch: epoch, FromSeq: entries[0].Seq, ToSeq: r.Seq, Entries: entries})
+		if e != nil || n > protocol.TargetIndexBatchSize {
+			return i
+		}
+	}
+	return len(rows)
 }
 
 func (s *Session) sendIndexUpdate(shareID string, rows []index.FileRow, full bool) error {
@@ -403,6 +498,102 @@ func (s *Session) readLoop() {
 		}
 
 		switch typ {
+		case protocol.MsgIndexSyncRequest:
+			var m protocol.IndexSyncRequest
+			if protocol.DecodeMessage(payload, &m) != nil {
+				continue
+			}
+			s.wg.Add(1)
+			go func() {
+				defer s.wg.Done()
+				if err := s.answerSyncRequest(s.ctx, m); err != nil {
+					s.logf("answer index sync: %v", err)
+				}
+			}()
+		case protocol.MsgIndexSnapshotBegin:
+			var m protocol.IndexSnapshotBegin
+			if protocol.DecodeMessage(payload, &m) != nil {
+				continue
+			}
+			s.snapshotMu.Lock()
+			s.snapshots[m.ShareID] = m
+			s.snapshotMu.Unlock()
+			_ = s.store.SetCursor(s.ctx, s.peerID, m.ShareID, "incoming", index.Cursor{Epoch: m.Epoch, SnapshotID: m.SnapshotID})
+		case protocol.MsgIndexSnapshotBatch:
+			var m protocol.IndexSnapshotBatch
+			if protocol.DecodeMessage(payload, &m) != nil {
+				continue
+			}
+			s.snapshotMu.Lock()
+			b, ok := s.snapshots[m.ShareID]
+			s.snapshotMu.Unlock()
+			if !ok || b.SnapshotID != m.SnapshotID {
+				continue
+			}
+			c, _ := s.store.Cursor(s.ctx, s.peerID, m.ShareID, "incoming")
+			if m.Batch < c.SnapshotBatch {
+				continue
+			}
+			if m.Batch != c.SnapshotBatch {
+				_ = s.writer.WriteMessage(protocol.MsgIndexSyncRequest, protocol.IndexSyncRequest{ShareID: m.ShareID, Epoch: c.Epoch, AppliedSeq: c.AppliedSeq, SnapshotID: c.SnapshotID, SnapshotBatch: c.SnapshotBatch})
+				continue
+			}
+			rr := make([]index.FileRow, len(m.Files))
+			for i, f := range m.Files {
+				rr[i] = index.FileRowFromInfo(m.ShareID, f, time.Now())
+			}
+			if s.store.StageSnapshotBatch(s.ctx, s.peerID, m.ShareID, m.SnapshotID, m.Batch, rr) == nil {
+				c.SnapshotBatch++
+				_ = s.store.SetCursor(s.ctx, s.peerID, m.ShareID, "incoming", c)
+			}
+		case protocol.MsgIndexSnapshotEnd:
+			var m protocol.IndexSnapshotEnd
+			if protocol.DecodeMessage(payload, &m) != nil {
+				continue
+			}
+			s.snapshotMu.Lock()
+			b, ok := s.snapshots[m.ShareID]
+			delete(s.snapshots, m.ShareID)
+			s.snapshotMu.Unlock()
+			c, _ := s.store.Cursor(s.ctx, s.peerID, m.ShareID, "incoming")
+			if ok && b.SnapshotID == m.SnapshotID && c.SnapshotBatch == m.BatchCount && s.store.CommitSnapshot(s.ctx, s.peerID, m.ShareID, m.SnapshotID, b.Epoch, b.HighSeq) == nil {
+				_ = s.writer.WriteMessage(protocol.MsgIndexAck, protocol.IndexAck{ShareID: m.ShareID, Epoch: b.Epoch, AppliedSeq: b.HighSeq, SnapshotID: m.SnapshotID})
+				s.wg.Add(1)
+				go func() {
+					defer s.wg.Done()
+					s.reconcilePeerShare(s.ctx, m.ShareID)
+				}()
+			}
+		case protocol.MsgIndexDeltaBatch:
+			var m protocol.IndexDeltaBatch
+			if protocol.DecodeMessage(payload, &m) != nil {
+				continue
+			}
+			rr := make([]index.FileRow, len(m.Entries))
+			valid := true
+			for i, e := range m.Entries {
+				if e.Seq != m.FromSeq+uint64(i) {
+					valid = false
+					break
+				}
+				rr[i] = index.FileRowFromInfo(m.ShareID, e.File, time.Now())
+			}
+			if valid && s.store.ApplyPeerDelta(s.ctx, s.peerID, m.ShareID, m.Epoch, m.FromSeq, m.ToSeq, rr) == nil {
+				_ = s.writer.WriteMessage(protocol.MsgIndexAck, protocol.IndexAck{ShareID: m.ShareID, Epoch: m.Epoch, AppliedSeq: m.ToSeq})
+				s.wg.Add(1)
+				go func() {
+					defer s.wg.Done()
+					s.handleIndexUpdate(s.ctx, protocol.IndexUpdate{ShareID: m.ShareID, Files: rowsToInfos(rr)})
+				}()
+			} else {
+				c, _ := s.store.Cursor(s.ctx, s.peerID, m.ShareID, "incoming")
+				_ = s.writer.WriteMessage(protocol.MsgIndexSyncRequest, protocol.IndexSyncRequest{ShareID: m.ShareID, Epoch: c.Epoch, AppliedSeq: c.AppliedSeq})
+			}
+		case protocol.MsgIndexAck:
+			var m protocol.IndexAck
+			if protocol.DecodeMessage(payload, &m) == nil {
+				_ = s.store.SetCursor(s.ctx, s.peerID, m.ShareID, "outgoing", index.Cursor{Epoch: m.Epoch, AppliedSeq: m.AppliedSeq})
+			}
 		case protocol.MsgIndexUpdate:
 			var msg protocol.IndexUpdate
 			if err := protocol.DecodeMessage(payload, &msg); err != nil {
@@ -456,6 +647,47 @@ func (s *Session) readLoop() {
 				ctrlHandler(typ, payload)
 			}
 		}
+	}
+}
+
+func (s *Session) reconcilePeerShare(ctx context.Context, shareID string) {
+	s.reconcileMu.Lock()
+	defer s.reconcileMu.Unlock()
+	rows, err := s.store.ListPeerFiles(ctx, s.peerID, shareID)
+	if err != nil {
+		return
+	}
+	// CommitSnapshot has already installed the mirror; feed reconciliation
+	// without re-entering the peer-state persistence path.
+	cfg, ok := s.getShare(shareID)
+	if !ok || cfg.Direction.InboundBlocked {
+		return
+	}
+	local, err := s.store.ListShare(ctx, shareID, true)
+	if err != nil {
+		return
+	}
+	actions := Reconcile(rowsToInfos(local), rowsToInfos(rows), s.nodeID, cfg.Direction, s.clock)
+	sem := make(chan struct{}, maxConcurrentPulls)
+	var wg sync.WaitGroup
+	var changed atomic.Bool
+	for _, a := range actions {
+		a := a
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			if len(s.applyAndPersist(ctx, cfg, a)) > 0 {
+				changed.Store(true)
+			}
+		}()
+	}
+	wg.Wait()
+	if changed.Load() && !cfg.Direction.OutboundBlocked {
+		// Reconciliation results are journaled by applyAndPersist; publish
+		// them so conflict copies converge on every peer.
+		_ = s.answerSyncRequest(ctx, protocol.IndexSyncRequest{ShareID: shareID})
 	}
 }
 

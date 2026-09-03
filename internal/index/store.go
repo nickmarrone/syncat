@@ -58,13 +58,75 @@ type Store struct {
 // file header) rather than a table we'd have to query separately — it's
 // exactly what PRAGMA user_version exists for, and it's readable/writable
 // in the same connection setup step as the other pragmas below.
-const currentSchemaVersion = 1
+const currentSchemaVersion = 2
 
 // migrations[i] upgrades a database from schema version i to i+1.
 // Migrations run inside a single transaction per step (see migrate) so a
 // failure partway through a step never leaves the schema half-applied.
 var migrations = []func(ctx context.Context, tx *sql.Tx) error{
 	migrateV1,
+	migrateV2,
+}
+
+func migrateV2(ctx context.Context, tx *sql.Tx) error {
+	stmts := []string{
+		`CREATE TABLE share_state (
+			share_id TEXT PRIMARY KEY,
+			epoch TEXT NOT NULL,
+			next_seq INTEGER NOT NULL DEFAULT 1)`,
+		`CREATE TABLE change_journal (
+			share_id TEXT NOT NULL,
+			epoch TEXT NOT NULL,
+			seq INTEGER NOT NULL,
+			relpath TEXT NOT NULL,
+			type TEXT NOT NULL,
+			size INTEGER NOT NULL,
+			mtime_ns INTEGER NOT NULL,
+			mode INTEGER NOT NULL,
+			sha256 BLOB,
+			version_json TEXT NOT NULL,
+			deleted INTEGER NOT NULL,
+			created_at INTEGER NOT NULL,
+			PRIMARY KEY(share_id,seq))`,
+		`CREATE INDEX change_journal_retention ON change_journal(
+			created_at)`,
+		`CREATE TABLE peer_cursors (
+			peer_key TEXT NOT NULL,
+			share_id TEXT NOT NULL,
+			direction TEXT NOT NULL,
+			epoch TEXT NOT NULL,
+			applied_seq INTEGER NOT NULL DEFAULT 0,
+			snapshot_id TEXT NOT NULL DEFAULT '',
+			snapshot_batch INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY(peer_key,share_id,direction))`,
+		`CREATE TABLE snapshot_staging (
+			peer_key TEXT NOT NULL,
+			share_id TEXT NOT NULL,
+			snapshot_id TEXT NOT NULL,
+			batch INTEGER NOT NULL,
+			relpath TEXT NOT NULL,
+			type TEXT NOT NULL,
+			size INTEGER NOT NULL,
+			mtime_ns INTEGER NOT NULL,
+			mode INTEGER NOT NULL,
+			sha256 BLOB,
+			version_json TEXT NOT NULL,
+			deleted INTEGER NOT NULL,
+			PRIMARY KEY(peer_key,share_id,snapshot_id,relpath))`,
+		`CREATE TABLE dirty_paths (
+			peer_key TEXT NOT NULL,
+			share_id TEXT NOT NULL,
+			relpath TEXT NOT NULL,
+			attempts INTEGER NOT NULL DEFAULT 0,
+			updated_at INTEGER NOT NULL,
+			PRIMARY KEY(peer_key,share_id,relpath))`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Open opens (creating if necessary) the SQLite database at path and
@@ -328,15 +390,42 @@ func (s *Store) GetFile(ctx context.Context, shareID, relpath string) (FileRow, 
 
 // PutFile upserts one row into the files table.
 func (s *Store) PutFile(ctx context.Context, row FileRow) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := putFileAndJournal(ctx, tx, row); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("index: put %s/%s: %w", row.ShareID, row.RelPath, err)
+	}
+	return nil
+}
+
+func putFileAndJournal(ctx context.Context, tx *sql.Tx, row FileRow) error {
 	vj, err := versionJSON(row.Version)
 	if err != nil {
 		return fmt.Errorf("index: put %s/%s: %w", row.ShareID, row.RelPath, err)
 	}
-	if _, err := s.db.ExecContext(ctx, putFileSQL,
+	if _, err := tx.ExecContext(ctx, putFileSQL,
 		row.ShareID, row.RelPath, string(row.Type), row.Size, row.MTimeNS, row.Mode,
 		row.SHA256, vj, boolInt(row.Deleted), timeNS(row.UpdatedAt),
 	); err != nil {
 		return fmt.Errorf("index: put %s/%s: %w", row.ShareID, row.RelPath, err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO share_state(share_id,epoch) VALUES(?,lower(hex(randomblob(16))))`, row.ShareID); err != nil {
+		return err
+	}
+	var epoch string
+	var seq uint64
+	if err := tx.QueryRowContext(ctx, `UPDATE share_state SET next_seq=next_seq+1 WHERE share_id=? RETURNING epoch,next_seq-1`, row.ShareID).Scan(&epoch, &seq); err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO change_journal(share_id,epoch,seq,relpath,type,size,mtime_ns,mode,sha256,version_json,deleted,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, row.ShareID, epoch, seq, row.RelPath, string(row.Type), row.Size, row.MTimeNS, row.Mode, row.SHA256, vj, boolInt(row.Deleted), time.Now().UnixNano())
+	if err != nil {
+		return fmt.Errorf("index: journal %s/%s: %w", row.ShareID, row.RelPath, err)
 	}
 	return nil
 }
@@ -388,23 +477,10 @@ func (s *Store) ApplyScanResult(ctx context.Context, result *ScanResult) error {
 	}
 	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
 
-	stmt, err := tx.PrepareContext(ctx, putFileSQL)
-	if err != nil {
-		return fmt.Errorf("index: apply scan result: prepare: %w", err)
-	}
-	defer stmt.Close()
-
 	apply := func(rows []FileRow) error {
 		for _, row := range rows {
-			vj, err := versionJSON(row.Version)
-			if err != nil {
-				return fmt.Errorf("row %s/%s: %w", row.ShareID, row.RelPath, err)
-			}
-			if _, err := stmt.ExecContext(ctx,
-				row.ShareID, row.RelPath, string(row.Type), row.Size, row.MTimeNS, row.Mode,
-				row.SHA256, vj, boolInt(row.Deleted), timeNS(row.UpdatedAt),
-			); err != nil {
-				return fmt.Errorf("row %s/%s: %w", row.ShareID, row.RelPath, err)
+			if err := putFileAndJournal(ctx, tx, row); err != nil {
+				return err
 			}
 		}
 		return nil

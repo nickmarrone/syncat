@@ -41,6 +41,12 @@ const (
 	MsgPong
 	MsgError
 	MsgFinished
+	MsgIndexSyncRequest
+	MsgIndexSnapshotBegin
+	MsgIndexSnapshotBatch
+	MsgIndexSnapshotEnd
+	MsgIndexDeltaBatch
+	MsgIndexAck
 )
 
 func (t MsgType) String() string {
@@ -69,6 +75,18 @@ func (t MsgType) String() string {
 		return "Error"
 	case MsgFinished:
 		return "Finished"
+	case MsgIndexSyncRequest:
+		return "IndexSyncRequest"
+	case MsgIndexSnapshotBegin:
+		return "IndexSnapshotBegin"
+	case MsgIndexSnapshotBatch:
+		return "IndexSnapshotBatch"
+	case MsgIndexSnapshotEnd:
+		return "IndexSnapshotEnd"
+	case MsgIndexDeltaBatch:
+		return "IndexDeltaBatch"
+	case MsgIndexAck:
+		return "IndexAck"
 	default:
 		return fmt.Sprintf("MsgType(%d)", byte(t))
 	}
@@ -205,6 +223,51 @@ type IndexUpdate struct {
 	Full    bool       `cbor:"full"`
 }
 
+// Index synchronization is an acknowledged, ordered stream. Sequence zero
+// means that no change in the epoch has been applied yet.
+type IndexSyncRequest struct {
+	ShareID       string `cbor:"share_id"`
+	Epoch         string `cbor:"epoch"`
+	AppliedSeq    uint64 `cbor:"applied_seq"`
+	SnapshotID    string `cbor:"snapshot_id,omitempty"`
+	SnapshotBatch uint64 `cbor:"snapshot_batch,omitempty"`
+}
+type IndexSnapshotBegin struct {
+	ShareID    string `cbor:"share_id"`
+	SnapshotID string `cbor:"snapshot_id"`
+	Epoch      string `cbor:"epoch"`
+	HighSeq    uint64 `cbor:"high_seq"`
+}
+type IndexSnapshotBatch struct {
+	ShareID    string     `cbor:"share_id"`
+	SnapshotID string     `cbor:"snapshot_id"`
+	Batch      uint64     `cbor:"batch"`
+	Files      []FileInfo `cbor:"files"`
+}
+type IndexSnapshotEnd struct {
+	ShareID    string `cbor:"share_id"`
+	SnapshotID string `cbor:"snapshot_id"`
+	BatchCount uint64 `cbor:"batch_count"`
+}
+type IndexDeltaEntry struct {
+	Seq  uint64   `cbor:"seq"`
+	File FileInfo `cbor:"file"`
+}
+type IndexDeltaBatch struct {
+	ShareID string            `cbor:"share_id"`
+	Epoch   string            `cbor:"epoch"`
+	FromSeq uint64            `cbor:"from_seq"`
+	ToSeq   uint64            `cbor:"to_seq"`
+	Entries []IndexDeltaEntry `cbor:"entries"`
+}
+type IndexAck struct {
+	ShareID    string `cbor:"share_id"`
+	Epoch      string `cbor:"epoch"`
+	AppliedSeq uint64 `cbor:"applied_seq"`
+	SnapshotID string `cbor:"snapshot_id,omitempty"`
+	Replay     bool   `cbor:"replay,omitempty"`
+}
+
 // FileRequest asks the holder of a file for its bytes, optionally resuming
 // from Offset (puller → holder, SPEC.md §4).
 type FileRequest struct {
@@ -285,7 +348,16 @@ const (
 	// §4: "≤1 MiB raw bytes"), comfortably under MaxFrameSize once the
 	// small FileChunkHeader is added.
 	MaxFileChunkData = 1 * 1024 * 1024
+	// TargetIndexBatchSize leaves ample room below MaxFrameSize for framing
+	// and future fields.
+	TargetIndexBatchSize = 3 * 1024 * 1024
 )
+
+// EncodedMessageSize returns the CBOR payload size used for batch planning.
+func EncodedMessageSize(typ MsgType, v any) (int, error) {
+	b, err := encodeMessage(typ, v)
+	return len(b), err
+}
 
 // Writer encodes messages onto an underlying io.Writer as length-prefixed
 // frames (SPEC.md §4).
