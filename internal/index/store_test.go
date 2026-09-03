@@ -45,7 +45,7 @@ func TestOpenCreatesFreshDatabase(t *testing.T) {
 		t.Errorf("user_version = %d, want %d", version, currentSchemaVersion)
 	}
 
-	for _, table := range []string{"files", "peer_files", "pending_transfers"} {
+	for _, table := range []string{"files", "peer_files", "pending_transfers", "share_state", "change_journal", "peer_cursors", "snapshot_staging", "dirty_paths"} {
 		var name string
 		err := s.db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&name)
 		if err != nil {
