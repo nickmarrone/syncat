@@ -308,15 +308,10 @@ func NewWriter(w io.Writer) *Writer {
 // instead; WriteFrame is exposed for tests and for message types this
 // package doesn't know about (forward compatibility).
 func (w *Writer) WriteFrame(typ MsgType, payload []byte) error {
-	bodyLen := 1 + len(payload)
-	if bodyLen > MaxFrameSize {
-		return fmt.Errorf("protocol: frame: %s body is %d bytes, exceeds max %d", typ, bodyLen, MaxFrameSize)
+	buf, err := encodeFrame(typ, payload)
+	if err != nil {
+		return err
 	}
-
-	buf := make([]byte, frameLenSize+bodyLen)
-	binary.BigEndian.PutUint32(buf[:frameLenSize], uint32(bodyLen))
-	buf[frameLenSize] = byte(typ)
-	copy(buf[frameLenSize+1:], payload)
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -326,31 +321,72 @@ func (w *Writer) WriteFrame(typ MsgType, payload []byte) error {
 	return nil
 }
 
+// encodeFrame builds one complete on-the-wire frame — length prefix, type
+// byte, payload — as a single self-contained buffer.
+//
+// Returning bytes rather than writing them is what lets [StreamWriter]
+// queue a frame: the buffer owns its copy of payload, so a caller that
+// reuses its payload slice across calls (Session.streamFile reads every
+// chunk into one buffer) can't mutate a frame already sitting in the
+// queue.
+func encodeFrame(typ MsgType, payload []byte) ([]byte, error) {
+	bodyLen := 1 + len(payload)
+	if bodyLen > MaxFrameSize {
+		return nil, fmt.Errorf("protocol: frame: %s body is %d bytes, exceeds max %d", typ, bodyLen, MaxFrameSize)
+	}
+
+	buf := make([]byte, frameLenSize+bodyLen)
+	binary.BigEndian.PutUint32(buf[:frameLenSize], uint32(bodyLen))
+	buf[frameLenSize] = byte(typ)
+	copy(buf[frameLenSize+1:], payload)
+	return buf, nil
+}
+
 // WriteMessage CBOR-encodes v as a map (via its `cbor:"..."` struct tags)
 // and writes it as a frame of the given type.
 func (w *Writer) WriteMessage(typ MsgType, v any) error {
-	payload, err := cbor.Marshal(v)
+	payload, err := encodeMessage(typ, v)
 	if err != nil {
-		return fmt.Errorf("protocol: frame: encode %s: %w", typ, err)
+		return err
 	}
 	return w.WriteFrame(typ, payload)
+}
+
+// encodeMessage CBOR-encodes v as a frame payload, naming typ in any
+// error.
+func encodeMessage(typ MsgType, v any) ([]byte, error) {
+	payload, err := cbor.Marshal(v)
+	if err != nil {
+		return nil, fmt.Errorf("protocol: frame: encode %s: %w", typ, err)
+	}
+	return payload, nil
 }
 
 // WriteFileChunk writes a MsgFileChunk frame: hdr CBOR-encoded, followed
 // immediately by the raw bytes in data (SPEC.md §4). data must be at most
 // MaxFileChunkData bytes.
 func (w *Writer) WriteFileChunk(hdr FileChunkHeader, data []byte) error {
+	payload, err := encodeFileChunk(hdr, data)
+	if err != nil {
+		return err
+	}
+	return w.WriteFrame(MsgFileChunk, payload)
+}
+
+// encodeFileChunk builds a MsgFileChunk frame's payload: hdr's CBOR
+// encoding followed immediately by the raw bytes in data.
+func encodeFileChunk(hdr FileChunkHeader, data []byte) ([]byte, error) {
 	if len(data) > MaxFileChunkData {
-		return fmt.Errorf("protocol: frame: file chunk data is %d bytes, exceeds max %d", len(data), MaxFileChunkData)
+		return nil, fmt.Errorf("protocol: frame: file chunk data is %d bytes, exceeds max %d", len(data), MaxFileChunkData)
 	}
 	hdrBytes, err := cbor.Marshal(hdr)
 	if err != nil {
-		return fmt.Errorf("protocol: frame: encode file chunk header: %w", err)
+		return nil, fmt.Errorf("protocol: frame: encode file chunk header: %w", err)
 	}
 	payload := make([]byte, 0, len(hdrBytes)+len(data))
 	payload = append(payload, hdrBytes...)
 	payload = append(payload, data...)
-	return w.WriteFrame(MsgFileChunk, payload)
+	return payload, nil
 }
 
 // Reader decodes length-prefixed frames from an underlying io.Reader
