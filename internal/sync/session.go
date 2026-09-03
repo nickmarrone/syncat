@@ -158,6 +158,11 @@ type Session struct {
 	// unexported and never set outside this package's own tests.
 	testServeDelay time.Duration
 
+	// testPullStallTimeout, if non-zero, replaces pullStallTimeout. Same
+	// deal as testServeDelay: a test can't wait a real minute to watch a
+	// silent peer time out.
+	testPullStallTimeout time.Duration
+
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup

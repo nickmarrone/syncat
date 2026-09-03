@@ -316,16 +316,42 @@ func (pc *peerConn) offer(ctx context.Context, conn net.Conn, result *protocol.H
 	node.requestSubscriptions(sess, pc.peerKeyHex)
 
 	node.goTracked(func() {
-		ka.Run(sessCtx, 0, func() {
-			if err := sess.Writer().WriteMessage(protocol.MsgPing, protocol.Ping{}); err != nil {
-				node.logger.Printf("core: peer %s: send ping: %v", pc.name, err)
-				return
-			}
-			ka.RecordSent()
-		}, func() {
-			conn.Close() // dead per SPEC.md §4's 90s rule; unblocks the session's read loop
-		})
+		// The keepalive runs alongside the wait below rather than being the
+		// wait itself. Its dead timer is the *backstop* for noticing this
+		// connection has ended, not the mechanism: a peer that closes
+		// cleanly, or a socket that breaks under a write, ends the session's
+		// read loop immediately, and waiting out SPEC.md §4's 90s instead
+		// (at the poll granularity, up to 120s) is 90s of a node reporting
+		// itself connected to something that is gone, and 90s before
+		// dialAttempt is released to redial. The check interval comes from
+		// protocol.DefaultKeepaliveCheckInterval.
+		kaDone := make(chan struct{})
+		go func() {
+			defer close(kaDone)
+			ka.Run(sessCtx, 0, func() {
+				if err := sess.Writer().WriteMessage(protocol.MsgPing, protocol.Ping{}); err != nil {
+					// Not a transient condition to log and retry in 30s: a
+					// ping is one small frame on the writer's priority lane,
+					// so a failure to even queue it means the connection is
+					// finished. Close it and let the read loop's EOF unwind
+					// the session, the same way a peer disconnecting does.
+					node.logger.Printf("core: peer %s: send ping, dropping connection: %v", pc.name, err)
+					conn.Close()
+					return
+				}
+				ka.RecordSent()
+			}, func() {
+				conn.Close() // dead per SPEC.md §4's 90s rule; unblocks the session's read loop
+			})
+		}()
+
+		select {
+		case <-sess.Done(): // the read loop ended: peer closed, or the link broke
+		case <-kaDone: // the dead rule fired, or the session context was cancelled
+		}
+
 		cancel()
+		<-kaDone // cancel() above is what unblocks ka.Run
 		sess.Close()
 		conn.Close()
 
