@@ -1,3 +1,7 @@
+// handshake.go: the mutually-authenticated Ed25519 handshake (SPEC.md §4)
+// that every connection runs before a session starts. The keepalive timer
+// that follows lives in keepalive.go.
+
 package protocol
 
 import (
@@ -8,7 +12,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"sync"
 	"time"
 
 	"github.com/nickmarrone/syncat/internal/config"
@@ -138,54 +141,19 @@ func Handshake(ctx context.Context, conn net.Conn, cfg HandshakeConfig) (*Handsh
 		minVersion = CurrentProtoVersion
 	}
 
-	timeout := cfg.Timeout
-	if timeout <= 0 {
-		timeout = DefaultHandshakeTimeout
-	}
-	deadline := time.Now().Add(timeout)
-	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
-		deadline = ctxDeadline
-	}
-	if err := conn.SetDeadline(deadline); err != nil {
-		return nil, fmt.Errorf("protocol: handshake: set deadline: %w", err)
-	}
-
-	// If ctx is canceled before the deadline above would fire on its own,
-	// force any Read/Write already blocked (or about to block) to return
-	// promptly by pulling the deadline in to "now". The watcher goroutine
-	// always exits when Handshake returns, via stop.
-	stop := make(chan struct{})
-	stopped := false
-	// Only ever called on Handshake's own goroutine, so the bool needs no
-	// synchronisation.
-	stopWatcher := func() {
-		if !stopped {
-			stopped = true
-			close(stop)
-		}
+	stopWatcher, err := armHandshakeDeadline(ctx, conn, cfg.Timeout)
+	if err != nil {
+		return nil, err
 	}
 	defer stopWatcher()
-	go func() {
-		select {
-		case <-ctx.Done():
-			_ = conn.SetDeadline(time.Now())
-		case <-stop:
-		}
-	}()
 
 	ourPub := cfg.IdentityKey.Public().(ed25519.PublicKey)
 	ourNonce := make([]byte, nonceSize)
 	if _, err := rand.Read(ourNonce); err != nil {
 		return nil, fmt.Errorf("protocol: handshake: generate nonce: %w", err)
 	}
-
-	// A Token whose embedded id doesn't match our own key is a local
-	// misconfiguration, not something the peer needs to tell us about;
-	// catch it before ever writing a Hello we know is inconsistent.
-	if ourTok, err := config.ParseToken(cfg.Token); err != nil {
-		return nil, fmt.Errorf("protocol: handshake: our own token is invalid: %w", err)
-	} else if !bytes.Equal(ourTok.ID, ourPub) {
-		return nil, errors.New("protocol: handshake: our own token id does not match our identity key")
+	if err := checkOwnToken(cfg.Token, ourPub); err != nil {
+		return nil, err
 	}
 
 	fw := NewWriter(conn)
@@ -270,6 +238,64 @@ func Handshake(ctx context.Context, conn net.Conn, cfg HandshakeConfig) (*Handsh
 		PeerToken:    peerHello.Token,
 		ProtoVersion: negotiated,
 	}, nil
+}
+
+// armHandshakeDeadline bounds the handshake on conn by timeout
+// (DefaultHandshakeTimeout if <= 0) or ctx's own deadline, whichever comes
+// first, and starts a goroutine that pulls the deadline in to "now" if ctx
+// is canceled before then. It returns stopWatcher, which retires that
+// goroutine; it is idempotent and must only be called from the goroutine
+// running [Handshake]. The deadline itself is left armed — clearing it (or
+// not, on failure) is the caller's decision.
+func armHandshakeDeadline(ctx context.Context, conn net.Conn, timeout time.Duration) (stopWatcher func(), err error) {
+	if timeout <= 0 {
+		timeout = DefaultHandshakeTimeout
+	}
+	deadline := time.Now().Add(timeout)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		deadline = ctxDeadline
+	}
+	if err := conn.SetDeadline(deadline); err != nil {
+		return nil, fmt.Errorf("protocol: handshake: set deadline: %w", err)
+	}
+
+	// If ctx is canceled before the deadline above would fire on its own,
+	// force any Read/Write already blocked (or about to block) to return
+	// promptly by pulling the deadline in to "now". The watcher goroutine
+	// always exits when Handshake returns, via stop.
+	stop := make(chan struct{})
+	stopped := false
+	// Only ever called on Handshake's own goroutine, so the bool needs no
+	// synchronisation.
+	stopWatcher = func() {
+		if !stopped {
+			stopped = true
+			close(stop)
+		}
+	}
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.SetDeadline(time.Now())
+		case <-stop:
+		}
+	}()
+	return stopWatcher, nil
+}
+
+// checkOwnToken confirms that token (this node's own sc1 token) parses
+// and embeds ourPub. A Token whose embedded id doesn't match our own key
+// is a local misconfiguration, not something the peer needs to tell us
+// about; catch it before ever writing a Hello we know is inconsistent.
+func checkOwnToken(token string, ourPub ed25519.PublicKey) error {
+	ourTok, err := config.ParseToken(token)
+	if err != nil {
+		return fmt.Errorf("protocol: handshake: our own token is invalid: %w", err)
+	}
+	if !bytes.Equal(ourTok.ID, ourPub) {
+		return errors.New("protocol: handshake: our own token id does not match our identity key")
+	}
+	return nil
 }
 
 // authTranscript builds the fixed-order byte string that gets signed and
@@ -385,6 +411,18 @@ func exchangeAuth(fw *Writer, fr *Reader, ours Auth) (Auth, error) {
 	return peer, nil
 }
 
+// RemoteError wraps an Error message received from the peer, so callers
+// can distinguish "the peer told us why it's closing" from a local
+// decode/timeout/IO failure.
+type RemoteError struct {
+	Code string
+	Msg  string
+}
+
+func (e *RemoteError) Error() string {
+	return fmt.Sprintf("protocol: peer sent error %q: %s", e.Code, e.Msg)
+}
+
 // readExpected reads one frame and returns its payload if it has type
 // want. A frame of type MsgError is decoded and returned as a *RemoteError
 // instead of a generic "wrong type" error, since that's a more useful
@@ -414,160 +452,4 @@ func readExpected(fr *Reader, want MsgType) ([]byte, error) {
 // situation that leads to wanting to send an Error in the first place.
 func sendError(fw *Writer, code, msg string) {
 	_ = fw.WriteMessage(MsgError, Error{Code: code, Msg: msg})
-}
-
-// Default keepalive timing (SPEC.md §4): send Ping after 30s of outbound
-// idleness; treat the connection as dead after 90s with nothing received
-// at all (a Pong counts as received traffic, same as any other message).
-const (
-	DefaultPingInterval = 30 * time.Second
-	DefaultDeadAfter    = 90 * time.Second
-
-	// DefaultKeepaliveCheckInterval is how often [Keepalive.Run] evaluates
-	// NeedsPing and Dead. It is much shorter than DefaultPingInterval on
-	// purpose: the poll interval is the granularity of both decisions, so
-	// checking only once per ping interval meant SPEC.md §4's 90s dead rule
-	// actually fired somewhere between 90s and 120s. Ping timing is
-	// unaffected — NeedsPing is a comparison against lastSent, not a
-	// countdown, so a faster poll finds the same instant, just sooner after
-	// it passes.
-	DefaultKeepaliveCheckInterval = 5 * time.Second
-)
-
-// --- keepalive: Ping/Pong idle and dead-connection timing --------------
-
-// Clock abstracts wall-clock time so [Keepalive.Run] can be driven
-// deterministically in tests, with no real sleeping. [RealClock] is the
-// production implementation. This mirrors transport.Clock but is defined
-// locally rather than imported, so internal/protocol has no dependency on
-// internal/transport (SPEC.md §10/§12 layering: protocol is a leaf
-// package).
-type Clock interface {
-	Now() time.Time
-	After(d time.Duration) <-chan time.Time
-}
-
-type realClock struct{}
-
-func (realClock) Now() time.Time                         { return time.Now() }
-func (realClock) After(d time.Duration) <-chan time.Time { return time.After(d) }
-
-// RealClock is the production [Clock], backed by the time package.
-var RealClock Clock = realClock{}
-
-// Keepalive tracks send/receive activity on one connection and decides
-// when to send a Ping and when to declare the connection dead (SPEC.md
-// §4). It does no I/O and starts no goroutines on its own: the owner
-// (internal/core's peer manager) calls [Keepalive.RecordSent] and
-// [Keepalive.RecordReceived] from its read/write loop, and drives the
-// timing with [Keepalive.Run] (or polls [Keepalive.NeedsPing] /
-// [Keepalive.Dead] directly).
-//
-// The zero value is not usable; construct with [NewKeepalive].
-type Keepalive struct {
-	clock        Clock
-	pingInterval time.Duration
-	deadAfter    time.Duration
-
-	mu       sync.Mutex
-	lastSent time.Time
-	lastRecv time.Time
-}
-
-// NewKeepalive returns a Keepalive using clock for timing (RealClock if
-// nil), sending a Ping after pingInterval of outbound idleness (
-// DefaultPingInterval if <= 0) and considering the connection dead after
-// deadAfter with nothing received (DefaultDeadAfter if <= 0). Both
-// lastSent and lastRecv start at clock.Now(), i.e. a freshly constructed
-// Keepalive assumes the connection just did something in both directions
-// (matching a connection that just finished its handshake).
-func NewKeepalive(clock Clock, pingInterval, deadAfter time.Duration) *Keepalive {
-	if clock == nil {
-		clock = RealClock
-	}
-	if pingInterval <= 0 {
-		pingInterval = DefaultPingInterval
-	}
-	if deadAfter <= 0 {
-		deadAfter = DefaultDeadAfter
-	}
-	now := clock.Now()
-	return &Keepalive{
-		clock:        clock,
-		pingInterval: pingInterval,
-		deadAfter:    deadAfter,
-		lastSent:     now,
-		lastRecv:     now,
-	}
-}
-
-// RecordSent notes that a frame (of any type — a Ping counts, and so does
-// any other outbound message) was just sent, resetting the ping-idle
-// timer.
-func (k *Keepalive) RecordSent() {
-	k.mu.Lock()
-	k.lastSent = k.clock.Now()
-	k.mu.Unlock()
-}
-
-// RecordReceived notes that a frame (of any type — a Pong counts, and so
-// does any other inbound message) was just received, resetting the
-// dead-connection timer.
-func (k *Keepalive) RecordReceived() {
-	k.mu.Lock()
-	k.lastRecv = k.clock.Now()
-	k.mu.Unlock()
-}
-
-// NeedsPing reports whether pingInterval has elapsed since the last
-// RecordSent (or since construction, if none yet).
-func (k *Keepalive) NeedsPing() bool {
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	return !k.clock.Now().Before(k.lastSent.Add(k.pingInterval))
-}
-
-// Dead reports whether deadAfter has elapsed since the last
-// RecordReceived (or since construction, if none yet).
-func (k *Keepalive) Dead() bool {
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	return !k.clock.Now().Before(k.lastRecv.Add(k.deadAfter))
-}
-
-// Run polls NeedsPing and Dead every checkInterval
-// (DefaultKeepaliveCheckInterval if checkInterval <= 0) until ctx is done,
-// calling onPing each time a ping becomes due and onDead (once) the moment
-// the connection is judged dead, at which point Run returns — the caller
-// is expected to tear down and reconnect (SPEC.md §4), not keep polling a
-// connection already declared dead. onPing and onDead may be nil.
-//
-// Run does no I/O itself: onPing is expected to actually send a Ping
-// frame and then call RecordSent, and onDead to close the connection (and
-// whatever else internal/core's reconnect policy requires).
-//
-// Dead is evaluated before NeedsPing, so a connection that has gone quiet
-// is torn down rather than pinged one last time.
-func (k *Keepalive) Run(ctx context.Context, checkInterval time.Duration, onPing, onDead func()) {
-	if checkInterval <= 0 {
-		checkInterval = DefaultKeepaliveCheckInterval
-	}
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-k.clock.After(checkInterval):
-		}
-		if k.Dead() {
-			if onDead != nil {
-				onDead()
-			}
-			return
-		}
-		if k.NeedsPing() {
-			if onPing != nil {
-				onPing()
-			}
-		}
-	}
 }

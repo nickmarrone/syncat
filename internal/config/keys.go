@@ -123,14 +123,10 @@ func LoadTailcatKey(path string) (*tailcat.PrivateKey, error) {
 // init time and persisting the concrete RegionID keeps the token stable for
 // the life of the key, matching cmd/tailcat's `genkey --fixed-region`.
 func LoadOrCreateTailcatKey(ctx context.Context, path string) (key *tailcat.PrivateKey, created bool, err error) {
-	if data, readErr := os.ReadFile(path); readErr == nil {
-		var priv tailcat.PrivateKey
-		if err := json.Unmarshal(data, &priv); err != nil {
-			return nil, false, fmt.Errorf("config: parse tailcat key %s: %w", path, err)
-		}
-		return &priv, false, nil
-	} else if !errors.Is(readErr, os.ErrNotExist) {
-		return nil, false, fmt.Errorf("config: read tailcat key %s: %w", path, readErr)
+	if key, err := LoadTailcatKey(path); err == nil {
+		return key, false, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, false, err
 	}
 
 	priv := tailcat.NewPrivateKey()
@@ -161,10 +157,10 @@ func LoadOrCreateTailcatKey(ctx context.Context, path string) (key *tailcat.Priv
 	return priv, true, nil
 }
 
+// --- sc1 node tokens (SPEC.md §2) --------------------------------------
+
 // TokenPrefix versions the syncat node token format (SPEC.md §2).
 const TokenPrefix = "sc1"
-
-// --- sc1 node tokens (SPEC.md §2) --------------------------------------
 
 // tokenPayload is the CBOR body of a node token. It's encoded as a CBOR map
 // (not an array) keyed by these short field names so that decoding ignores
@@ -228,11 +224,11 @@ func ParseToken(token string) (*NodeToken, error) {
 	}, nil
 }
 
+// --- the REST API token (SPEC.md §3) -----------------------------------
+
 // apiTokenBytes is the number of random bytes in api.token, hex-encoded to
 // 64 characters (SPEC.md §3).
 const apiTokenBytes = 32
-
-// --- the REST API token (SPEC.md §3) -----------------------------------
 
 // LoadOrCreateAPIToken loads the REST API auth token from path, generating
 // and persisting a new random 64-hex-character token (mode 0600) if none
@@ -257,16 +253,4 @@ func LoadOrCreateAPIToken(path string) (string, error) {
 		return "", fmt.Errorf("config: save api token %s: %w", path, err)
 	}
 	return tok, nil
-}
-
-// --- share ids ---------------------------------------------------------
-
-// NewShareID returns a random 8-byte hex-encoded (16 character) share id,
-// generated at share creation and stable for the share's life (SPEC.md §3).
-func NewShareID() (string, error) {
-	raw := make([]byte, 8)
-	if _, err := rand.Read(raw); err != nil {
-		return "", fmt.Errorf("config: generate share id: %w", err)
-	}
-	return hex.EncodeToString(raw), nil
 }

@@ -5,6 +5,8 @@
 package config
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -73,6 +75,16 @@ type Share struct {
 	// Access maps a peer's Ed25519 public key (hex) to "granted" or
 	// "denied".
 	Access map[string]string
+}
+
+// NewShareID returns a random 8-byte hex-encoded (16 character) share id,
+// generated at share creation and stable for the share's life (SPEC.md §3).
+func NewShareID() (string, error) {
+	raw := make([]byte, 8)
+	if _, err := rand.Read(raw); err != nil {
+		return "", fmt.Errorf("config: generate share id: %w", err)
+	}
+	return hex.EncodeToString(raw), nil
 }
 
 // Subscription is this node's decision to sync a peer's share into a local
@@ -180,15 +192,15 @@ func (c *Config) Validate() error {
 // configDoc mirrors Config for JSON encoding, using SPEC.md §3's
 // snake_case field names.
 type configDoc struct {
-	NodeName              string         `json:"node_name"`
-	APIAddr               string         `json:"api_addr"`
-	TrashRetentionDays    int            `json:"trash_retention_days"`
-	RescanIntervalSeconds int            `json:"rescan_interval_seconds"`
-	Debug                 bool           `json:"debug"`
-	GlobalIgnores         []string       `json:"global_ignores,omitempty"`
-	Peers                 []peerDoc      `json:"peers,omitempty"`
-	Shares                []shareDoc     `json:"shares,omitempty"`
-	Subscriptions         []subscription `json:"subscriptions,omitempty"`
+	NodeName              string            `json:"node_name"`
+	APIAddr               string            `json:"api_addr"`
+	TrashRetentionDays    int               `json:"trash_retention_days"`
+	RescanIntervalSeconds int               `json:"rescan_interval_seconds"`
+	Debug                 bool              `json:"debug"`
+	GlobalIgnores         []string          `json:"global_ignores,omitempty"`
+	Peers                 []peerDoc         `json:"peers,omitempty"`
+	Shares                []shareDoc        `json:"shares,omitempty"`
+	Subscriptions         []subscriptionDoc `json:"subscriptions,omitempty"`
 }
 
 // peerDoc mirrors Peer, except Enabled is a pointer so Unmarshal can tell
@@ -208,9 +220,9 @@ type shareDoc struct {
 	Access           map[string]string `json:"access,omitempty"`
 }
 
-// subscription mirrors Subscription 1:1 (no fields need pointer-defaulting)
-// so it doubles as both the doc and public type's field layout.
-type subscription struct {
+// subscriptionDoc mirrors Subscription 1:1 (no fields need
+// pointer-defaulting), so the two convert with a plain type conversion.
+type subscriptionDoc struct {
 	Peer      string `json:"peer"`
 	ShareID   string `json:"share_id"`
 	LocalPath string `json:"local_path"`
@@ -264,7 +276,7 @@ func configToDoc(cfg *Config) *configDoc {
 		})
 	}
 	for _, sub := range cfg.Subscriptions {
-		doc.Subscriptions = append(doc.Subscriptions, subscription(sub))
+		doc.Subscriptions = append(doc.Subscriptions, subscriptionDoc(sub))
 	}
 	return doc
 }
@@ -338,6 +350,8 @@ func Save(path string, cfg *Config) error {
 	return nil
 }
 
+// --- share/subscription overlap ----------------------------------------
+//
 // A directory that this node syncs down from a peer must not also be offered
 // back out as one of this node's own shares.
 //
@@ -353,8 +367,6 @@ func Save(path string, cfg *Config) error {
 // The rule is symmetric and covers nesting in both directions, because sharing
 // a parent of a subscribed directory re-exports its contents just as surely as
 // sharing the directory itself.
-
-// --- share/subscription overlap (see the block comment below) ----------
 
 // pathContains reports whether child is parent or lies beneath it. The
 // comparison is lexical after cleaning, so it is not fooled by "/a/code"
@@ -410,51 +422,6 @@ func (c *Config) CheckSubscriptionPath(localPath string) error {
 					"a directory received from another node cannot be offered back out",
 				localPath, s.Path, s.Name)
 		}
-	}
-	return nil
-}
-
-// --- atomic file writes ------------------------------------------------
-
-// writeFileAtomic writes data to path with the given permissions by writing
-// to a temp file in the same directory and renaming it into place, so a
-// concurrent reader (or a crash mid-write) never observes a partial file.
-// The parent directory is created (mode 0700) if it doesn't already exist.
-func writeFileAtomic(path string, data []byte, perm os.FileMode) (err error) {
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return fmt.Errorf("config: mkdir %s: %w", dir, err)
-	}
-
-	tmp, err := os.CreateTemp(dir, ".tmp-"+filepath.Base(path)+"-*")
-	if err != nil {
-		return fmt.Errorf("config: create temp file in %s: %w", dir, err)
-	}
-	tmpName := tmp.Name()
-	defer func() {
-		// Best-effort cleanup; no-op once the rename below succeeds.
-		if removeErr := os.Remove(tmpName); removeErr != nil && err == nil && !os.IsNotExist(removeErr) {
-			err = fmt.Errorf("config: cleanup temp file %s: %w", tmpName, removeErr)
-		}
-	}()
-
-	if _, err = tmp.Write(data); err != nil {
-		tmp.Close()
-		return fmt.Errorf("config: write temp file %s: %w", tmpName, err)
-	}
-	if err = tmp.Chmod(perm); err != nil {
-		tmp.Close()
-		return fmt.Errorf("config: chmod temp file %s: %w", tmpName, err)
-	}
-	if err = tmp.Sync(); err != nil {
-		tmp.Close()
-		return fmt.Errorf("config: sync temp file %s: %w", tmpName, err)
-	}
-	if err = tmp.Close(); err != nil {
-		return fmt.Errorf("config: close temp file %s: %w", tmpName, err)
-	}
-	if err = os.Rename(tmpName, path); err != nil {
-		return fmt.Errorf("config: rename %s to %s: %w", tmpName, path, err)
 	}
 	return nil
 }

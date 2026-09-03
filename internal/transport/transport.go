@@ -63,6 +63,8 @@ type Transport interface {
 	Close() error
 }
 
+// --- reconnect scheduling (SPEC.md §2.2) -------------------------------
+
 // Default schedule parameters (SPEC.md §2.2): dial every configured peer
 // continuously with exponential backoff, 1s initial, doubling, capped at
 // 5 minutes, jittered.
@@ -75,8 +77,6 @@ const (
 	// [(1-j)*d, d].
 	DefaultBackoffJitter = 0.5
 )
-
-// --- reconnect scheduling (SPEC.md §2.2) -------------------------------
 
 // Backoff computes the reconnect delay schedule from SPEC.md §2.2. It is a
 // pure, stateless value: [Backoff.NextDelay] takes the failure count and a

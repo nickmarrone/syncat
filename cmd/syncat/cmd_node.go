@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -23,7 +24,7 @@ import (
 
 // cmdInit implements `syncat init [--name NAME]`. It is idempotent: running
 // it again never regenerates existing keys, the api token, or an existing
-// config.toml's node name.
+// config.json's node name.
 func cmdInit(paths *config.Paths, args []string) error {
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
 	name := fs.String("name", "", "display name for this node (default: hostname)")
@@ -161,26 +162,50 @@ func cmdDaemon(paths *config.Paths, args []string) error {
 		return err
 	}
 
+	logger := log.New(os.Stderr, "syncat: ", log.LstdFlags)
+
+	nodeCtx, nodeCancel := context.WithCancel(context.Background())
+	defer nodeCancel()
+
+	n, httpServer, ln, err := startDaemon(nodeCtx, paths, *apiAddr, logger)
+	if err != nil {
+		return err
+	}
+
+	serveErrCh := make(chan error, 1)
+	go func() { serveErrCh <- httpServer.Serve(ln) }()
+
+	logger.Printf("node %q (short id %s) started", n.Status().NodeName, n.Status().ShortID)
+	logger.Printf("api listening on http://%s", ln.Addr().String())
+
+	waitAndShutdown(n, httpServer, serveErrCh, logger)
+	return nil
+}
+
+// startDaemon does cmdDaemon's construction half: load config (with the
+// --api override applied), load the tailcat key and api token, bind the
+// loopback API listener, build the transport, open the core.Node and
+// build the API server. The listener is bound but not yet served; the
+// caller starts Serve. On error nothing is left running.
+func startDaemon(nodeCtx context.Context, paths *config.Paths, apiAddr string, logger *log.Logger) (*core.Node, *http.Server, net.Listener, error) {
 	cfg, err := config.Load(paths.ConfigFile())
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("no config found at %s (run `syncat init` first): %w", paths.ConfigFile(), err)
+			return nil, nil, nil, fmt.Errorf("no config found at %s (run `syncat init` first): %w", paths.ConfigFile(), err)
 		}
-		return err
+		return nil, nil, nil, err
 	}
-	if *apiAddr != "" {
-		cfg.APIAddr = *apiAddr
+	if apiAddr != "" {
+		cfg.APIAddr = apiAddr
 	}
-
-	logger := log.New(os.Stderr, "syncat: ", log.LstdFlags)
 
 	tcKey, _, err := config.LoadOrCreateTailcatKey(context.Background(), paths.TailcatKeyFile())
 	if err != nil {
-		return fmt.Errorf("load tailcat key: %w", err)
+		return nil, nil, nil, fmt.Errorf("load tailcat key: %w", err)
 	}
 	apiToken, err := config.LoadOrCreateAPIToken(paths.APITokenFile())
 	if err != nil {
-		return fmt.Errorf("load api token: %w", err)
+		return nil, nil, nil, fmt.Errorf("load api token: %w", err)
 	}
 
 	// Bind the API listener before starting the node: a bad --api value
@@ -188,7 +213,7 @@ func cmdDaemon(paths *config.Paths, args []string) error {
 	// than after tailcat/index/watchers have already spun up.
 	ln, err := api.ListenLoopback(cfg.APIAddr)
 	if err != nil {
-		return err
+		return nil, nil, nil, err
 	}
 
 	// tailcat's own logging (netcheck reports, link-change/route-monitor
@@ -201,9 +226,6 @@ func cmdDaemon(paths *config.Paths, args []string) error {
 	}
 	tr := transport.NewTailcatTransport(tcKey, tcLogf)
 
-	nodeCtx, nodeCancel := context.WithCancel(context.Background())
-	defer nodeCancel()
-
 	n, err := core.Open(nodeCtx, core.Options{
 		Paths:     paths,
 		Config:    cfg,
@@ -212,18 +234,20 @@ func cmdDaemon(paths *config.Paths, args []string) error {
 	})
 	if err != nil {
 		ln.Close()
-		return fmt.Errorf("start node: %w", err)
+		return nil, nil, nil, fmt.Errorf("start node: %w", err)
 	}
 
 	srv := api.NewServer(n, apiToken, ln.Addr().String(), logger)
 	httpServer := &http.Server{Handler: srv.Handler()}
+	return n, httpServer, ln, nil
+}
 
-	serveErrCh := make(chan error, 1)
-	go func() { serveErrCh <- httpServer.Serve(ln) }()
-
-	logger.Printf("node %q (short id %s) started", n.Status().NodeName, n.Status().ShortID)
-	logger.Printf("api listening on http://%s", ln.Addr().String())
-
+// waitAndShutdown does cmdDaemon's run-and-stop half: block until
+// SIGINT/SIGTERM arrives or the API server's Serve returns on its own
+// (serveErrCh), then shut down in order — stop accepting new API requests
+// (bounded by shutdownGrace), then close the node, which itself waits for
+// every background goroutine before returning.
+func waitAndShutdown(n *core.Node, httpServer *http.Server, serveErrCh <-chan error, logger *log.Logger) {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(sigCh)
@@ -247,7 +271,6 @@ func cmdDaemon(paths *config.Paths, args []string) error {
 		logger.Printf("node close: %v", err)
 	}
 	logger.Printf("shutdown complete")
-	return nil
 }
 
 // cmdStatus implements `syncat status [--watch] [--json]` (SPEC.md §8).

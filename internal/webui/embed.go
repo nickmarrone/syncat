@@ -10,9 +10,9 @@ import (
 	"strings"
 )
 
-// Assets embeds internal/webui/static/ (SPEC.md §9's hand-written,
+// embedded holds internal/webui/static/ (SPEC.md §9's hand-written,
 // build-step-free single-page UI: index.html, app.js, style.css,
-// favicon.svg).
+// favicon.svg), still rooted at "static/". Use Assets instead.
 //
 //go:embed static
 var embedded embed.FS
@@ -63,7 +63,7 @@ var staticContentTypes = map[string]string{
 //
 // Auth: intentionally unauthenticated (mounted outside the api package's
 // auth() wrapper) — a browser has no X-Syncat-Token yet when it first
-// loads the page; see GET /ui-token in internal/api/handlers.go for how
+// loads the page; see GET /ui-token in internal/api/server.go for how
 // the page bootstraps one afterward. The daemon's loopback-only listener
 // (ListenLoopback) is what keeps this reachable only from the local
 // machine.

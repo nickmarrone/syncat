@@ -164,19 +164,9 @@ func cmdShareSet(paths *config.Paths, args []string) error {
 }
 
 // cmdSubscription implements `syncat subscription add|ls|rm|pause|resume`
-// (SPEC.md §8): the subscriber-side counterpart to `syncat share`, which
-// manages what this node offers.
-//
-// This is deliberately a noun with subcommands rather than the bare
-// `subscribe`/`unsubscribe` verbs it replaces. Every other collection the
-// daemon exposes is already shaped that way on both sides of the API —
-// `syncat peer` over /api/peers, `syncat share` over /api/shares — and the
-// two loose verbs meant the subscription collection alone had no obvious
-// home for its list, pause and resume operations. The REST API was never
-// the inconsistent part; the CLI was.
-//
-// PEER and SHARE are references in the sense of internal/core/mutations.go:
-// a canonical id, a display name, or a unique id prefix.
+// (SPEC.md §8): the subscriber-side counterpart to `syncat share`. PEER and
+// SHARE are references in the sense of internal/core/resolve.go: a
+// canonical id, a display name, or a unique id prefix.
 func cmdSubscription(paths *config.Paths, args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("usage: syncat subscription add PEER SHARE LOCALPATH [--mode mirror|receive] | ls | rm PEER SHARE | pause PEER SHARE | resume PEER SHARE")
@@ -316,17 +306,9 @@ func subscriptionPath(peer, shareID string) string {
 }
 
 // cmdTrash implements `syncat trash ls SHARE` and `syncat trash restore
-// SHARE PATH` (SPEC.md §7/§8).
-//
-// This used to operate directly on the on-disk trash and index,
-// independent of whether a daemon was running (the same way `syncat
-// token`/`syncat init` work offline against config and keys alone). Now
-// that the REST API exists, trash is a thin API client like every other
-// syncat subcommand (SPEC.md §1) rather than a second, divergent code
-// path that touches the SQLite index directly — which would also race a
-// live daemon's own index access if one happened to be running at the
-// same time. The user-visible change: `syncat trash` now requires the daemon
-// to be running, same as `peer`/`share`/`status`/etc.
+// SHARE PATH` (SPEC.md §7/§8) as a thin API client, so like the other
+// daemon-backed subcommands (`peer`, `share`, `status`, ...) it requires a
+// running daemon.
 func cmdTrash(paths *config.Paths, args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("usage: syncat trash ls SHARE | syncat trash restore SHARE PATH")

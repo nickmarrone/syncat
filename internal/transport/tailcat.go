@@ -105,6 +105,51 @@ func (t *TailcatTransport) Start(ctx context.Context, onConn func(net.Conn)) err
 	}
 }
 
+// clientFor returns the [tailcat.Client] for addr, creating and caching it
+// on first use. Reusing one Client per peer (rather than building one per
+// dial attempt) avoids repeating its WireGuard/DERP setup and lets it keep
+// its connection to the peer warm across repeated dials.
+//
+// Deliberately leaves Client.Key unset rather than reusing t.key.Private
+// (this node's own server identity): tailcat.Client's doc comment says an
+// unset Key gets "a new ephemeral key ... generated at first use", and
+// that's required here, not optional. DERP routes packets to a node key by
+// delivering to whichever local connection most recently registered under
+// it; every locoBackend that needs to receive unsolicited inbound traffic
+// (this transport's own Server, plus one per-peer Client per configured
+// peer, since each independently dials and keeps a "home" DERP connection
+// alive) needs a *distinct* key, or their DERP registrations keep
+// stealing each other's routing slot. Concretely: reusing the server's
+// key here meant that the moment any client (i.e. any dial — including
+// one started well after Start, like Node.AddPeer's) registered with
+// DERP, it silently superseded the server's own registration, so a
+// MeowPing another peer sent us landed on a Client's locoBackend instead
+// of the Server's — and Client.onDERPRecv explicitly ignores MeowPing
+// ("client ignores MeowPing"). The sender then just sits on
+// Client.Ping's unconditional 10s internal timeout, forever, with no
+// error surfaced anywhere below dialAttempt. See internal/core/peer.go's
+// dialAttempt and the regression test for the full failure mode.
+func (t *TailcatTransport) clientFor(addr string) (*tailcat.Client, error) {
+	if addr == "" {
+		return nil, errors.New("transport: tailcat: dial: address must not be empty")
+	}
+
+	t.clientsMu.Lock()
+	defer t.clientsMu.Unlock()
+	if c, ok := t.clients[addr]; ok {
+		return c, nil
+	}
+	c := &tailcat.Client{
+		Server: tailcat.ConnBlob(addr),
+		Logf:   t.logf,
+	}
+	if t.clients == nil {
+		t.clients = make(map[string]*tailcat.Client)
+	}
+	t.clients[addr] = c
+	return c, nil
+}
+
 func (t *TailcatTransport) Dial(ctx context.Context, addr string) (net.Conn, error) {
 	c, err := t.clientFor(addr)
 	if err != nil {
@@ -166,51 +211,6 @@ func (t *TailcatTransport) discardClient(addr string, c *tailcat.Client) {
 	if c != nil {
 		_ = c.Close()
 	}
-}
-
-// clientFor returns the [tailcat.Client] for addr, creating and caching it
-// on first use. Reusing one Client per peer (rather than building one per
-// dial attempt) avoids repeating its WireGuard/DERP setup and lets it keep
-// its connection to the peer warm across repeated dials.
-//
-// Deliberately leaves Client.Key unset rather than reusing t.key.Private
-// (this node's own server identity): tailcat.Client's doc comment says an
-// unset Key gets "a new ephemeral key ... generated at first use", and
-// that's required here, not optional. DERP routes packets to a node key by
-// delivering to whichever local connection most recently registered under
-// it; every locoBackend that needs to receive unsolicited inbound traffic
-// (this transport's own Server, plus one per-peer Client per configured
-// peer, since each independently dials and keeps a "home" DERP connection
-// alive) needs a *distinct* key, or their DERP registrations keep
-// stealing each other's routing slot. Concretely: reusing the server's
-// key here meant that the moment any client (i.e. any dial — including
-// one started well after Start, like Node.AddPeer's) registered with
-// DERP, it silently superseded the server's own registration, so a
-// MeowPing another peer sent us landed on a Client's locoBackend instead
-// of the Server's — and Client.onDERPRecv explicitly ignores MeowPing
-// ("client ignores MeowPing"). The sender then just sits on
-// Client.Ping's unconditional 10s internal timeout, forever, with no
-// error surfaced anywhere below dialAttempt. See internal/core/peer.go's
-// dialAttempt and the regression test for the full failure mode.
-func (t *TailcatTransport) clientFor(addr string) (*tailcat.Client, error) {
-	if addr == "" {
-		return nil, errors.New("transport: tailcat: dial: address must not be empty")
-	}
-
-	t.clientsMu.Lock()
-	defer t.clientsMu.Unlock()
-	if c, ok := t.clients[addr]; ok {
-		return c, nil
-	}
-	c := &tailcat.Client{
-		Server: tailcat.ConnBlob(addr),
-		Logf:   t.logf,
-	}
-	if t.clients == nil {
-		t.clients = make(map[string]*tailcat.Client)
-	}
-	t.clients[addr] = c
-	return c, nil
 }
 
 // DiscardPeer implements Transport. Unlike discardClient it is

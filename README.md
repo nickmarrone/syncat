@@ -199,7 +199,7 @@ don't work:
   Unix" is not implemented in this build.
 - **Transfer resume.** `FileRequest.offset` is always sent as 0; an
   interrupted transfer restarts from the beginning rather than resuming
-  (`internal/sync/session.go`). The `pending_transfers` table exists in the
+  (`internal/sync/transfer.go`). The `pending_transfers` table exists in the
   schema for it, but nothing reads or writes it yet.
 - **Transfer progress in the status surface.** SPEC.md §8 lists transfer
   stats on `GET /api/status` and §9 wants progress bars on the dashboard.
@@ -309,18 +309,20 @@ daemons on any exit path and dumps the relevant daemon log tail on failure.
 
 ## Project layout
 
-Nine packages, 30 source files. Every package is small enough to list in full:
+Nine packages, 35 source files. Every package is small enough to list in
+full; [ARCHITECTURE.md](ARCHITECTURE.md) explains how they fit together and
+walks the main flows.
 
 | Package | Files |
 |---|---|
 | `cmd/syncat/` | `main.go` (subcommand dispatch, stdlib `flag`, no cobra) · `client.go` (REST client + response shapes) · `cmd_node.go` (`init`/`token`/`daemon`/`status`/`config`) · `cmd_peer.go` (`peer`/`remote`/`approvals`) · `cmd_share.go` (`share`/`subscription`/`trash`) |
-| `internal/core/` | `node.go` (lifecycle, accept path, clock adapters) · `mutations.go` (the config-mutation API the REST layer calls, plus name/prefix reference resolution) · `peer.go` (per-peer dial/dedup/keepalive state machine) · `shares.go` (share dirs → scanner/watcher) · `status.go` (the read-only snapshot) — gomobile-safe, no UI/CLI deps |
+| `internal/core/` | `node.go` (lifecycle, accept path, clock adapters) · `mutations.go` (the config-mutation API the REST layer calls) · `resolve.go` (names and id prefixes → ids) · `peer.go` (per-peer dial/dedup/keepalive state machine) · `access.go` (share-access negotiation: ShareList/SubscribeRequest/AccessUpdate) · `shares.go` (share dirs → scanner/watcher) · `status.go` (the read-only snapshot) — gomobile-safe, no UI/CLI deps |
 | `internal/transport/` | `transport.go` (`Transport` interface, backoff/supervisor, dedup tie-break) · `tailcat.go` (production carrier) · `pipe.go` (loopback-TCP transport used by every package's tests) |
-| `internal/protocol/` | `message.go` (message types + frame codec) · `stream.go` (bounded, prioritized session writer) · `handshake.go` (mutual Ed25519 auth + keepalive) |
+| `internal/protocol/` | `message.go` (message types + frame codec) · `stream.go` (bounded, prioritized session writer) · `handshake.go` (mutual Ed25519 auth) · `keepalive.go` (Ping/Pong idle and dead timing) |
 | `internal/index/` | `store.go` (SQLite schema, `files`, `peer_files`) · `scanner.go` (tree walk, hashing, ignore matching) · `watcher.go` (`fsnotify` + debounce + periodic rescan) |
-| `internal/sync/` | `reconcile.go` (version vectors, actions, conflict naming, the reconciler — all pure, no I/O) · `session.go` (one peer connection: index exchange, pulls, serving) · `apply.go` (writing results to disk) · `path.go` (the single validation gate for peer-supplied relpaths) · `trash.go` (trash can + janitor) |
-| `internal/config/` | `config.go` (schema, JSON encoding, load/save, re-share guard, atomic writes) · `keys.go` (identity key, tailcat key, `sc1` tokens, API token, share ids) · `paths.go` (XDG layout) |
-| `internal/api/` | `server.go` (routing, auth, HTTP concerns) · `handlers.go` (endpoint handlers + JSON DTOs) |
+| `internal/sync/` | `reconcile.go` (version vectors, actions, conflict naming, the reconciler — all pure, no I/O) · `session.go` (one peer connection: lifecycle, read loop, index exchange) · `transfer.go` (pulling and serving file bytes) · `apply.go` (writing results to disk) · `path.go` (the single validation gate for peer-supplied relpaths) · `trash.go` (trash can + janitor) |
+| `internal/config/` | `config.go` (schema, JSON encoding, load/save, re-share guard, share ids) · `keys.go` (identity key, tailcat key, `sc1` tokens, API token) · `paths.go` (XDG layout, atomic writes) |
+| `internal/api/` | `server.go` (routing, auth, `/ui-token`, HTTP helpers) · `handlers.go` (one handler per endpoint) · `dto.go` (the JSON shapes every response goes through) |
 | `internal/webui/` | `embed.go` + `static/` — `go:embed`-ed single-page UI (vanilla HTML/CSS/JS, no build step) |
 
 Files long enough to need it open their sections with `// --- name ---`
