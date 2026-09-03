@@ -332,6 +332,10 @@ func (n *Node) startConfiguredWatches(cfg *config.Config) {
 // startConfiguredPeers builds a peerConn for every peer in cfg, registers
 // it, and starts the dial supervisor for each enabled one. A peer whose
 // token cannot be parsed is logged and skipped.
+//
+// The transport is already accepting by the time this runs (see Open's
+// ordering), so handleAccept may be calling lookupPeer concurrently; every
+// write to n.peers takes peersMu, exactly as AddPeer does.
 func (n *Node) startConfiguredPeers(cfg *config.Config) {
 	for _, p := range cfg.Peers {
 		pc, err := newPeerConn(n, p)
@@ -339,7 +343,9 @@ func (n *Node) startConfiguredPeers(cfg *config.Config) {
 			n.logger.Printf("core: open: configure peer %s: %v", p.Name, err)
 			continue
 		}
+		n.peersMu.Lock()
 		n.peers[pc.peerKeyHex] = pc
+		n.peersMu.Unlock()
 		// AddPeer rejects our own token, but a config.json written before
 		// that check existed (or edited by hand) can still carry one, and
 		// dialing ourselves fails in a uniquely silent way: the handshake
