@@ -129,12 +129,15 @@ All syncat traffic runs over a single TCP stream inside the tailcat tunnel:
 Control payloads are CBOR (fxamacker/cbor); `FileChunk` payloads are raw bytes
 preceded by a small CBOR header (own type byte). Max frame 4 MiB.
 
-**Handshake (mutual auth):**
-1. Both sides immediately send `Hello{proto_version:1, node_name, ed25519_pub, token, nonce[32]}`.
-2. Both reply `Auth{sig = Ed25519.Sign(identity_key, "syncat-auth-v1" || their_nonce || my_nonce)}`.
-3. Each verifies the signature against the pubkey it has configured for this peer
-   (or records a pending peer and closes, §2). `proto_version` mismatch: use
-   `min(theirs, mine)` if supported, else close with `Error`.
+**Handshake (mutual auth, v2):**
+1. The dialer sends `Hello{proto_version:2, node_name, ed25519_pub, token, nonce[32]}`.
+2. The acceptor validates it and sends one `HelloAuth{hello, sig}` frame. The
+   signature covers the role-labelled hash of both Hellos and the negotiated version.
+3. The dialer validates the acceptor and sends `Auth{sig}` over the same transcript
+   with the client-proof role. The acceptor verifies it and sends `Finished`.
+4. A rejection is sent only while the other endpoint is waiting for a response.
+   Error delivery is deadline-bounded and followed by close. `proto_version`
+   mismatch uses `min(theirs, mine)` if supported, otherwise `Error`.
 
 **Messages after handshake:**
 

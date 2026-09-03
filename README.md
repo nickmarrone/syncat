@@ -153,23 +153,11 @@ text, and why:
 - **`PATCH /api/node` was added.** SPEC.md §8's endpoint list omits it, but
   §9's dashboard requires an editable node name, and `core.Node` already
   exposed `RenameNode`. Wired up in `internal/api/server.go`/`handlers.go`.
-- **The test transport is loopback TCP, not `net.Pipe`.** SPEC.md §10/§13
-  name `net.Pipe` for the test transport, but the stdlib pipe is synchronous
-  and unbuffered: a write blocks until the other end reads. SPEC.md §4 has
-  both sides of the handshake send `Hello` before either reads, which
-  deadlocks on a bare `net.Pipe`. `transport.PipeTransport` keeps SPEC's
-  address-registry shape — peers still find each other by an address string,
-  standing in for a tailcat ConnBlob — but each transport listens on
-  `127.0.0.1:0` and connections are real sockets
-  (`internal/transport/pipe.go`). A hand-rolled buffered `net.Conn` was
-  tried first and is what the loopback listener replaced: it has to
-  re-implement all of `net.Conn`, and the parts it got wrong were invisible
-  — a deadline armed against an already-blocked `Read` did nothing (which is
-  exactly how `protocol.Handshake` cancels), and writes to a departed peer
-  never failed. Both are now pinned by tests
-  (`TestPipeTransportReadDeadlineInterruptsBlockedRead`,
-  `TestPipeTransportWriteFailsAfterPeerClose`,
-  `TestHandshakeAbortsOnContextCancel`).
+- **The test transport uses `net.Pipe`.** Its address registry still stands
+  in for tailcat ConnBlobs. The v2 handshake assigns dialer/acceptor roles
+  and alternates Hello, HelloAuth, Auth, and Finished, so every synchronous
+  pipe write has a waiting reader. This also makes invalid ordering visible
+  in tests instead of hiding it behind a TCP send buffer.
 - **`syncat trash` now requires a running daemon.** SPEC.md's original phase
   plan had it operate directly on the on-disk trash/index, independent of a
   daemon (like `init`/`token`). Once the REST API existed, that would have
@@ -242,7 +230,7 @@ item, in the order it is worth doing.
    ("until a key is allowed, all clients are allowed"), and `AddAllowedClient`
    is unavailable to us because client keys must be ephemeral for DERP
    routing (see `TailcatTransport.clientFor`). The signed transcript is
-   `"syncat-auth-v1" || their_nonce || our_nonce` and names neither endpoint's
+   v2 transcript binds both role-labelled Hellos but names neither endpoint's
    tailcat identity, so an attacker who alters the `tc` field of a token in
    transit — tokens are pasted over chat and email — can relay both
    handshakes between two honest nodes over two separate tunnels and sit in
@@ -317,7 +305,7 @@ walks the main flows.
 |---|---|
 | `cmd/syncat/` | `main.go` (subcommand dispatch, stdlib `flag`, no cobra) · `client.go` (REST client + response shapes) · `cmd_node.go` (`init`/`token`/`daemon`/`status`/`config`) · `cmd_peer.go` (`peer`/`remote`/`approvals`) · `cmd_share.go` (`share`/`subscription`/`trash`) |
 | `internal/core/` | `node.go` (lifecycle, accept path, clock adapters) · `mutations.go` (the config-mutation API the REST layer calls) · `resolve.go` (names and id prefixes → ids) · `peer.go` (per-peer dial/dedup/keepalive state machine) · `access.go` (share-access negotiation: ShareList/SubscribeRequest/AccessUpdate) · `shares.go` (share dirs → scanner/watcher) · `status.go` (the read-only snapshot) — gomobile-safe, no UI/CLI deps |
-| `internal/transport/` | `transport.go` (`Transport` interface, backoff/supervisor, dedup tie-break) · `tailcat.go` (production carrier) · `pipe.go` (loopback-TCP transport used by every package's tests) |
+| `internal/transport/` | `transport.go` (`Transport` interface, backoff/supervisor, dedup tie-break) · `tailcat.go` (production carrier) · `pipe.go` (`net.Pipe` transport used by every package's tests) |
 | `internal/protocol/` | `message.go` (message types + frame codec) · `stream.go` (bounded, prioritized session writer) · `handshake.go` (mutual Ed25519 auth) · `keepalive.go` (Ping/Pong idle and dead timing) |
 | `internal/index/` | `store.go` (SQLite schema, `files`, `peer_files`) · `scanner.go` (tree walk, hashing, ignore matching) · `watcher.go` (`fsnotify` + debounce + periodic rescan) |
 | `internal/sync/` | `reconcile.go` (version vectors, actions, conflict naming, the reconciler — all pure, no I/O) · `session.go` (one peer connection: lifecycle, read loop, index exchange) · `transfer.go` (pulling and serving file bytes) · `apply.go` (writing results to disk) · `path.go` (the single validation gate for peer-supplied relpaths) · `trash.go` (trash can + janitor) |

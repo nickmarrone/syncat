@@ -74,7 +74,7 @@ implementation uses JSON to stay inside the dependency budget (README
 |---|---|
 | `transport.go` | The `Transport` interface (`Start`/`Dial`/`DiscardPeer`/`LocalAddress`/`Close`); `Backoff` and `Supervisor` (the dial-with-exponential-backoff loop, §2.2); `KeepConnection`, the duplicate-connection tie-break (§2.4) |
 | `tailcat.go` | `TailcatTransport`, the production carrier. Its long comments record hard-won facts about tailcat client lifetimes and DERP key collisions; read them before touching it |
-| `pipe.go` | `PipeTransport`, used by every other package's tests. Real loopback TCP sockets behind an address registry, because `net.Pipe` deadlocks the handshake (README "Deviations") |
+| `pipe.go` | `PipeTransport`, used by every other package's tests. Address registry plus stdlib `net.Pipe`; the ordered v2 handshake has no simultaneous writes |
 
 `KeepConnection` deserves a sentence: when two nodes dial each other at
 once, each side independently computes the same answer about which of the
@@ -192,8 +192,9 @@ Each `peerConn` runs `transport.Supervisor`, which calls `dialAttempt`
 with exponential backoff (1s → 5min, jittered). Inbound connections arrive
 via `Node.onAccept`. Both paths converge on the same steps:
 
-1. `protocol.Handshake` over the raw conn. Both sides send `Hello`, then
-   sign `"syncat-auth-v1" || their_nonce || our_nonce`. `IsKnownPeer`
+1. The dialer runs `protocol.InitiateHandshake` and the acceptor runs
+   `protocol.AcceptHandshake`. Their ordered Hello/HelloAuth/Auth/Finished
+   exchange signs a role-labelled transcript of both Hellos. `IsKnownPeer`
    rejects an inbound key we did not configure; the rejection is recorded
    for the UI (`RejectedConnection`).
 2. `peerConn.offer`: `transport.KeepConnection` decides whether this

@@ -1,6 +1,6 @@
 // Package transport abstracts peer connectivity behind a Transport
 // interface, with a tailcat implementation for production (tailcat.go)
-// and a loopback-TCP implementation for tests (pipe.go) — SPEC.md §10.
+// and an in-process net.Pipe implementation for tests (pipe.go) — SPEC.md §10.
 // It also owns the reconnect schedule (Backoff/Supervisor) and SPEC.md
 // §2.4's duplicate-connection tie-break (KeepConnection).
 package transport
@@ -20,7 +20,7 @@ import (
 // Transport abstracts peer connectivity (SPEC.md §10) so the sync core and
 // everything above it never talks to tailcat, or any other carrier,
 // directly. [TailcatTransport] is the production implementation; a
-// [PipeTransport] backed by a loopback socket stands in for it in
+// [PipeTransport] backed by net.Pipe stands in for it in
 // tests. A future mobile-native carrier need only satisfy this interface.
 //
 // Per SPEC.md §4, one Transport connection (whether returned by Dial or
