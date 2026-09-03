@@ -238,7 +238,7 @@ func (s *StreamWriter) enqueue(typ MsgType, frame []byte) error {
 // control costs a queue slot, while a frame wrongly treated as bulk can
 // delay a keepalive.
 func isBulk(typ MsgType) bool {
-	return typ == MsgFileChunk || typ == MsgIndexUpdate
+	return typ == MsgFileChunk || typ == MsgIndexUpdate || typ == MsgIndexSnapshotBegin || typ == MsgIndexSnapshotBatch || typ == MsgIndexSnapshotEnd || typ == MsgIndexDeltaBatch
 }
 
 // run is the single writer goroutine: drain ctrl to empty, then take one
