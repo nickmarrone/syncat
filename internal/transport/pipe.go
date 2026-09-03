@@ -124,10 +124,6 @@ func acceptLoop(ln net.Listener, onConn func(net.Conn)) {
 	}
 }
 
-// DiscardPeer implements Transport. PipeTransport caches nothing per peer
-// — every Dial goes straight to the registry — so there is nothing to drop.
-func (t *PipeTransport) DiscardPeer(string) {}
-
 func (t *PipeTransport) Dial(ctx context.Context, addr string) (net.Conn, error) {
 	v, ok := pipeRegistry.Load(addr)
 	if !ok {
@@ -151,6 +147,10 @@ func (t *PipeTransport) Dial(ctx context.Context, addr string) (net.Conn, error)
 	}
 	return conn, nil
 }
+
+// DiscardPeer implements Transport. PipeTransport caches nothing per peer
+// — every Dial goes straight to the registry — so there is nothing to drop.
+func (t *PipeTransport) DiscardPeer(string) {}
 
 // LocalAddress implements Transport. It returns the registry key — the
 // address peers dial, and the tailcat ConnBlob's stand-in inside a node
