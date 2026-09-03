@@ -22,9 +22,7 @@ import (
 var pipeAddrCounter int64
 
 // newPipeConnPair returns two connected net.Conns, as if a dialed b, over
-// internal/transport's PipeTransport (a pair of loopback sockets — not a
-// bare net.Pipe, which would deadlock on the handshake's "both sides send
-// Hello immediately" requirement).
+// internal/transport's net.Pipe-backed PipeTransport.
 func newPipeConnPair(t *testing.T) (a, b net.Conn) {
 	t.Helper()
 	ctx := context.Background()
@@ -98,11 +96,11 @@ func runBothHandshakes(t *testing.T, connA, connB net.Conn, cfgA, cfgB Handshake
 	chA := make(chan error, 1)
 	chB := make(chan error, 1)
 	go func() {
-		_, err := Handshake(context.Background(), connA, cfgA)
+		_, err := InitiateHandshake(context.Background(), connA, cfgA)
 		chA <- err
 	}()
 	go func() {
-		_, err := Handshake(context.Background(), connB, cfgB)
+		_, err := AcceptHandshake(context.Background(), connB, cfgB)
 		chB <- err
 	}()
 	select {
@@ -176,11 +174,11 @@ func TestHandshakeHappyPath(t *testing.T) {
 	chA := make(chan outcome, 1)
 	chB := make(chan outcome, 1)
 	go func() {
-		res, err := Handshake(context.Background(), connA, cfgA)
+		res, err := InitiateHandshake(context.Background(), connA, cfgA)
 		chA <- outcome{res, err}
 	}()
 	go func() {
-		res, err := Handshake(context.Background(), connB, cfgB)
+		res, err := AcceptHandshake(context.Background(), connB, cfgB)
 		chB <- outcome{res, err}
 	}()
 
@@ -252,21 +250,19 @@ func TestHandshakeRejectsForgedSignature(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		_, err := Handshake(context.Background(), connA, cfgA)
+		_, err := AcceptHandshake(context.Background(), connA, cfgA)
 		errCh <- err
 	}()
 
 	fw := NewWriter(connB)
 	fr := NewReader(connB)
 
-	readFrame(t, fr) // drain A's real Hello
-
 	nonceM := mustNonce(t)
-	if err := fw.WriteMessage(MsgHello, Hello{ProtoVersion: 1, NodeName: "mallory", Ed25519Pub: pubM, Token: tokM, Nonce: nonceM}); err != nil {
+	if err := fw.WriteMessage(MsgHello, Hello{ProtoVersion: CurrentProtoVersion, NodeName: "mallory", Ed25519Pub: pubM, Token: tokM, Nonce: nonceM}); err != nil {
 		t.Fatalf("write hello: %v", err)
 	}
 
-	readFrame(t, fr) // drain A's real Auth
+	readFrame(t, fr) // drain A's HelloAuth
 
 	garbage := make([]byte, ed25519.SignatureSize)
 	if _, err := rand.Read(garbage); err != nil {
@@ -324,22 +320,20 @@ func TestHandshakeRejectsReflectedSignature(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		_, err := Handshake(context.Background(), connA, cfgA)
+		_, err := AcceptHandshake(context.Background(), connA, cfgA)
 		errCh <- err
 	}()
 
 	fw := NewWriter(connB)
 	fr := NewReader(connB)
 
-	readFrame(t, fr) // drain A's real Hello
-
 	claimNonce := mustNonce(t)
-	if err := fw.WriteMessage(MsgHello, Hello{ProtoVersion: 1, NodeName: "mallory-as-alice", Ed25519Pub: pubA, Token: tokA, Nonce: claimNonce}); err != nil {
+	if err := fw.WriteMessage(MsgHello, Hello{ProtoVersion: CurrentProtoVersion, NodeName: "mallory-as-alice", Ed25519Pub: pubA, Token: tokA, Nonce: claimNonce}); err != nil {
 		t.Fatalf("write hello: %v", err)
 	}
 
-	_, authPayload := readFrame(t, fr) // A's real Auth
-	var authA Auth
+	_, authPayload := readFrame(t, fr) // A's HelloAuth
+	var authA HelloAuth
 	if err := DecodeMessage(authPayload, &authA); err != nil {
 		t.Fatalf("decode A's auth: %v", err)
 	}
@@ -411,18 +405,15 @@ func TestHandshakeRejectsWrongLengthPubkey(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		_, err := Handshake(context.Background(), connA, cfgA)
+		_, err := AcceptHandshake(context.Background(), connA, cfgA)
 		errCh <- err
 	}()
 
 	fw := NewWriter(connB)
-	fr := NewReader(connB)
-	readFrame(t, fr) // drain A's Hello
-
 	_, somePub := newTestIdentity(t)
 	badTok := mustToken(t, somePub, "bad") // a validly-shaped token, unrelated to the truncated key below
 	badPub := somePub[:16]                 // wrong length: 16, not 32
-	if err := fw.WriteMessage(MsgHello, Hello{ProtoVersion: 1, NodeName: "x", Ed25519Pub: badPub, Token: badTok, Nonce: mustNonce(t)}); err != nil {
+	if err := fw.WriteMessage(MsgHello, Hello{ProtoVersion: CurrentProtoVersion, NodeName: "x", Ed25519Pub: badPub, Token: badTok, Nonce: mustNonce(t)}); err != nil {
 		t.Fatalf("write hello: %v", err)
 	}
 
@@ -451,17 +442,14 @@ func TestHandshakeRejectsAllZeroPubkey(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		_, err := Handshake(context.Background(), connA, cfgA)
+		_, err := AcceptHandshake(context.Background(), connA, cfgA)
 		errCh <- err
 	}()
 
 	fw := NewWriter(connB)
-	fr := NewReader(connB)
-	readFrame(t, fr) // drain A's Hello
-
 	zeroPub := make(ed25519.PublicKey, ed25519.PublicKeySize)
 	zeroTok := mustToken(t, zeroPub, "zero")
-	if err := fw.WriteMessage(MsgHello, Hello{ProtoVersion: 1, NodeName: "zero", Ed25519Pub: zeroPub, Token: zeroTok, Nonce: mustNonce(t)}); err != nil {
+	if err := fw.WriteMessage(MsgHello, Hello{ProtoVersion: CurrentProtoVersion, NodeName: "zero", Ed25519Pub: zeroPub, Token: zeroTok, Nonce: mustNonce(t)}); err != nil {
 		t.Fatalf("write hello: %v", err)
 	}
 
@@ -488,18 +476,15 @@ func TestHandshakeRejectsTokenPubkeyMismatch(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		_, err := Handshake(context.Background(), connA, cfgA)
+		_, err := AcceptHandshake(context.Background(), connA, cfgA)
 		errCh <- err
 	}()
 
 	fw := NewWriter(connB)
-	fr := NewReader(connB)
-	readFrame(t, fr) // drain A's Hello
-
 	_, pub1 := newTestIdentity(t)
 	_, pub2 := newTestIdentity(t)
 	tokForPub2 := mustToken(t, pub2, "mismatch")
-	if err := fw.WriteMessage(MsgHello, Hello{ProtoVersion: 1, NodeName: "x", Ed25519Pub: pub1, Token: tokForPub2, Nonce: mustNonce(t)}); err != nil {
+	if err := fw.WriteMessage(MsgHello, Hello{ProtoVersion: CurrentProtoVersion, NodeName: "x", Ed25519Pub: pub1, Token: tokForPub2, Nonce: mustNonce(t)}); err != nil {
 		t.Fatalf("write hello: %v", err)
 	}
 

@@ -205,7 +205,7 @@ func (pc *peerConn) dialAttempt(ctx context.Context) error {
 		return fmt.Errorf("dial: %w", err)
 	}
 
-	result, err := protocol.Handshake(ctx, conn, protocol.HandshakeConfig{
+	result, err := protocol.InitiateHandshake(ctx, conn, protocol.HandshakeConfig{
 		IdentityKey: pc.node.identity.Private,
 		NodeName:    pc.node.nodeName(),
 		Token:       pc.node.localToken(),

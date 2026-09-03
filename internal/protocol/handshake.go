@@ -9,9 +9,12 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"time"
 
 	"github.com/nickmarrone/syncat/internal/config"
@@ -19,7 +22,7 @@ import (
 
 // CurrentProtoVersion is the syncat wire protocol version this build
 // speaks (SPEC.md §4).
-const CurrentProtoVersion = 1
+const CurrentProtoVersion = 2
 
 // DefaultHandshakeTimeout bounds the whole handshake (SPEC.md §4): a peer
 // that opens a connection and says nothing must not pin a goroutine
@@ -32,7 +35,7 @@ const nonceSize = 32
 // authContext domain-separates the handshake signature from any other use
 // of the node's Ed25519 identity key, and from any other version of this
 // protocol that might reuse the same key.
-const authContext = "syncat-auth-v1"
+const authContext = "syncat-handshake-v2"
 
 // --- the mutually-authenticated handshake (SPEC.md §4) -----------------
 
@@ -89,20 +92,10 @@ type HandshakeResult struct {
 	ProtoVersion int
 }
 
-// Handshake runs the mutually-authenticated syncat handshake (SPEC.md §4)
-// over conn:
-//
-//  1. Both sides immediately send Hello (this call sends ours in a
-//     background goroutine while concurrently reading the peer's, so
-//     neither side blocks waiting for the other to go first).
-//  2. Each side validates the peer's Hello (proto_version negotiation,
-//     well-formed ed25519_pub, token consistency, known-peer check) and,
-//     if that passes, sends Auth: a signature over a nonce transcript
-//     that binds both sides' nonces in a fixed, direction-dependent order
-//     (see the comment on the signing step below — this is what makes a
-//     reflected/replayed Auth fail verification).
-//  3. Each side verifies the peer's Auth signature against the peer's
-//     claimed public key.
+// The v2 handshake is role ordered. The initiator sends Hello; the
+// responder returns one atomic HelloAuth; the initiator returns Auth; and
+// the responder confirms it with Finished. Every write therefore has a
+// reader already waiting, including over an unbuffered net.Pipe.
 //
 // On any validation failure this side sends an Error frame (best-effort;
 // its own failure is ignored) and returns a non-nil error; the caller
@@ -125,7 +118,21 @@ type HandshakeResult struct {
 //
 // On failure the deadline is left as-is; the caller owns conn and must
 // close it.
+func InitiateHandshake(ctx context.Context, conn net.Conn, cfg HandshakeConfig) (*HandshakeResult, error) {
+	return handshake(ctx, conn, cfg, true)
+}
+
+func AcceptHandshake(ctx context.Context, conn net.Conn, cfg HandshakeConfig) (*HandshakeResult, error) {
+	return handshake(ctx, conn, cfg, false)
+}
+
+// Handshake is retained as the initiator entry point for source compatibility.
+// New code should use InitiateHandshake or AcceptHandshake explicitly.
 func Handshake(ctx context.Context, conn net.Conn, cfg HandshakeConfig) (*HandshakeResult, error) {
+	return InitiateHandshake(ctx, conn, cfg)
+}
+
+func handshake(ctx context.Context, conn net.Conn, cfg HandshakeConfig, initiator bool) (*HandshakeResult, error) {
 	if len(cfg.IdentityKey) != ed25519.PrivateKeySize {
 		return nil, fmt.Errorf("protocol: handshake: identity key must be %d bytes, got %d", ed25519.PrivateKeySize, len(cfg.IdentityKey))
 	}
@@ -167,58 +174,69 @@ func Handshake(ctx context.Context, conn net.Conn, cfg HandshakeConfig) (*Handsh
 		Nonce:        ourNonce,
 	}
 
-	peerHello, err := exchangeHello(fw, fr, ourHello)
-	if err != nil {
-		return nil, err
+	var peerHello Hello
+	var deferredServerSig []byte
+	if initiator {
+		if err := fw.WriteMessage(MsgHello, ourHello); err != nil {
+			return nil, fmt.Errorf("protocol: handshake: send hello: %w", err)
+		}
+		var response HelloAuth
+		if err := readMessage(fr, MsgAuth, &response); err != nil {
+			return nil, err
+		}
+		peerHello = response.Hello
+		// Retain the proof until validation establishes the claimed key.
+		deferredServerSig = response.Sig
+	} else {
+		if err := readMessage(fr, MsgHello, &peerHello); err != nil {
+			return nil, err
+		}
 	}
 
-	if err := validateHelloShape(peerHello); err != nil {
-		sendError(fw, ErrCodeBadHello, err.Error())
+	// Validate before sending our identity. On rejection the initiator is
+	// waiting for a response, so this Error write always has a reader.
+	if err := validatePeerHello(cfg, ourVersion, minVersion, peerHello); err != nil {
+		sendError(conn, fw, errorCode(err), err.Error())
 		return nil, fmt.Errorf("protocol: handshake: peer hello: %w", err)
 	}
-
-	negotiated, err := negotiateVersion(ourVersion, minVersion, peerHello.ProtoVersion)
-	if err != nil {
-		sendError(fw, ErrCodeUnsupportedVersion, err.Error())
-		return nil, fmt.Errorf("protocol: handshake: %w", err)
-	}
-
+	negotiated, _ := negotiateVersion(ourVersion, minVersion, peerHello.ProtoVersion)
 	peerPub := ed25519.PublicKey(peerHello.Ed25519Pub)
-	if !cfg.IsKnownPeer(peerPub) {
-		sendError(fw, ErrCodeUnauthorized, "peer key is not a configured peer")
-		return nil, fmt.Errorf("protocol: handshake: unknown peer key %x", peerPub)
+
+	clientHello, serverHello := ourHello, peerHello
+	if !initiator {
+		clientHello, serverHello = peerHello, ourHello
 	}
+	proof := handshakeTranscript(clientHello, serverHello, negotiated)
 
-	// Sign authContext || their_nonce || our_nonce ("their" and "our" from
-	// this side's point of view). The peer verifies this same byte string
-	// by recomputing it with its own labels swapped (its "our_nonce" is
-	// the nonce it generated, which is the same value we call
-	// peerHello.Nonce below when verifying its Auth) — see the comment
-	// just before the Verify call for why this fixed, swapped ordering is
-	// what defeats a reflected/replayed signature.
-	ourSig := ed25519.Sign(cfg.IdentityKey, authTranscript(peerHello.Nonce, ourNonce))
-
-	peerAuth, err := exchangeAuth(fw, fr, Auth{Sig: ourSig})
-	if err != nil {
-		return nil, err
-	}
-
-	// Verify against authContext || our_nonce || their_nonce: the mirror
-	// image of what we signed above. This asymmetry (each side puts the
-	// *other* side's nonce first) is what makes reflection fail: if a
-	// peer merely echoes back a signature it observed from us on this
-	// same connection — whether that's genuinely our Auth, or an
-	// adversary who has no private key of their own and is hoping we'll
-	// accept our own words as theirs — the transcript it was actually
-	// produced over (their_nonce||our_nonce, from the signer's
-	// perspective) does not match the transcript we require here
-	// (our_nonce||their_nonce), because the two nonces are independent
-	// 32-byte crypto/rand values and so essentially never equal. The
-	// signature only verifies if it was produced, over exactly this
-	// transcript, by the private key matching peerPub.
-	if !ed25519.Verify(peerPub, authTranscript(ourNonce, peerHello.Nonce), peerAuth.Sig) {
-		sendError(fw, ErrCodeBadAuth, "signature verification failed")
-		return nil, errors.New("protocol: handshake: peer signature verification failed")
+	if initiator {
+		if !ed25519.Verify(peerPub, appendRole(proof, "server"), deferredServerSig) {
+			sendError(conn, fw, ErrCodeBadAuth, "server signature verification failed")
+			return nil, errors.New("protocol: handshake: peer signature verification failed")
+		}
+		ourSig := ed25519.Sign(cfg.IdentityKey, appendRole(proof, "client"))
+		if err := fw.WriteMessage(MsgAuth, Auth{Sig: ourSig}); err != nil {
+			return nil, fmt.Errorf("protocol: handshake: send auth: %w", err)
+		}
+		var finished Finished
+		if err := readMessage(fr, MsgFinished, &finished); err != nil {
+			return nil, err
+		}
+	} else {
+		ourSig := ed25519.Sign(cfg.IdentityKey, appendRole(proof, "server"))
+		if err := fw.WriteMessage(MsgAuth, HelloAuth{Hello: ourHello, Sig: ourSig}); err != nil {
+			return nil, fmt.Errorf("protocol: handshake: send hello auth: %w", err)
+		}
+		var clientAuth Auth
+		if err := readMessage(fr, MsgAuth, &clientAuth); err != nil {
+			return nil, err
+		}
+		if !ed25519.Verify(peerPub, appendRole(proof, "client"), clientAuth.Sig) {
+			sendError(conn, fw, ErrCodeBadAuth, "client signature verification failed")
+			return nil, errors.New("protocol: handshake: peer signature verification failed")
+		}
+		if err := fw.WriteMessage(MsgFinished, Finished{}); err != nil {
+			return nil, fmt.Errorf("protocol: handshake: send finished: %w", err)
+		}
 	}
 
 	// Authenticated. Retire the ctx watcher and disarm the deadline before
@@ -298,16 +316,66 @@ func checkOwnToken(token string, ourPub ed25519.PublicKey) error {
 	return nil
 }
 
-// authTranscript builds the fixed-order byte string that gets signed and
-// verified: the domain-separation context, then theirNonce, then
-// ourNonce, from the caller's point of view (see the two call sites in
-// Handshake for exactly which nonce is which on each side).
-func authTranscript(theirNonce, ourNonce []byte) []byte {
-	buf := make([]byte, 0, len(authContext)+len(theirNonce)+len(ourNonce))
-	buf = append(buf, authContext...)
-	buf = append(buf, theirNonce...)
-	buf = append(buf, ourNonce...)
-	return buf
+func validatePeerHello(cfg HandshakeConfig, ourVersion, minVersion int, h Hello) error {
+	if err := validateHelloShape(h); err != nil {
+		return err
+	}
+	if _, err := negotiateVersion(ourVersion, minVersion, h.ProtoVersion); err != nil {
+		return err
+	}
+	if !cfg.IsKnownPeer(ed25519.PublicKey(h.Ed25519Pub)) {
+		return fmt.Errorf("unknown peer key %x", h.Ed25519Pub)
+	}
+	return nil
+}
+
+func errorCode(err error) string {
+	s := err.Error()
+	switch {
+	case strings.Contains(s, "proto_version"):
+		return ErrCodeUnsupportedVersion
+	case strings.Contains(s, "unknown peer key"):
+		return ErrCodeUnauthorized
+	default:
+		return ErrCodeBadHello
+	}
+}
+
+func handshakeTranscript(client, server Hello, negotiated int) []byte {
+	c, _ := encodeMessage(MsgHello, client)
+	s, _ := encodeMessage(MsgHello, server)
+	h := sha256.New()
+	h.Write([]byte(authContext))
+	for _, part := range [][]byte{c, s} {
+		var n [4]byte
+		binary.BigEndian.PutUint32(n[:], uint32(len(part)))
+		h.Write(n[:])
+		h.Write(part)
+	}
+	var v [4]byte
+	binary.BigEndian.PutUint32(v[:], uint32(negotiated))
+	h.Write(v[:])
+	return h.Sum(nil)
+}
+
+func appendRole(transcript []byte, role string) []byte {
+	b := make([]byte, 0, len(authContext)+len(role)+len(transcript)+2)
+	b = append(b, authContext...)
+	b = append(b, 0, byte(len(role)))
+	b = append(b, role...)
+	b = append(b, transcript...)
+	return b
+}
+
+func readMessage(fr *Reader, want MsgType, dst any) error {
+	payload, err := readExpected(fr, want)
+	if err != nil {
+		return err
+	}
+	if err := DecodeMessage(payload, dst); err != nil {
+		return fmt.Errorf("protocol: handshake: decode %s: %w", want, err)
+	}
+	return nil
 }
 
 // negotiateVersion implements SPEC.md §4's "use min(theirs, mine) if
@@ -362,55 +430,6 @@ func isAllZero(b []byte) bool {
 	return true
 }
 
-// exchangeHello writes ours in a goroutine (so we never block waiting for
-// the peer to send first, matching SPEC.md §4's "both sides immediately
-// send Hello") while reading the peer's Hello on the calling goroutine,
-// then joins the write.
-func exchangeHello(fw *Writer, fr *Reader, ours Hello) (Hello, error) {
-	writeErrCh := make(chan error, 1)
-	go func() { writeErrCh <- fw.WriteMessage(MsgHello, ours) }()
-
-	payload, readErr := readExpected(fr, MsgHello)
-
-	if writeErr := <-writeErrCh; writeErr != nil {
-		if readErr == nil {
-			readErr = fmt.Errorf("protocol: handshake: send hello: %w", writeErr)
-		}
-	}
-	if readErr != nil {
-		return Hello{}, readErr
-	}
-
-	var peer Hello
-	if err := DecodeMessage(payload, &peer); err != nil {
-		return Hello{}, fmt.Errorf("protocol: handshake: decode peer hello: %w", err)
-	}
-	return peer, nil
-}
-
-// exchangeAuth is exchangeHello's counterpart for the Auth message.
-func exchangeAuth(fw *Writer, fr *Reader, ours Auth) (Auth, error) {
-	writeErrCh := make(chan error, 1)
-	go func() { writeErrCh <- fw.WriteMessage(MsgAuth, ours) }()
-
-	payload, readErr := readExpected(fr, MsgAuth)
-
-	if writeErr := <-writeErrCh; writeErr != nil {
-		if readErr == nil {
-			readErr = fmt.Errorf("protocol: handshake: send auth: %w", writeErr)
-		}
-	}
-	if readErr != nil {
-		return Auth{}, readErr
-	}
-
-	var peer Auth
-	if err := DecodeMessage(payload, &peer); err != nil {
-		return Auth{}, fmt.Errorf("protocol: handshake: decode peer auth: %w", err)
-	}
-	return peer, nil
-}
-
 // RemoteError wraps an Error message received from the peer, so callers
 // can distinguish "the peer told us why it's closing" from a local
 // decode/timeout/IO failure.
@@ -450,6 +469,9 @@ func readExpected(fr *Reader, want MsgType) ([]byte, error) {
 // way, so a failure here is not itself a reportable error — the
 // connection may already be broken, which is exactly the sort of
 // situation that leads to wanting to send an Error in the first place.
-func sendError(fw *Writer, code, msg string) {
+func sendError(conn net.Conn, fw *Writer, code, msg string) {
+	// Error delivery is diagnostic and must not delay rejection when the
+	// peer violates the state machine and is not reading its response.
+	_ = conn.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
 	_ = fw.WriteMessage(MsgError, Error{Code: code, Msg: msg})
 }

@@ -5,7 +5,7 @@
 //
 // This package has no filesystem, UI, or HTTP dependencies (SPEC.md §12:
 // it must stay gomobile-safe) and is testable entirely over a bare
-// net.Conn; see internal/transport's PipeTransport for the loopback
+// net.Conn; see internal/transport's PipeTransport for the in-process
 // Transport used by this package's own tests.
 package protocol
 
@@ -40,6 +40,7 @@ const (
 	MsgPing
 	MsgPong
 	MsgError
+	MsgFinished
 )
 
 func (t MsgType) String() string {
@@ -66,6 +67,8 @@ func (t MsgType) String() string {
 		return "Pong"
 	case MsgError:
 		return "Error"
+	case MsgFinished:
+		return "Finished"
 	default:
 		return fmt.Sprintf("MsgType(%d)", byte(t))
 	}
@@ -118,8 +121,7 @@ type FileInfo struct {
 	Deleted bool          `cbor:"deleted"`
 }
 
-// Hello is the first message each side sends, immediately and without
-// waiting for the peer's Hello (SPEC.md §4).
+// Hello carries one endpoint's identity and fresh handshake nonce.
 type Hello struct {
 	ProtoVersion int    `cbor:"proto_version"`
 	NodeName     string `cbor:"node_name"`
@@ -140,6 +142,19 @@ type Hello struct {
 type Auth struct {
 	Sig []byte `cbor:"sig"`
 }
+
+// HelloAuth is the responder's atomic handshake flight. Keeping its Hello
+// and proof in one frame prevents it from beginning another write before
+// the initiator has accepted the Hello.
+type HelloAuth struct {
+	Hello Hello  `cbor:"hello"`
+	Sig   []byte `cbor:"sig"`
+}
+
+// Finished confirms that the responder accepted the initiator's proof.
+// Without it the initiator could enter the session before mutual
+// authentication had completed at the responder.
+type Finished struct{}
 
 // Share access states, as seen by a subscriber (ShareListEntry.Access) or
 // pushed by an offerer (AccessUpdate.Access).

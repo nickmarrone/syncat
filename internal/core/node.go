@@ -480,7 +480,7 @@ func (n *Node) onAccept(conn net.Conn) {
 // pending-peer queue is deferred — see the package doc comment).
 func (n *Node) handleAccept(conn net.Conn) {
 	var sawPub ed25519.PublicKey
-	result, err := protocol.Handshake(n.ctx, conn, protocol.HandshakeConfig{
+	result, err := protocol.AcceptHandshake(n.ctx, conn, protocol.HandshakeConfig{
 		IdentityKey: n.identity.Private,
 		NodeName:    n.nodeName(),
 		Token:       n.localToken(),
