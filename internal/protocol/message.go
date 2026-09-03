@@ -315,7 +315,7 @@ func (w *Writer) WriteFrame(typ MsgType, payload []byte) error {
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if _, err := w.w.Write(buf); err != nil {
+	if _, err := io.Copy(w.w, bytes.NewReader(buf)); err != nil {
 		return fmt.Errorf("protocol: frame: write %s: %w", typ, err)
 	}
 	return nil
