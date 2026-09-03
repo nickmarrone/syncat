@@ -27,7 +27,7 @@ import (
 	_ "modernc.org/sqlite" // registers the "sqlite" driver; pure Go, no cgo (SPEC.md §12)
 )
 
-// --- the database: opening and migrating -------------------------------
+// --- the database: opening and migrating -----------------------------
 
 // Store is the durable index: one SQLite database per node, at
 // <datadir>/db/index.db (SPEC.md §3, §5). It holds this node's own view of
@@ -222,7 +222,7 @@ func (s *Store) Close() error {
 	return nil
 }
 
-// --- FileRow: the index's row shape ------------------------------------
+// --- FileRow: the index's row shape ----------------------------------
 
 // FileRow is the index's on-disk representation of one file/dir/symlink
 // entry within a share: protocol.FileInfo (the wire shape) plus the local
@@ -292,10 +292,23 @@ func cloneVersion(v protocol.VersionVector) protocol.VersionVector {
 	return out
 }
 
+// --- the files table: this node's own view ---------------------------
+
+const putFileSQL = `
+	INSERT INTO files (share_id, relpath, type, size, mtime_ns, mode, sha256, version_json, deleted, updated_at)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	ON CONFLICT (share_id, relpath) DO UPDATE SET
+		type = excluded.type,
+		size = excluded.size,
+		mtime_ns = excluded.mtime_ns,
+		mode = excluded.mode,
+		sha256 = excluded.sha256,
+		version_json = excluded.version_json,
+		deleted = excluded.deleted,
+		updated_at = excluded.updated_at`
+
 // ErrNotFound is returned by lookups (GetFile) when no row matches.
 var ErrNotFound = errors.New("index: not found")
-
-// --- the files table: this node's own view -----------------------------
 
 // GetFile returns the row for one (shareID, relpath), including tombstones
 // (rows with Deleted=true).
@@ -408,18 +421,7 @@ func (s *Store) ApplyScanResult(ctx context.Context, result *ScanResult) error {
 	return nil
 }
 
-const putFileSQL = `
-	INSERT INTO files (share_id, relpath, type, size, mtime_ns, mode, sha256, version_json, deleted, updated_at)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	ON CONFLICT (share_id, relpath) DO UPDATE SET
-		type = excluded.type,
-		size = excluded.size,
-		mtime_ns = excluded.mtime_ns,
-		mode = excluded.mode,
-		sha256 = excluded.sha256,
-		version_json = excluded.version_json,
-		deleted = excluded.deleted,
-		updated_at = excluded.updated_at`
+// --- row encoding: shared by both tables -----------------------------
 
 // rowScanner is satisfied by both *sql.Row and *sql.Rows, letting
 // scanFileRow serve GetFile (single row) and the List* methods (many rows)
@@ -512,7 +514,20 @@ func timeNS(t time.Time) int64 {
 	return t.UnixNano()
 }
 
-// --- the peer_files table: each peer's mirrored index ------------------
+// --- the peer_files table: each peer's mirrored index ----------------
+
+const putPeerFileSQL = `
+		INSERT INTO peer_files (peer_key, share_id, relpath, type, size, mtime_ns, mode, sha256, version_json, deleted, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT (peer_key, share_id, relpath) DO UPDATE SET
+			type = excluded.type,
+			size = excluded.size,
+			mtime_ns = excluded.mtime_ns,
+			mode = excluded.mode,
+			sha256 = excluded.sha256,
+			version_json = excluded.version_json,
+			deleted = excluded.deleted,
+			updated_at = excluded.updated_at`
 
 // UpsertPeerFiles replaces this peer's known state for the given rows, in
 // one transaction. Each row's ShareID/RelPath identifies which file it
@@ -529,18 +544,7 @@ func (s *Store) UpsertPeerFiles(ctx context.Context, peerKey string, rows []File
 	}
 	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
 
-	stmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO peer_files (peer_key, share_id, relpath, type, size, mtime_ns, mode, sha256, version_json, deleted, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT (peer_key, share_id, relpath) DO UPDATE SET
-			type = excluded.type,
-			size = excluded.size,
-			mtime_ns = excluded.mtime_ns,
-			mode = excluded.mode,
-			sha256 = excluded.sha256,
-			version_json = excluded.version_json,
-			deleted = excluded.deleted,
-			updated_at = excluded.updated_at`)
+	stmt, err := tx.PrepareContext(ctx, putPeerFileSQL)
 	if err != nil {
 		return fmt.Errorf("index: upsert peer files: prepare: %w", err)
 	}

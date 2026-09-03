@@ -88,9 +88,9 @@ func NewScanner(fsys fs.FS, ignore *Matcher) *Scanner {
 	return &Scanner{fsys: fsys, ignore: ignore}
 }
 
-// warnf formats one skipped-entry message for ScanResult.Warnings.
-func (sc *Scanner) warnf(format string, args ...any) string {
-	return fmt.Sprintf(format, args...)
+// warnf formats one skipped-entry message and records it in r.Warnings.
+func (r *ScanResult) warnf(format string, args ...any) {
+	r.Warnings = append(r.Warnings, fmt.Sprintf(format, args...))
 }
 
 // Scan walks the share and classifies every entry against existing (the
@@ -117,126 +117,7 @@ func (sc *Scanner) Scan(ctx context.Context, shareID string, existing map[string
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
 		}
-		if p == "." {
-			// The share root itself: never emit a row for it, but do
-			// propagate a hard failure to read it (nothing to scan).
-			return err
-		}
-		if err != nil {
-			// A directory or file vanished, or became unreadable,
-			// between being listed by its parent and being visited here.
-			// Skip and continue (never abort the whole scan).
-			result.Warnings = append(result.Warnings, sc.warnf("index: scan %s: skip %s (vanished or unreadable): %v", shareID, p, err))
-			if d != nil && d.IsDir() {
-				return fs.SkipDir
-			}
-			return nil
-		}
-
-		relpath := path.Clean(p)
-		if relpath == "." || relpath == ".." || strings.HasPrefix(relpath, "../") || path.IsAbs(relpath) {
-			// Defensive only: fs.WalkDir's paths are already clean,
-			// relative, and rooted at fsys — this should be unreachable
-			// for any real fs.FS implementation, but we never trust a
-			// path enough to let it name something outside the share.
-			result.Warnings = append(result.Warnings, sc.warnf("index: scan %s: rejecting escaping path %q", shareID, p))
-			if d.IsDir() {
-				return fs.SkipDir
-			}
-			return nil
-		}
-
-		if sc.ignore.Match(relpath) {
-			if d.IsDir() {
-				return fs.SkipDir
-			}
-			return nil
-		}
-
-		if d.Type()&fs.ModeSymlink != 0 {
-			// SPEC.md §5: symlinks are not followed; MVP scope skips them
-			// entirely (with a warning) rather than syncing the link
-			// itself. Not recursed into either way, since a symlink
-			// dirent is never also a directory dirent.
-			result.Warnings = append(result.Warnings, sc.warnf("index: scan %s: skipping symlink %s (not synced in this version)", shareID, relpath))
-			return nil
-		}
-
-		info, err := d.Info()
-		if err != nil {
-			result.Warnings = append(result.Warnings, sc.warnf("index: scan %s: skip %s (stat failed, likely vanished): %v", shareID, relpath, err))
-			if d.IsDir() {
-				return fs.SkipDir
-			}
-			return nil
-		}
-
-		seen[relpath] = true
-		old, existed := existing[relpath]
-
-		if d.IsDir() {
-			if !existed || old.Deleted || old.Type != protocol.FileTypeDir {
-				result.Added = append(result.Added, FileRow{
-					ShareID: shareID, RelPath: relpath, Type: protocol.FileTypeDir,
-					MTimeNS: info.ModTime().UnixNano(), Mode: uint32(info.Mode().Perm()),
-					Version: carriedVersion(old, existed), UpdatedAt: now,
-				})
-			}
-			return nil
-		}
-
-		newSize := info.Size()
-		newMTimeNS := info.ModTime().UnixNano()
-		newMode := uint32(info.Mode().Perm())
-
-		if !existed || old.Deleted || old.Type != protocol.FileTypeFile {
-			sha, err := sc.hashFile(relpath)
-			if err != nil {
-				result.Warnings = append(result.Warnings, sc.warnf("index: scan %s: skip %s (read failed, likely vanished): %v", shareID, relpath, err))
-				return nil
-			}
-			result.Added = append(result.Added, FileRow{
-				ShareID: shareID, RelPath: relpath, Type: protocol.FileTypeFile,
-				Size: newSize, MTimeNS: newMTimeNS, Mode: newMode, SHA256: sha,
-				Version: carriedVersion(old, existed), UpdatedAt: now,
-			})
-			return nil
-		}
-
-		sizeOrMTimeChanged := newSize != old.Size || newMTimeNS != old.MTimeNS
-		modeChanged := newMode != old.Mode
-
-		if !sizeOrMTimeChanged {
-			if modeChanged {
-				row := old
-				row.Mode = newMode
-				row.Version = cloneVersion(old.Version)
-				row.UpdatedAt = now
-				result.MetadataOnly = append(result.MetadataOnly, row)
-			}
-			return nil
-		}
-
-		// SPEC.md §5: "A file is 'changed' when size or mtime differs
-		// from the index; then hash (sha256) to confirm. Hash-equal =>
-		// metadata-only update, no transfer." This is the load-bearing
-		// distinction; see scanner_test.go for the case that pins it.
-		sha, err := sc.hashFile(relpath)
-		if err != nil {
-			result.Warnings = append(result.Warnings, sc.warnf("index: scan %s: skip %s (read failed, likely changed/vanished mid-scan): %v", shareID, relpath, err))
-			return nil
-		}
-		row := FileRow{
-			ShareID: shareID, RelPath: relpath, Type: protocol.FileTypeFile,
-			Size: newSize, MTimeNS: newMTimeNS, Mode: newMode, SHA256: sha,
-			Version: cloneVersion(old.Version), UpdatedAt: now,
-		}
-		if bytes.Equal(sha, old.SHA256) {
-			result.MetadataOnly = append(result.MetadataOnly, row)
-		} else {
-			result.ContentChanged = append(result.ContentChanged, row)
-		}
-		return nil
+		return sc.visit(result, existing, seen, now, p, d, err)
 	})
 	if walkErr != nil {
 		if errors.Is(walkErr, context.Canceled) || errors.Is(walkErr, context.DeadlineExceeded) {
@@ -257,6 +138,171 @@ func (sc *Scanner) Scan(ctx context.Context, shareID string, existing map[string
 	}
 
 	return result, nil
+}
+
+// visit is Scan's fs.WalkDir callback body for one entry: it skips what
+// SPEC.md §5 says to skip (recording a warning where the skip is
+// noteworthy), marks the path seen, and classifies the entry against
+// existing into one of result's buckets. It returns fs.SkipDir to prune a
+// subtree, and a non-nil error only for the share root itself being
+// unreadable — every other problem is a warning, never a walk failure.
+func (sc *Scanner) visit(result *ScanResult, existing map[string]FileRow, seen map[string]bool, now time.Time, p string, d fs.DirEntry, err error) error {
+	shareID := result.ShareID
+	if p == "." {
+		// The share root itself: never emit a row for it, but do
+		// propagate a hard failure to read it (nothing to scan).
+		return err
+	}
+	if err != nil {
+		// A directory or file vanished, or became unreadable,
+		// between being listed by its parent and being visited here.
+		// Skip and continue (never abort the whole scan).
+		result.warnf("index: scan %s: skip %s (vanished or unreadable): %v", shareID, p, err)
+		if d != nil && d.IsDir() {
+			return fs.SkipDir
+		}
+		return nil
+	}
+
+	relpath := path.Clean(p)
+	if relpath == "." || relpath == ".." || strings.HasPrefix(relpath, "../") || path.IsAbs(relpath) {
+		// Defensive only: fs.WalkDir's paths are already clean,
+		// relative, and rooted at fsys — this should be unreachable
+		// for any real fs.FS implementation, but we never trust a
+		// path enough to let it name something outside the share.
+		result.warnf("index: scan %s: rejecting escaping path %q", shareID, p)
+		if d.IsDir() {
+			return fs.SkipDir
+		}
+		return nil
+	}
+
+	if sc.ignore.Match(relpath) {
+		if d.IsDir() {
+			return fs.SkipDir
+		}
+		return nil
+	}
+
+	if d.Type()&fs.ModeSymlink != 0 {
+		// SPEC.md §5: symlinks are not followed; MVP scope skips them
+		// entirely (with a warning) rather than syncing the link
+		// itself. Not recursed into either way, since a symlink
+		// dirent is never also a directory dirent.
+		result.warnf("index: scan %s: skipping symlink %s (not synced in this version)", shareID, relpath)
+		return nil
+	}
+
+	info, err := d.Info()
+	if err != nil {
+		result.warnf("index: scan %s: skip %s (stat failed, likely vanished): %v", shareID, relpath, err)
+		if d.IsDir() {
+			return fs.SkipDir
+		}
+		return nil
+	}
+
+	seen[relpath] = true
+	old, existed := existing[relpath]
+
+	if d.IsDir() {
+		if !existed || old.Deleted || old.Type != protocol.FileTypeDir {
+			result.Added = append(result.Added, FileRow{
+				ShareID: shareID, RelPath: relpath, Type: protocol.FileTypeDir,
+				MTimeNS: info.ModTime().UnixNano(), Mode: uint32(info.Mode().Perm()),
+				Version: carriedVersion(old, existed), UpdatedAt: now,
+			})
+		}
+		return nil
+	}
+
+	if !existed || old.Deleted || old.Type != protocol.FileTypeFile {
+		sha, err := sc.hashFile(relpath)
+		if err != nil {
+			result.warnf("index: scan %s: skip %s (read failed, likely vanished): %v", shareID, relpath, err)
+			return nil
+		}
+		result.Added = append(result.Added, FileRow{
+			ShareID: shareID, RelPath: relpath, Type: protocol.FileTypeFile,
+			Size: info.Size(), MTimeNS: info.ModTime().UnixNano(), Mode: uint32(info.Mode().Perm()), SHA256: sha,
+			Version: carriedVersion(old, existed), UpdatedAt: now,
+		})
+		return nil
+	}
+
+	// SPEC.md §5: "A file is 'changed' when size or mtime differs
+	// from the index; then hash (sha256) to confirm. Hash-equal =>
+	// metadata-only update, no transfer." This is the load-bearing
+	// distinction; see scanner_test.go for the case that pins it.
+	var sha []byte
+	if needsHash(old, info) {
+		sha, err = sc.hashFile(relpath)
+		if err != nil {
+			result.warnf("index: scan %s: skip %s (read failed, likely changed/vanished mid-scan): %v", shareID, relpath, err)
+			return nil
+		}
+	}
+	row, change := classifyExisting(shareID, relpath, old, info, sha, now)
+	switch change {
+	case fileMetadataOnly:
+		result.MetadataOnly = append(result.MetadataOnly, row)
+	case fileContentChanged:
+		result.ContentChanged = append(result.ContentChanged, row)
+	}
+	return nil
+}
+
+// fileChange is classifyExisting's verdict on a file the index already
+// holds a live row for.
+type fileChange int
+
+const (
+	fileUnchanged      fileChange = iota // nothing to record
+	fileMetadataOnly                     // row goes in ScanResult.MetadataOnly
+	fileContentChanged                   // row goes in ScanResult.ContentChanged
+)
+
+// needsHash reports whether info's size or mtime differ from old's — the
+// cheap pre-check SPEC.md §5 uses to decide a file must be re-hashed
+// before it can be classified. Files that pass it are never re-read.
+func needsHash(old FileRow, info fs.FileInfo) bool {
+	return info.Size() != old.Size || info.ModTime().UnixNano() != old.MTimeNS
+}
+
+// classifyExisting decides how a live, indexed file (old, stored under
+// shareID/relpath) relates to what is on disk now (info), and builds the
+// replacement row. sha is the file's current hash, and is only consulted
+// when needsHash(old, info) is true — callers pass nil otherwise, having
+// skipped the read. It is a pure function of its inputs: no I/O, no
+// mutation of old (the returned row carries a fresh copy of old's version
+// vector, unchanged).
+//
+// With size and mtime unchanged, only a mode change is reportable, and
+// that is metadata-only. With size or mtime changed, the hash is the
+// tiebreaker: equal means metadata-only, different means content changed.
+func classifyExisting(shareID, relpath string, old FileRow, info fs.FileInfo, sha []byte, now time.Time) (FileRow, fileChange) {
+	newMode := uint32(info.Mode().Perm())
+
+	if !needsHash(old, info) {
+		if newMode == old.Mode {
+			return FileRow{}, fileUnchanged
+		}
+		row := old
+		row.Mode = newMode
+		row.Version = cloneVersion(old.Version)
+		row.UpdatedAt = now
+		return row, fileMetadataOnly
+	}
+
+	row := FileRow{
+		ShareID: shareID, RelPath: relpath, Type: protocol.FileTypeFile,
+		Size: info.Size(), MTimeNS: info.ModTime().UnixNano(), Mode: newMode, SHA256: sha,
+		Version: cloneVersion(old.Version), UpdatedAt: now,
+	}
+	if bytes.Equal(sha, old.SHA256) {
+		return row, fileMetadataOnly
+	}
+	return row, fileContentChanged
 }
 
 // carriedVersion returns the version vector a newly-classified "Added" row

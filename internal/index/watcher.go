@@ -13,6 +13,8 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
+// --- the watcher: fsnotify plus a periodic full rescan -----------------
+
 // Default watcher timing (SPEC.md §5): a burst of fsnotify events
 // collapses into one rescan after 1s of quiet; the periodic full rescan
 // (source of truth) runs every 300s regardless of watcher activity.
@@ -20,8 +22,6 @@ const (
 	DefaultDebounce       = 1 * time.Second
 	DefaultRescanInterval = 300 * time.Second
 )
-
-// --- the watcher: fsnotify plus a periodic full rescan -----------------
 
 // Clock abstracts wall-clock time so debounce timing can be driven
 // deterministically in tests, with no real sleeping (see debouncer and

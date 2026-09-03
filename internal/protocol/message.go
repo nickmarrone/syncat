@@ -1,7 +1,7 @@
 // Package protocol implements the syncat wire format (SPEC.md §4):
 // length-prefixed frames and CBOR message types (message.go), the
-// mutually-authenticated Ed25519 handshake, and the Ping/Pong
-// idle/dead-connection timing logic (handshake.go).
+// mutually-authenticated Ed25519 handshake (handshake.go), and the
+// Ping/Pong idle/dead-connection timing logic (keepalive.go).
 //
 // This package has no filesystem, UI, or HTTP dependencies (SPEC.md §12:
 // it must stay gomobile-safe) and is testable entirely over a bare
@@ -212,7 +212,7 @@ type FileChunkHeader struct {
 	EOF     bool          `cbor:"eof"`
 }
 
-// Ping and Pong are empty keepalive messages (SPEC.md §4); see handshake.go
+// Ping and Pong are empty keepalive messages (SPEC.md §4); see keepalive.go
 // for the reusable idle/dead-connection timing logic that decides when to
 // send one.
 type Ping struct{}
@@ -251,17 +251,7 @@ type Error struct {
 	RelPath string `cbor:"relpath,omitempty"`
 }
 
-// RemoteError wraps an Error message received from the peer, so callers
-// can distinguish "the peer told us why it's closing" from a local
-// decode/timeout/IO failure.
-type RemoteError struct {
-	Code string
-	Msg  string
-}
-
-func (e *RemoteError) Error() string {
-	return fmt.Sprintf("protocol: peer sent error %q: %s", e.Code, e.Msg)
-}
+// --- framing: length-prefixed frames on the wire -----------------------
 
 const (
 	// frameLenSize is the width of the big-endian length prefix (SPEC.md
@@ -281,8 +271,6 @@ const (
 	// small FileChunkHeader is added.
 	MaxFileChunkData = 1 * 1024 * 1024
 )
-
-// --- framing: length-prefixed frames on the wire -----------------------
 
 // Writer encodes messages onto an underlying io.Writer as length-prefixed
 // frames (SPEC.md §4).
