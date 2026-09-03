@@ -607,7 +607,7 @@ func toRejectedConnDTO(r core.RejectedConnection) rejectedConnDTO {
 	return rejectedConnDTO{PeerKey: r.PeerKey, PeerName: r.PeerName, At: r.At, Reason: r.Reason}
 }
 
-func toTrashEntryDTO(e syncsvc.Entry) trashEntryDTO {
+func toTrashEntryDTO(e syncsvc.TrashEntry) trashEntryDTO {
 	return trashEntryDTO{ShareID: e.ShareID, RelPath: e.RelPath, TrashedAt: e.TrashedAt, Size: e.Size}
 }
 

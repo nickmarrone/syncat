@@ -3,6 +3,7 @@ package core
 import (
 	"time"
 
+	"github.com/nickmarrone/syncat/internal/config"
 	"github.com/nickmarrone/syncat/internal/protocol"
 )
 
@@ -13,27 +14,8 @@ import (
 // JSON-friendly fields (strings, numbers, bools, times, slices, maps of
 // string to plain struct), deliberately with no encoding/json or HTTP
 // import anywhere in this package (SPEC.md §12) — internal/api owns
-// marshaling.
-
-// ConnState is a peer connection's current state, per SPEC.md §2's dial/
-// backoff/handshake flow.
-type ConnState string
-
-const (
-	// ConnStateDisconnected means no connection attempt is currently in
-	// flight or established, and none has ever succeeded (or the peer is
-	// disabled).
-	ConnStateDisconnected ConnState = "disconnected"
-	// ConnStateConnecting means a dial or handshake is currently in
-	// progress.
-	ConnStateConnecting ConnState = "connecting"
-	// ConnStateConnected means an authenticated connection is up (having
-	// won SPEC.md §2.4's dedup, if applicable).
-	ConnStateConnected ConnState = "connected"
-	// ConnStateBackingOff means the last attempt failed and the next is
-	// scheduled after transport.Backoff's delay.
-	ConnStateBackingOff ConnState = "backing_off"
-)
+// marshaling. (ConnState, which PeerStatus.State carries, lives with the
+// connection state machine in peer.go.)
 
 // PeerStatus is one configured peer's connection state, for GET
 // /api/peers and the dashboard's peer cards.
@@ -243,6 +225,15 @@ func (n *Node) Status() Status {
 
 		RejectedConnections: rejected,
 	}
+}
+
+// peerNameLocked returns the configured display name for peerKeyHex, or ""
+// if it is not a configured peer. cfg must be read under cfgMu.
+func peerNameLocked(cfg *config.Config, peerKeyHex string) string {
+	if i := findPeerIndex(cfg, peerKeyHex); i >= 0 {
+		return cfg.Peers[i].Name
+	}
+	return ""
 }
 
 func (pc *peerConn) snapshot() PeerStatus {

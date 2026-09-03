@@ -3,14 +3,15 @@
 // packages (SPEC.md §12).
 //
 // [Node] (node.go) owns startup/shutdown ordering and the accept path.
-// mutations.go is the config-mutation API the REST layer and CLI call, and
-// the reference resolution that lets those callers pass names and id
-// prefixes instead of raw hex. peer.go implements the per-peer
-// dial/accept/dedup/keepalive state machine (SPEC.md §2, §4). shares.go
-// wires local share/subscription directories to internal/index's
-// Scanner/Watcher and drives internal/sync.Session on every local or
-// remote change. status.go defines the read-only snapshot the API and UI
-// render.
+// mutations.go is the config-mutation API the REST layer and CLI call;
+// resolve.go is the reference resolution that lets those callers pass
+// names and id prefixes instead of raw hex. peer.go implements the
+// per-peer dial/accept/dedup/keepalive state machine (SPEC.md §2, §4), and
+// access.go the ShareList/SubscribeRequest/AccessUpdate negotiation that
+// runs over an adopted connection (SPEC.md §6). shares.go wires local
+// share/subscription directories to internal/index's Scanner/Watcher and
+// drives internal/sync.Session on every local or remote change. status.go
+// defines the read-only snapshot the API and UI render.
 //
 // Known MVP gaps, called out where they bite rather than left implicit:
 //   - SPEC.md §2.3's pending-peer approval queue is deferred: an unknown
@@ -19,14 +20,14 @@
 //     surface it.
 //   - SPEC.md §6's share-access approval queue is deferred: every
 //     SubscribeRequest is auto-granted regardless of ApprovalRequired (see
-//     handleSubscribeRequest's TODO) — ApprovalRequired is still persisted
-//     in config for when that queue exists.
+//     provisionShareForRequest's TODO in access.go) — ApprovalRequired is
+//     still persisted in config for when that queue exists.
 //   - Once granted, a share/subscription can only be "neutered" on an
 //     already-open connection (both Direction flags set, see
-//     neuterShareOnSessions and its call sites) rather than fully removed,
-//     since internal/sync.Session exposes no share-removal call. A fresh
-//     connection never re-adds a removed/revoked share, so this converges
-//     on reconnect either way.
+//     peerConn.neuterShare in peer.go and its callers in mutations.go and
+//     access.go) rather than fully removed, since internal/sync.Session
+//     exposes no share-removal call. A fresh connection never re-adds a
+//     removed/revoked share, so this converges on reconnect either way.
 package core
 
 import (
@@ -91,23 +92,13 @@ type Options struct {
 	DisableJitter bool
 }
 
-// shareWatch is one local directory Node keeps indexed: either a share we
-// offer (root = config.Share.Path) or a subscription's local copy (root =
-// config.Subscription.LocalPath). See shares.go.
-type shareWatch struct {
-	shareID string
-	root    string
-	scanner *index.Scanner
-	watcher *index.Watcher
-}
-
 // Node owns one running syncat instance end to end: config, identity,
 // index store, transport, peer connections, share/subscription watchers,
 // and the trash janitor. Construct with Open; shut down with Close.
 //
 // Every exported method is safe for concurrent use, including concurrently
-// with the peer manager's own background activity — see the package doc
-// comment's note on lock ordering (config mutations always clone-mutate-
+// with the peer manager's own background activity — see mutations.go's
+// file comment on lock ordering (config mutations always clone-mutate-
 // swap under cfgMu; live effects are applied after cfgMu is released).
 type Node struct {
 	paths     *config.Paths
@@ -172,13 +163,110 @@ func Open(ctx context.Context, opts Options) (*Node, error) {
 	if err := opts.Paths.EnsureDirs(); err != nil {
 		return nil, fmt.Errorf("core: open: %w", err)
 	}
+	in, err := loadOpenInputs(opts)
+	if err != nil {
+		return nil, err
+	}
 
+	store, err := index.Open(ctx, opts.Paths.DBFile())
+	if err != nil {
+		return nil, fmt.Errorf("core: open: %w", err)
+	}
+
+	nodeCtx, cancel := context.WithCancel(context.Background())
+
+	n := &Node{
+		paths:        opts.Paths,
+		identity:     in.identity,
+		transport:    opts.Transport,
+		store:        store,
+		logger:       in.logger,
+		clock:        in.clock,
+		rand:         in.rand,
+		cfg:          in.cfg,
+		peers:        map[string]*peerConn{},
+		shareWatches: map[string]*shareWatch{},
+		ctx:          nodeCtx,
+		cancel:       cancel,
+		startTime:    in.clock.Now(),
+	}
+	n.trash = syncsvc.NewTrash(opts.Paths.TrashDir(), asSyncClock(in.clock))
+	n.janitor = syncsvc.NewJanitor(n.trash, time.Duration(in.cfg.TrashRetentionDays)*24*time.Hour, asJanitorClock(in.clock), 0, nil)
+	n.janitor.Start(nodeCtx)
+
+	// From here on a failure has to unwind what has already been started,
+	// in this order (the transport only once Start has succeeded).
+	ok, transportStarted := false, false
+	cleanup := func() {
+		n.janitor.Close()
+		store.Close()
+		if transportStarted {
+			opts.Transport.Close()
+		}
+		cancel()
+	}
+	defer func() {
+		if !ok {
+			cleanup()
+		}
+	}()
+
+	if err := opts.Transport.Start(nodeCtx, n.onAccept); err != nil {
+		return nil, fmt.Errorf("core: open: start transport: %w", err)
+	}
+	transportStarted = true
+
+	addr, err := opts.Transport.LocalAddress()
+	if err != nil {
+		return nil, fmt.Errorf("core: open: %w", err)
+	}
+	tok, err := config.EncodeToken(addr, in.identity.Public(), in.cfg.NodeName)
+	if err != nil {
+		return nil, fmt.Errorf("core: open: %w", err)
+	}
+	// Under tokenMu, not because anything else has started yet in Open,
+	// but because Transport.Start above is already accepting: an inbound
+	// connection landing in this window runs handleAccept, which reads
+	// this field via localToken. (Such a connection sees an empty token
+	// and is rejected by the peer's Hello validation; the peer's backoff
+	// redials into a fully-initialised node. The token can't be built any
+	// earlier — it embeds Transport.LocalAddress, which is only valid
+	// once Start has returned.)
+	n.tokenMu.Lock()
+	n.token = tok
+	n.tokenMu.Unlock()
+
+	n.startConfiguredWatches(in.cfg)
+	n.startConfiguredPeers(in.cfg)
+
+	ok = true
+	return n, nil
+}
+
+// openInputs is everything Open resolves from Options before it starts
+// anything: the config (loaded or defaulted, then persisted), the
+// identity, and the clock/rand/logger with their documented defaults
+// applied.
+type openInputs struct {
+	cfg      *config.Config
+	identity *config.IdentityKey
+	clock    Clock
+	rand     *rand.Rand
+	logger   *log.Logger
+}
+
+// loadOpenInputs applies Options' documented defaults: it loads (or
+// defaults) and persists the config, loads or creates the identity key,
+// and falls back to RealClock, a time-seeded Rand (unless DisableJitter),
+// and log.Default(). opts.Paths must already be validated and its
+// directories ensured.
+func loadOpenInputs(opts Options) (openInputs, error) {
 	cfg := opts.Config
 	if cfg == nil {
 		loaded, err := config.Load(opts.Paths.ConfigFile())
 		if err != nil {
 			if !errors.Is(err, os.ErrNotExist) {
-				return nil, fmt.Errorf("core: open: %w", err)
+				return openInputs{}, fmt.Errorf("core: open: %w", err)
 			}
 			loaded = config.Default()
 		}
@@ -186,14 +274,14 @@ func Open(ctx context.Context, opts Options) (*Node, error) {
 	}
 	cfg.ApplyDefaults()
 	if err := config.Save(opts.Paths.ConfigFile(), cfg); err != nil {
-		return nil, fmt.Errorf("core: open: persist config: %w", err)
+		return openInputs{}, fmt.Errorf("core: open: persist config: %w", err)
 	}
 
 	identity := opts.Identity
 	if identity == nil {
 		id, _, err := config.LoadOrCreateIdentityKey(opts.Paths.IdentityKeyFile())
 		if err != nil {
-			return nil, fmt.Errorf("core: open: %w", err)
+			return openInputs{}, fmt.Errorf("core: open: %w", err)
 		}
 		identity = id
 	}
@@ -210,75 +298,21 @@ func Open(ctx context.Context, opts Options) (*Node, error) {
 	if logger == nil {
 		logger = log.Default()
 	}
+	return openInputs{cfg: cfg, identity: identity, clock: clock, rand: rnd, logger: logger}, nil
+}
 
-	store, err := index.Open(ctx, opts.Paths.DBFile())
-	if err != nil {
-		return nil, fmt.Errorf("core: open: %w", err)
-	}
-
-	nodeCtx, cancel := context.WithCancel(context.Background())
-
-	n := &Node{
-		paths:        opts.Paths,
-		identity:     identity,
-		transport:    opts.Transport,
-		store:        store,
-		logger:       logger,
-		clock:        clock,
-		rand:         rnd,
-		cfg:          cfg,
-		peers:        map[string]*peerConn{},
-		shareWatches: map[string]*shareWatch{},
-		ctx:          nodeCtx,
-		cancel:       cancel,
-		startTime:    clock.Now(),
-	}
-	n.trash = syncsvc.NewTrash(opts.Paths.TrashDir(), asSyncClock(clock))
-	n.janitor = syncsvc.NewJanitor(n.trash, time.Duration(cfg.TrashRetentionDays)*24*time.Hour, asJanitorClock(clock), 0, nil)
-	n.janitor.Start(nodeCtx)
-
-	if err := opts.Transport.Start(nodeCtx, n.onAccept); err != nil {
-		n.janitor.Close()
-		store.Close()
-		cancel()
-		return nil, fmt.Errorf("core: open: start transport: %w", err)
-	}
-
-	addr, err := opts.Transport.LocalAddress()
-	if err != nil {
-		n.janitor.Close()
-		store.Close()
-		opts.Transport.Close()
-		cancel()
-		return nil, fmt.Errorf("core: open: %w", err)
-	}
-	tok, err := config.EncodeToken(addr, identity.Public(), cfg.NodeName)
-	if err != nil {
-		n.janitor.Close()
-		store.Close()
-		opts.Transport.Close()
-		cancel()
-		return nil, fmt.Errorf("core: open: %w", err)
-	}
-	// Under tokenMu, not because anything else has started yet in Open,
-	// but because Transport.Start above is already accepting: an inbound
-	// connection landing in this window runs handleAccept, which reads
-	// this field via localToken. (Such a connection sees an empty token
-	// and is rejected by the peer's Hello validation; the peer's backoff
-	// redials into a fully-initialised node. The token can't be built any
-	// earlier — it embeds Transport.LocalAddress, which is only valid
-	// once Start has returned.)
-	n.tokenMu.Lock()
-	n.token = tok
-	n.tokenMu.Unlock()
-
+// startConfiguredWatches starts a watcher and runs the initial synchronous
+// scan for every share and every non-paused subscription in cfg. Failures
+// are logged per entry rather than failing Open: one bad directory should
+// not keep the rest of the node from starting.
+func (n *Node) startConfiguredWatches(cfg *config.Config) {
 	for _, s := range cfg.Shares {
 		if _, err := n.startShareWatch(s.ID, s.Path); err != nil {
-			logger.Printf("core: open: start watcher for share %s: %v", s.ID, err)
+			n.logger.Printf("core: open: start watcher for share %s: %v", s.ID, err)
 			continue
 		}
-		if err := n.rescanShare(nodeCtx, s.ID); err != nil {
-			logger.Printf("core: open: initial scan for share %s: %v", s.ID, err)
+		if err := n.rescanShare(n.ctx, s.ID); err != nil {
+			n.logger.Printf("core: open: initial scan for share %s: %v", s.ID, err)
 		}
 	}
 	for _, sub := range cfg.Subscriptions {
@@ -286,18 +320,23 @@ func Open(ctx context.Context, opts Options) (*Node, error) {
 			continue
 		}
 		if _, err := n.startShareWatch(sub.ShareID, sub.LocalPath); err != nil {
-			logger.Printf("core: open: start watcher for subscription %s: %v", sub.ShareID, err)
+			n.logger.Printf("core: open: start watcher for subscription %s: %v", sub.ShareID, err)
 			continue
 		}
-		if err := n.rescanShare(nodeCtx, sub.ShareID); err != nil {
-			logger.Printf("core: open: initial scan for subscription %s: %v", sub.ShareID, err)
+		if err := n.rescanShare(n.ctx, sub.ShareID); err != nil {
+			n.logger.Printf("core: open: initial scan for subscription %s: %v", sub.ShareID, err)
 		}
 	}
+}
 
+// startConfiguredPeers builds a peerConn for every peer in cfg, registers
+// it, and starts the dial supervisor for each enabled one. A peer whose
+// token cannot be parsed is logged and skipped.
+func (n *Node) startConfiguredPeers(cfg *config.Config) {
 	for _, p := range cfg.Peers {
 		pc, err := newPeerConn(n, p)
 		if err != nil {
-			logger.Printf("core: open: configure peer %s: %v", p.Name, err)
+			n.logger.Printf("core: open: configure peer %s: %v", p.Name, err)
 			continue
 		}
 		n.peers[pc.peerKeyHex] = pc
@@ -309,7 +348,7 @@ func Open(ctx context.Context, opts Options) (*Node, error) {
 		// the peer anyway — so it stays visible in `syncat peer ls` rather
 		// than vanishing while it's still in config.json — but never dial.
 		if pc.peerKeyHex == n.PeerKey() {
-			logger.Printf("core: open: peer %q is configured with this node's own token; not dialing it. Run `syncat peer rm %s`, then add the other node's token.", p.Name, pc.peerKeyHex)
+			n.logger.Printf("core: open: peer %q is configured with this node's own token; not dialing it. Run `syncat peer rm %s`, then add the other node's token.", p.Name, pc.peerKeyHex)
 			pc.disable("configured with this node's own token; remove it and add the other node's token")
 			continue
 		}
@@ -317,8 +356,6 @@ func Open(ctx context.Context, opts Options) (*Node, error) {
 			n.goTracked(pc.runSupervisor)
 		}
 	}
-
-	return n, nil
 }
 
 // Close shuts the node down in order: stop dialing/accepting new work
@@ -363,8 +400,6 @@ func (n *Node) Close() error {
 	return closeErr
 }
 
-// goTracked runs fn in a new goroutine tracked by n.wg, so Close waits for
-// it.
 // goTracked runs fn on a goroutine counted by n.wg, reporting false
 // without running it if the node is already closing.
 //

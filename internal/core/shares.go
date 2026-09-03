@@ -20,6 +20,16 @@ import (
 // only if something changed — re-syncs the share on every session that
 // currently has it active (propagateShare).
 
+// shareWatch is one local directory Node keeps indexed: either a share we
+// offer (root = config.Share.Path) or a subscription's local copy (root =
+// config.Subscription.LocalPath).
+type shareWatch struct {
+	shareID string
+	root    string
+	scanner *index.Scanner
+	watcher *index.Watcher
+}
+
 // startShareWatch begins watching root for shareID: an initial fsnotify
 // watch tree plus the periodic full rescan that remains the source of
 // truth (SPEC.md §5). It does not itself perform the first scan — callers
@@ -156,13 +166,4 @@ func (n *Node) propagateShare(ctx context.Context, shareID string) {
 			n.logger.Printf("core: propagate %s to %s: %v", shareID, pc.name, err)
 		}
 	}
-}
-
-// RescanShare runs an immediate, synchronous full scan of shareID and
-// propagates the result, exactly like the periodic/fsnotify-triggered
-// path. Exported for tests that want deterministic sync timing without
-// waiting on the watcher's real debounce/periodic timers, and as the entry
-// point a manual "rescan now" would call.
-func (n *Node) RescanShare(ctx context.Context, shareID string) error {
-	return n.rescanShare(ctx, shareID)
 }

@@ -67,12 +67,32 @@ const staleInboundGrace = 15 * time.Second
 // while still giving up fast enough to retry with a fresh Client promptly.
 const dialTimeout = 30 * time.Second
 
+// ConnState is a peer connection's current state, per SPEC.md §2's dial/
+// backoff/handshake flow.
+type ConnState string
+
+const (
+	// ConnStateDisconnected means no connection attempt is currently in
+	// flight or established, and none has ever succeeded (or the peer is
+	// disabled).
+	ConnStateDisconnected ConnState = "disconnected"
+	// ConnStateConnecting means a dial or handshake is currently in
+	// progress.
+	ConnStateConnecting ConnState = "connecting"
+	// ConnStateConnected means an authenticated connection is up (having
+	// won SPEC.md §2.4's dedup, if applicable).
+	ConnStateConnected ConnState = "connected"
+	// ConnStateBackingOff means the last attempt failed and the next is
+	// scheduled after transport.Backoff's delay.
+	ConnStateBackingOff ConnState = "backing_off"
+)
+
 // peerConn is one configured peer's connection state machine (SPEC.md
 // §2/§4): it drives the dial-with-backoff loop, adopts whichever
 // connection (dialed or accepted) wins SPEC.md §2.4's dedup rule, and
 // wires that connection's syncsvc.Session together with a
-// protocol.Keepalive and this file's control-message handling for
-// ShareList/SubscribeRequest/AccessUpdate.
+// protocol.Keepalive and handleControl, which dispatches
+// ShareList/SubscribeRequest/AccessUpdate to access.go.
 //
 // At most one connection is ever active at a time, guarded by mu.
 // Reaching that invariant doesn't require coordinating the two sides of a
@@ -315,67 +335,86 @@ func (pc *peerConn) offer(ctx context.Context, conn net.Conn, result *protocol.H
 	node.sendShareList(sess, pc.peerKeyHex)
 	node.requestSubscriptions(sess, pc.peerKeyHex)
 
-	node.goTracked(func() {
-		// The keepalive runs alongside the wait below rather than being the
-		// wait itself. Its dead timer is the *backstop* for noticing this
-		// connection has ended, not the mechanism: a peer that closes
-		// cleanly, or a socket that breaks under a write, ends the session's
-		// read loop immediately, and waiting out SPEC.md §4's 90s instead
-		// (at the poll granularity, up to 120s) is 90s of a node reporting
-		// itself connected to something that is gone, and 90s before
-		// dialAttempt is released to redial. The check interval comes from
-		// protocol.DefaultKeepaliveCheckInterval.
-		kaDone := make(chan struct{})
-		go func() {
-			defer close(kaDone)
-			ka.Run(sessCtx, 0, func() {
-				if err := sess.Writer().WriteMessage(protocol.MsgPing, protocol.Ping{}); err != nil {
-					// Not a transient condition to log and retry in 30s: a
-					// ping is one small frame on the writer's priority lane,
-					// so a failure to even queue it means the connection is
-					// finished. Close it and let the read loop's EOF unwind
-					// the session, the same way a peer disconnecting does.
-					node.logger.Printf("core: peer %s: send ping, dropping connection: %v", pc.name, err)
-					conn.Close()
-					return
-				}
-				ka.RecordSent()
-			}, func() {
-				conn.Close() // dead per SPEC.md §4's 90s rule; unblocks the session's read loop
-			})
-		}()
-
-		select {
-		case <-sess.Done(): // the read loop ended: peer closed, or the link broke
-		case <-kaDone: // the dead rule fired, or the session context was cancelled
-		}
-
-		cancel()
-		<-kaDone // cancel() above is what unblocks ka.Run
-		sess.Close()
-		conn.Close()
-
-		// Before close(done) releases dialAttempt to redial: whatever the
-		// transport cached for this peer belongs to the connection that
-		// just died. tailcat's per-peer Client is the case that matters —
-		// it announces itself to the peer's server exactly once, so a
-		// Client reused across the peer's restart dials into a tunnel the
-		// far side has forgotten, and hangs there.
-		node.transport.DiscardPeer(pc.connBlob)
-
-		pc.mu.Lock()
-		pc.sessCancel = nil
-		pc.session = nil
-		pc.conn = nil
-		pc.activeShares = nil
-		if pc.state == ConnStateConnected {
-			pc.state = ConnStateDisconnected
-		}
-		close(done)
-		pc.mu.Unlock()
-	})
-
+	node.goTracked(func() { pc.runConnection(sessCtx, cancel, sess, ka, conn, done) })
 	return true, nil
+}
+
+// runConnection is the adopted connection's lifetime, on its own tracked
+// goroutine: it runs the keepalive alongside the session, waits for
+// whichever ends first, then tears everything down and releases
+// dialAttempt (by closing done) to redial.
+//
+// The keepalive runs alongside the wait rather than being the wait itself.
+// Its dead timer is the *backstop* for noticing this connection has ended,
+// not the mechanism: a peer that closes cleanly, or a socket that breaks
+// under a write, ends the session's read loop immediately, and waiting
+// out SPEC.md §4's 90s instead (at the poll granularity, up to 120s) is
+// 90s of a node reporting itself connected to something that is gone, and
+// 90s before dialAttempt is released to redial. The check interval comes
+// from protocol.DefaultKeepaliveCheckInterval.
+//
+// The teardown order is load-bearing: cancel unblocks ka.Run; sess.Close
+// must precede conn.Close (see notePeerRedialed); the transport's cached
+// per-peer state must be discarded before close(done) lets dialAttempt
+// redial; and pc's fields are reset under mu in the same critical section
+// that closes done.
+func (pc *peerConn) runConnection(sessCtx context.Context, cancel context.CancelFunc, sess *syncsvc.Session, ka *protocol.Keepalive, conn net.Conn, done chan struct{}) {
+	kaDone := make(chan struct{})
+	go func() {
+		defer close(kaDone)
+		pc.runKeepalive(sessCtx, ka, sess, conn)
+	}()
+
+	select {
+	case <-sess.Done(): // the read loop ended: peer closed, or the link broke
+	case <-kaDone: // the dead rule fired, or the session context was cancelled
+	}
+
+	cancel()
+	<-kaDone // cancel() above is what unblocks ka.Run
+	sess.Close()
+	conn.Close()
+
+	// Before close(done) releases dialAttempt to redial: whatever the
+	// transport cached for this peer belongs to the connection that
+	// just died. tailcat's per-peer Client is the case that matters —
+	// it announces itself to the peer's server exactly once, so a
+	// Client reused across the peer's restart dials into a tunnel the
+	// far side has forgotten, and hangs there.
+	pc.node.transport.DiscardPeer(pc.connBlob)
+
+	pc.mu.Lock()
+	pc.sessCancel = nil
+	pc.session = nil
+	pc.conn = nil
+	pc.activeShares = nil
+	if pc.state == ConnStateConnected {
+		pc.state = ConnStateDisconnected
+	}
+	close(done)
+	pc.mu.Unlock()
+}
+
+// runKeepalive drives SPEC.md §4's ping/dead rule for one connection until
+// ctx is cancelled: it sends a Ping on ka's schedule and closes conn when
+// the dead timer fires (which unblocks the session's read loop and so ends
+// runConnection's wait).
+func (pc *peerConn) runKeepalive(ctx context.Context, ka *protocol.Keepalive, sess *syncsvc.Session, conn net.Conn) {
+	ka.Run(ctx, 0, func() {
+		if err := sess.Writer().WriteMessage(protocol.MsgPing, protocol.Ping{}); err != nil {
+			// Not a transient condition to log and retry in 30s: a
+			// ping is one small frame on the writer's priority lane,
+			// so a failure to even queue it means the connection is
+			// finished. Close it and let the read loop's EOF unwind
+			// the session, the same way a peer disconnecting does.
+			pc.node.logger.Printf("core: peer %s: send ping, dropping connection: %v", pc.name, err)
+			conn.Close()
+			return
+		}
+		ka.RecordSent()
+	}, func() {
+		conn.Close() // dead per SPEC.md §4's 90s rule; unblocks the session's read loop
+	})
 }
 
 // handleControl dispatches one frame Session's own read loop doesn't
@@ -560,12 +599,31 @@ func (pc *peerConn) markShareActive(shareID string) {
 	pc.mu.Unlock()
 }
 
-func (pc *peerConn) clearShareActive(shareID string) {
+// currentSession returns the session for this peer's active connection,
+// or nil if it is not connected right now.
+func (pc *peerConn) currentSession() *syncsvc.Session {
 	pc.mu.Lock()
+	s := pc.session
+	pc.mu.Unlock()
+	return s
+}
+
+// neuterShare blocks a share on this peer's current session, if any (both
+// Direction flags set — see the package doc comment) and stops counting it
+// as active for propagation. Root is irrelevant once both flags are set:
+// Reconcile/SyncShare both check InboundBlocked/OutboundBlocked before
+// ever touching cfg.Root (see reconcile.go and session.go), so an empty
+// Root here is safe.
+func (pc *peerConn) neuterShare(shareID string) {
+	pc.mu.Lock()
+	sess := pc.session
 	if pc.activeShares != nil {
 		delete(pc.activeShares, shareID)
 	}
 	pc.mu.Unlock()
+	if sess != nil {
+		sess.AddShare(syncsvc.ShareConfig{ShareID: shareID, Direction: syncsvc.Direction{InboundBlocked: true, OutboundBlocked: true}})
+	}
 }
 
 func (pc *peerConn) setRemoteShares(entries []protocol.ShareListEntry) {
@@ -592,175 +650,4 @@ func (pc *peerConn) setSubscriptionAccess(shareID, access string) {
 	}
 	pc.subAccess[shareID] = access
 	pc.mu.Unlock()
-}
-
-// --- offerer side: a peer wants access to a share we offer ----------------
-
-// provisionShareForRequest is SPEC.md §6's grant decision point (the MVP
-// auto-grants unconditionally — see the package doc comment) and the
-// synchronous half of handling a SubscribeRequest: it must run on the
-// session's read-loop goroutine (called directly from handleControl,
-// never from a spawned goroutine), because it establishes sess's local
-// share config — via sess.AddShare — before the read loop advances to
-// read whatever frame the peer sends next. Once granted, this node itself
-// sends an IndexUpdate for this share moments later (finishSubscribeRequest,
-// via SetShareAccess -> Session.SyncShare) on the SAME connection, and if
-// the peer's own inbound traffic interleaves with that, Session's read
-// loop must already know about this share by the time it dispatches
-// anything referencing it — a race that showed up in practice as
-// Session logging "index update for unknown share" when the two halves of
-// this handling ran on independent, unordered goroutines.
-//
-// Returns the share's config (for finishSubscribeRequest) and whether a
-// matching share was found at all.
-func (n *Node) provisionShareForRequest(pc *peerConn, sess *syncsvc.Session, shareID string) (config.Share, bool) {
-	n.cfgMu.RLock()
-	i := findShareIndex(n.cfg, shareID)
-	var share config.Share
-	if i >= 0 {
-		share = n.cfg.Shares[i]
-	}
-	n.cfgMu.RUnlock()
-	if i < 0 {
-		return config.Share{}, false // unknown share; no Error code defined for this in SPEC.md §4
-	}
-
-	// TODO(approvals): SPEC.md §6 says a share with ApprovalRequired=true
-	// should instead queue this for UI/CLI approval and only grant (and
-	// only then provision the session) on an explicit decision. The MVP
-	// auto-grants regardless — see the package doc comment — so the
-	// share's ApprovalRequired flag is intentionally unused here; it's
-	// still persisted in config for that future queue. Enforcing it will
-	// need to reconcile with this function's "must run synchronously"
-	// requirement above, since an approval decision can't be synchronous
-	// with an inbound frame that arrived before a human ever acts on it.
-	sess.AddShare(syncsvc.ShareConfig{ShareID: shareID, Root: share.Path, Direction: syncsvc.DirectionFor(share.Permission, "")})
-	pc.markShareActive(shareID)
-	return share, true
-}
-
-// finishSubscribeRequest is the asynchronous remainder of handling a
-// SubscribeRequest: persisting the grant and notifying the peer
-// (SetShareAccess also re-applies the same sess.AddShare provisionShareForRequest
-// already did — a harmless idempotent overwrite — since SetShareAccess is
-// also the REST API's direct entry point and shouldn't have a
-// provision-already-done special case).
-func (n *Node) finishSubscribeRequest(pc *peerConn, share config.Share) {
-	if err := n.SetShareAccess(share.ID, pc.peerKeyHex, protocol.AccessGranted); err != nil {
-		n.logger.Printf("core: grant %s to %s: %v", share.ID, pc.peerKeyHex, err)
-	}
-}
-
-// --- subscriber side: the offerer answered our SubscribeRequest -----------
-
-// provisionAccessUpdate is AccessUpdate's synchronous half — see
-// provisionShareForRequest's doc comment for why sess.AddShare must run
-// here, on the read-loop goroutine, rather than in a spawned goroutine:
-// the offerer sends its own IndexUpdate for this share immediately after
-// granting, and this session must already know the share by the time
-// that frame (or any later one) is dispatched.
-//
-// Returns whether there's asynchronous follow-up work to do (the initial
-// SyncShare and local rescan, only for a fresh, unpaused grant).
-func (n *Node) provisionAccessUpdate(pc *peerConn, sess *syncsvc.Session, msg protocol.AccessUpdate) bool {
-	n.cfgMu.RLock()
-	var subCopy config.Subscription
-	found := false
-	for _, s := range n.cfg.Subscriptions {
-		if s.Peer == pc.peerKeyHex && s.ShareID == msg.ShareID {
-			subCopy, found = s, true
-			break
-		}
-	}
-	n.cfgMu.RUnlock()
-	if !found {
-		return false
-	}
-
-	pc.setSubscriptionAccess(msg.ShareID, msg.Access)
-
-	switch msg.Access {
-	case protocol.AccessGranted:
-		if subCopy.Paused {
-			return false
-		}
-		direction := syncsvc.DirectionFor("", subCopy.Mode)
-		sess.AddShare(syncsvc.ShareConfig{ShareID: msg.ShareID, Root: subCopy.LocalPath, Direction: direction})
-		pc.markShareActive(msg.ShareID)
-		return true
-
-	case protocol.AccessDenied, protocol.AccessRevoked:
-		sess.AddShare(syncsvc.ShareConfig{ShareID: msg.ShareID, Direction: syncsvc.Direction{InboundBlocked: true, OutboundBlocked: true}})
-		pc.clearShareActive(msg.ShareID)
-	}
-	return false
-}
-
-// finishAccessUpdate is AccessUpdate's asynchronous half: the initial
-// full sync in both directions (SyncShare pushes our current state;
-// rescanShare picks up any pre-existing local content in the subscription
-// directory and pushes that too).
-func (n *Node) finishAccessUpdate(ctx context.Context, sess *syncsvc.Session, shareID string) {
-	if err := sess.SyncShare(ctx, shareID); err != nil {
-		n.logger.Printf("core: initial sync for subscription %s: %v", shareID, err)
-	}
-	if err := n.rescanShare(n.ctx, shareID); err != nil {
-		n.logger.Printf("core: initial local scan for subscription %s: %v", shareID, err)
-	}
-}
-
-// --- share list / subscribe-request announcements --------------------------
-
-func (n *Node) sendShareList(sess *syncsvc.Session, peerKeyHex string) {
-	entries := n.buildShareList(peerKeyHex)
-	if err := sess.Writer().WriteMessage(protocol.MsgShareList, protocol.ShareList{Shares: entries}); err != nil {
-		n.logger.Printf("core: send share list to %s: %v", peerKeyHex, err)
-	}
-}
-
-func (n *Node) buildShareList(peerKeyHex string) []protocol.ShareListEntry {
-	n.cfgMu.RLock()
-	defer n.cfgMu.RUnlock()
-	entries := make([]protocol.ShareListEntry, 0, len(n.cfg.Shares))
-	for _, s := range n.cfg.Shares {
-		access := s.Access[peerKeyHex]
-		if access == "" {
-			access = protocol.AccessNone
-		}
-		entries = append(entries, protocol.ShareListEntry{
-			ShareID: s.ID, Name: s.Name, Permission: s.Permission,
-			ApprovalRequired: s.ApprovalRequired, Access: access,
-		})
-	}
-	return entries
-}
-
-func (n *Node) requestSubscriptions(sess *syncsvc.Session, peerKeyHex string) {
-	n.cfgMu.RLock()
-	var toRequest []string
-	for _, sub := range n.cfg.Subscriptions {
-		if sub.Peer == peerKeyHex && !sub.Paused {
-			toRequest = append(toRequest, sub.ShareID)
-		}
-	}
-	n.cfgMu.RUnlock()
-	for _, shareID := range toRequest {
-		if err := sess.Writer().WriteMessage(protocol.MsgSubscribeRequest, protocol.SubscribeRequest{ShareID: shareID}); err != nil {
-			n.logger.Printf("core: send subscribe request %s to %s: %v", shareID, peerKeyHex, err)
-		}
-	}
-}
-
-// broadcastShareList re-announces our share list to every currently
-// connected peer (SPEC.md §4: ShareList is sent "on connect + on
-// change").
-func (n *Node) broadcastShareList() {
-	for _, pc := range n.snapshotPeers() {
-		pc.mu.Lock()
-		sess := pc.session
-		pc.mu.Unlock()
-		if sess != nil {
-			n.sendShareList(sess, pc.peerKeyHex)
-		}
-	}
 }

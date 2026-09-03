@@ -5,8 +5,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
-	"sort"
-	"strings"
 
 	"github.com/nickmarrone/syncat/internal/config"
 	"github.com/nickmarrone/syncat/internal/index"
@@ -17,10 +15,13 @@ import (
 // This file is Node's config-mutation API: everything the REST layer
 // (internal/api) and the CLI call to change what this node peers with,
 // offers, and subscribes to. Every entry point resolves its human-typed
-// references (see the "reference resolution" block below), mutates a
-// clone of the config under cfgMu, persists it, and only then applies the
-// live effects — watchers started or stopped, sessions re-synced — with
-// cfgMu released.
+// references (see resolve.go), mutates a clone of the config under cfgMu,
+// persists it, and only then applies the live effects — watchers started
+// or stopped, sessions re-synced — with cfgMu released.
+//
+// Lock ordering: config mutations always clone-mutate-swap under cfgMu;
+// live effects (which take peerConn.mu) are applied after cfgMu is
+// released, so cfgMu is never held while acquiring a peerConn's lock.
 
 // --- config mutation helpers ---------------------------------------------
 
@@ -81,11 +82,13 @@ func findShareIndex(cfg *config.Config, shareID string) int {
 	return -1
 }
 
-func peerNameLocked(cfg *config.Config, peerKeyHex string) string {
-	if i := findPeerIndex(cfg, peerKeyHex); i >= 0 {
-		return cfg.Peers[i].Name
+func findSubscriptionIndex(cfg *config.Config, peerKeyHex, shareID string) int {
+	for i, s := range cfg.Subscriptions {
+		if s.Peer == peerKeyHex && s.ShareID == shareID {
+			return i
+		}
 	}
-	return ""
+	return -1
 }
 
 // --- peer mutations --------------------------------------------------------
@@ -402,9 +405,7 @@ func (n *Node) SetShareAccess(shareRef, peerRef, access string) error {
 	if pc == nil {
 		return nil
 	}
-	pc.mu.Lock()
-	sess := pc.session
-	pc.mu.Unlock()
+	sess := pc.currentSession()
 	if sess == nil {
 		return nil
 	}
@@ -419,31 +420,9 @@ func (n *Node) SetShareAccess(shareRef, peerRef, access string) error {
 			n.logger.Printf("core: sync share %s to %s: %v", shareID, peerKeyHex, err)
 		}
 	} else {
-		sess.AddShare(syncsvc.ShareConfig{ShareID: shareID, Direction: syncsvc.Direction{InboundBlocked: true, OutboundBlocked: true}})
-		pc.clearShareActive(shareID)
+		pc.neuterShare(shareID)
 	}
 	return nil
-}
-
-// neuterShareOnSessions blocks a share on every currently-connected
-// session (both Direction flags set — see the package doc comment) and
-// stops counting it as active for propagation. Root is irrelevant once
-// both flags are set: Reconcile/SyncShare both check InboundBlocked/
-// OutboundBlocked before ever touching cfg.Root (see reconcile.go and
-// session.go), so an empty Root here is safe.
-func (n *Node) neuterShareOnSessions(shareID string) {
-	blocked := syncsvc.Direction{InboundBlocked: true, OutboundBlocked: true}
-	for _, pc := range n.snapshotPeers() {
-		pc.mu.Lock()
-		sess := pc.session
-		if pc.activeShares != nil {
-			delete(pc.activeShares, shareID)
-		}
-		pc.mu.Unlock()
-		if sess != nil {
-			sess.AddShare(syncsvc.ShareConfig{ShareID: shareID, Direction: blocked})
-		}
-	}
 }
 
 // --- subscription mutations -------------------------------------------------
@@ -500,10 +479,7 @@ func (n *Node) AddSubscription(peerRef, shareRef, localPath, mode string) error 
 		n.logger.Printf("core: add subscription: start watcher for %s: %v", shareID, err)
 	}
 
-	pc.mu.Lock()
-	sess := pc.session
-	pc.mu.Unlock()
-	if sess != nil {
+	if sess := pc.currentSession(); sess != nil {
 		if err := sess.Writer().WriteMessage(protocol.MsgSubscribeRequest, protocol.SubscribeRequest{ShareID: shareID}); err != nil {
 			n.logger.Printf("core: send subscribe request %s to %s: %v", shareID, peerKeyHex, err)
 		}
@@ -517,13 +493,7 @@ func (n *Node) AddSubscription(peerRef, shareRef, localPath, mode string) error 
 func (n *Node) RemoveSubscription(peerRef, shareRef string) error {
 	peerKeyHex, shareID := n.resolveSubscriptionRef(peerRef, shareRef)
 	if _, err := n.mutateConfig(func(cfg *config.Config) error {
-		idx := -1
-		for i, s := range cfg.Subscriptions {
-			if s.Peer == peerKeyHex && s.ShareID == shareID {
-				idx = i
-				break
-			}
-		}
+		idx := findSubscriptionIndex(cfg, peerKeyHex, shareID)
 		if idx < 0 {
 			return fmt.Errorf("subscription to peer %s share %s is not configured", peerKeyHex, shareID)
 		}
@@ -535,15 +505,7 @@ func (n *Node) RemoveSubscription(peerRef, shareRef string) error {
 
 	n.stopShareWatch(shareID)
 	if pc := n.lookupPeer(peerKeyHex); pc != nil {
-		pc.mu.Lock()
-		sess := pc.session
-		if pc.activeShares != nil {
-			delete(pc.activeShares, shareID)
-		}
-		pc.mu.Unlock()
-		if sess != nil {
-			sess.AddShare(syncsvc.ShareConfig{ShareID: shareID, Direction: syncsvc.Direction{InboundBlocked: true, OutboundBlocked: true}})
-		}
+		pc.neuterShare(shareID)
 	}
 	return nil
 }
@@ -555,13 +517,7 @@ func (n *Node) PauseSubscription(peerRef, shareRef string, paused bool) error {
 	peerKeyHex, shareID := n.resolveSubscriptionRef(peerRef, shareRef)
 	var sub config.Subscription
 	if _, err := n.mutateConfig(func(cfg *config.Config) error {
-		idx := -1
-		for i, s := range cfg.Subscriptions {
-			if s.Peer == peerKeyHex && s.ShareID == shareID {
-				idx = i
-				break
-			}
-		}
+		idx := findSubscriptionIndex(cfg, peerKeyHex, shareID)
 		if idx < 0 {
 			return fmt.Errorf("subscription to peer %s share %s is not configured", peerKeyHex, shareID)
 		}
@@ -577,15 +533,7 @@ func (n *Node) PauseSubscription(peerRef, shareRef string, paused bool) error {
 	if paused {
 		n.stopShareWatch(shareID)
 		if pc != nil {
-			pc.mu.Lock()
-			sess := pc.session
-			if pc.activeShares != nil {
-				delete(pc.activeShares, shareID)
-			}
-			pc.mu.Unlock()
-			if sess != nil {
-				sess.AddShare(syncsvc.ShareConfig{ShareID: shareID, Direction: syncsvc.Direction{InboundBlocked: true, OutboundBlocked: true}})
-			}
+			pc.neuterShare(shareID)
 		}
 		return nil
 	}
@@ -594,10 +542,7 @@ func (n *Node) PauseSubscription(peerRef, shareRef string, paused bool) error {
 		n.logger.Printf("core: resume subscription: start watcher for %s: %v", shareID, err)
 	}
 	if pc != nil {
-		pc.mu.Lock()
-		sess := pc.session
-		pc.mu.Unlock()
-		if sess != nil {
+		if sess := pc.currentSession(); sess != nil {
 			if err := sess.Writer().WriteMessage(protocol.MsgSubscribeRequest, protocol.SubscribeRequest{ShareID: shareID}); err != nil {
 				n.logger.Printf("core: send subscribe request %s to %s: %v", shareID, peerKeyHex, err)
 			}
@@ -634,8 +579,8 @@ func (n *Node) RenameNode(name string) error {
 // shareOrSubscriptionRoot resolves shareID to the local directory its
 // trash entries live under: the share's own path if this node offers it,
 // or the local subscription path if this node subscribes to it from a
-// peer. Mirrors cmd/syncat's offline shareRootFor helper, but reads the
-// live in-memory config under cfgMu instead of a freshly loaded file.
+// peer. Reads the live in-memory config under cfgMu, so it reflects any
+// mutation that has already been applied in this process.
 func (n *Node) shareOrSubscriptionRoot(shareID string) (string, error) {
 	n.cfgMu.RLock()
 	defer n.cfgMu.RUnlock()
@@ -656,7 +601,7 @@ func (n *Node) shareOrSubscriptionRoot(shareID string) (string, error) {
 // most-recently-trashed first. shareID must be a locally offered share or
 // subscription; an empty result (not an error) means nothing has been
 // trashed for it yet.
-func (n *Node) ListTrash(shareRef string) ([]syncsvc.Entry, error) {
+func (n *Node) ListTrash(shareRef string) ([]syncsvc.TrashEntry, error) {
 	shareID, err := n.resolveShareOrSubscriptionRef(shareRef)
 	if err != nil {
 		return nil, fmt.Errorf("core: list trash: %w", err)
@@ -692,7 +637,7 @@ func (n *Node) RestoreTrash(ctx context.Context, shareRef, relPath string) (inde
 	if err != nil {
 		return index.FileRow{}, fmt.Errorf("core: restore trash: %w", err)
 	}
-	var match *syncsvc.Entry
+	var match *syncsvc.TrashEntry
 	for i := range entries {
 		if entries[i].RelPath == relPath {
 			match = &entries[i]
@@ -711,230 +656,4 @@ func (n *Node) RestoreTrash(ctx context.Context, shareRef, relPath string) (inde
 		n.logger.Printf("core: restore trash: rescan %s after restore: %v", shareID, err)
 	}
 	return row, nil
-}
-
-// Reference resolution for the CLI and REST surface.
-//
-// Every peer and share has an unreadable canonical id — a 64-hex Ed25519
-// public key, a 16-hex share id — and a readable display name shown right
-// beside it by `syncat peer ls` and `syncat remote ls`. Taking only the id
-// is a usability trap: the name is what a user reads, remembers, and types,
-// so `syncat subscription add nishinomiya test ./test/` is the natural
-// command to reach for, and until these resolvers existed it was accepted
-// verbatim and then failed silently forever (see AddSubscription's doc
-// comment).
-//
-// So a "ref" here is any of:
-//
-//   - the exact canonical id;
-//   - an exact display name, if it is unambiguous;
-//   - a unique case-insensitive prefix of the canonical id (git-style).
-//
-// Checked strictly in that order, so an id always wins over a name that
-// happens to look like one, and an exact match always wins over a prefix.
-// Ambiguity is an error naming every candidate rather than a silent pick —
-// resolving "test" to whichever share sorted first is exactly the class of
-// bug this file exists to remove.
-
-// matchRef applies the resolution order above to a set of candidates,
-// returning the matched canonical id. kind names the thing being resolved
-// ("peer", "share") for error messages; each candidate is an (id, name)
-// pair, and name may be empty.
-func matchRef(kind, ref string, candidates [][2]string) (string, error) {
-	if ref == "" {
-		return "", fmt.Errorf("empty %s reference", kind)
-	}
-	if len(candidates) == 0 {
-		// Same "no <kind> matches" opening as the miss below, deliberately:
-		// callers (internal/api's mutationError) key the not-found status
-		// off that phrase, and an empty collection is still a miss.
-		return "", fmt.Errorf("no %s matches %q — no %ss are configured", kind, ref, kind)
-	}
-
-	var byName, byPrefix []string
-	lower := strings.ToLower(ref)
-	for _, c := range candidates {
-		id, name := c[0], c[1]
-		if id == ref {
-			return id, nil
-		}
-		if name != "" && name == ref {
-			byName = append(byName, id)
-		}
-		if strings.HasPrefix(strings.ToLower(id), lower) {
-			byPrefix = append(byPrefix, id)
-		}
-	}
-
-	for _, matches := range [][]string{byName, byPrefix} {
-		switch len(matches) {
-		case 0:
-			continue
-		case 1:
-			return matches[0], nil
-		default:
-			return "", fmt.Errorf("%s %q is ambiguous — it matches %s; use the full id", kind, ref, joinIDs(matches))
-		}
-	}
-	return "", fmt.Errorf("no %s matches %q — known %ss are %s", kind, ref, kind, describeCandidates(candidates))
-}
-
-func joinIDs(ids []string) string {
-	sorted := append([]string(nil), ids...)
-	sort.Strings(sorted)
-	return strings.Join(sorted, ", ")
-}
-
-func describeCandidates(candidates [][2]string) string {
-	out := make([]string, 0, len(candidates))
-	for _, c := range candidates {
-		if c[1] == "" {
-			out = append(out, c[0])
-			continue
-		}
-		out = append(out, fmt.Sprintf("%s (%s)", c[1], c[0]))
-	}
-	sort.Strings(out)
-	return strings.Join(out, ", ")
-}
-
-// resolvePeerRef resolves a peer ref — hex key, display name, or unique key
-// prefix — to the configured peer it names.
-func (n *Node) resolvePeerRef(ref string) (*peerConn, error) {
-	peers := n.snapshotPeers()
-	candidates := make([][2]string, 0, len(peers))
-	byID := make(map[string]*peerConn, len(peers))
-	for _, pc := range peers {
-		pc.mu.Lock()
-		name := pc.name
-		pc.mu.Unlock()
-		candidates = append(candidates, [2]string{pc.peerKeyHex, name})
-		byID[pc.peerKeyHex] = pc
-	}
-	id, err := matchRef("peer", ref, candidates)
-	if err != nil {
-		return nil, err
-	}
-	return byID[id], nil
-}
-
-// resolveOfferedShareRef resolves a share ref against what pc most recently
-// offered us.
-//
-// A peer that has never sent a ShareList (not connected since this process
-// started — remoteShares is in-memory only) leaves us nothing to resolve
-// against, so the ref is passed through as a literal share id. Subscribing
-// to a peer before ever connecting to it is legitimate, and refusing it
-// outright would be worse than taking the id on faith.
-func (n *Node) resolveOfferedShareRef(pc *peerConn, ref string) (string, error) {
-	offered := pc.offeredShares()
-	if len(offered) == 0 {
-		return ref, nil
-	}
-	candidates := make([][2]string, 0, len(offered))
-	for _, e := range offered {
-		candidates = append(candidates, [2]string{e.ShareID, e.Name})
-	}
-	id, err := matchRef("share", ref, candidates)
-	if err != nil {
-		pc.mu.Lock()
-		name := pc.name
-		pc.mu.Unlock()
-		return "", fmt.Errorf("peer %s: %w", name, err)
-	}
-	return id, nil
-}
-
-// resolveSubscriptionRef resolves the (peer, share) pair naming an existing
-// subscription, for RemoveSubscription and PauseSubscription.
-//
-// Deliberately best-effort: whatever it cannot resolve it passes through
-// unchanged, so the caller's own "is not configured" error is what the user
-// sees. That matters most for the case resolution would otherwise make
-// unfixable — a subscription whose peer is no longer configured, which is
-// precisely the state a bad `subscribe` used to leave behind. Those have to
-// stay removable by their literal stored values.
-func (n *Node) resolveSubscriptionRef(peerRef, shareRef string) (peerKeyHex, shareID string) {
-	peerKeyHex, shareID = peerRef, shareRef
-
-	pc, err := n.resolvePeerRef(peerRef)
-	if err != nil {
-		return peerKeyHex, shareID
-	}
-	peerKeyHex = pc.peerKeyHex
-
-	// Prefer the peer's offered names when we have them, but fall back to
-	// the share ids actually recorded in config so an offline peer's
-	// subscriptions can still be addressed by id or id prefix.
-	names := map[string]string{}
-	for _, e := range pc.offeredShares() {
-		names[e.ShareID] = e.Name
-	}
-	n.cfgMu.RLock()
-	var candidates [][2]string
-	for _, s := range n.cfg.Subscriptions {
-		if s.Peer == peerKeyHex {
-			candidates = append(candidates, [2]string{s.ShareID, names[s.ShareID]})
-		}
-	}
-	n.cfgMu.RUnlock()
-
-	if id, err := matchRef("share", shareRef, candidates); err == nil {
-		shareID = id
-	}
-	return peerKeyHex, shareID
-}
-
-// resolveLocalShareRef resolves a share ref against the shares this node
-// offers.
-func (n *Node) resolveLocalShareRef(ref string) (string, error) {
-	n.cfgMu.RLock()
-	candidates := make([][2]string, 0, len(n.cfg.Shares))
-	for _, s := range n.cfg.Shares {
-		candidates = append(candidates, [2]string{s.ID, s.Name})
-	}
-	n.cfgMu.RUnlock()
-	return matchRef("share", ref, candidates)
-}
-
-// resolveShareOrSubscriptionRef resolves a share ref against everything this
-// node holds a local copy of: the shares it offers plus the shares it
-// subscribes to from peers. That union is exactly what the trash is keyed
-// by (see shareOrSubscriptionRoot), since files are trashed on whichever
-// side deleted them.
-//
-// A subscription's display name comes from the offering peer's last
-// ShareList, so it is only known while that peer has been connected during
-// this run. A subscription with no name yet is still matchable by id or id
-// prefix — it simply contributes no name to match against.
-func (n *Node) resolveShareOrSubscriptionRef(ref string) (string, error) {
-	type subRef struct{ peerKeyHex, shareID string }
-
-	n.cfgMu.RLock()
-	candidates := make([][2]string, 0, len(n.cfg.Shares)+len(n.cfg.Subscriptions))
-	for _, s := range n.cfg.Shares {
-		candidates = append(candidates, [2]string{s.ID, s.Name})
-	}
-	subs := make([]subRef, 0, len(n.cfg.Subscriptions))
-	for _, s := range n.cfg.Subscriptions {
-		subs = append(subs, subRef{s.Peer, s.ShareID})
-	}
-	n.cfgMu.RUnlock()
-
-	// Names are gathered after releasing cfgMu: offeredShares takes the
-	// peerConn lock, and nesting the two would invert the order every
-	// other path here uses.
-	for _, s := range subs {
-		var name string
-		if pc := n.lookupPeer(s.peerKeyHex); pc != nil {
-			for _, e := range pc.offeredShares() {
-				if e.ShareID == s.shareID {
-					name = e.Name
-					break
-				}
-			}
-		}
-		candidates = append(candidates, [2]string{s.shareID, name})
-	}
-	return matchRef("share", ref, candidates)
 }

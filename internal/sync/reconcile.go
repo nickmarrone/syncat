@@ -3,9 +3,11 @@
 // reconcile.go is the pure decision layer: version-vector algebra, the
 // per-relpath [Reconcile] pass, and the [Action] values it produces. It
 // does no I/O. session.go executes those decisions over one peer
-// connection, apply.go writes the results to disk, path.go validates every
-// peer-supplied relpath before it ever becomes a filesystem path, and
-// trash.go implements the trash can and its janitor.
+// connection (lifecycle, read loop, index exchange), transfer.go moves the
+// bytes (pulling files from the peer and serving them), apply.go writes
+// the results to disk, path.go validates every peer-supplied relpath
+// before it ever becomes a filesystem path, and trash.go implements the
+// trash can and its janitor.
 package sync
 
 import (
@@ -117,23 +119,6 @@ func Bump(v protocol.VersionVector, nodeID string) protocol.VersionVector {
 
 // --- the decisions Reconcile emits -------------------------------------
 
-// LocallyModifiedWarning records one receive-only "locally modified" event
-// (SPEC.md §1, §5): a subscriber's local edit that diverged from the
-// offerer under a receive-only subscription. Reverted reports whether the
-// offerer already had content to revert to (a trash copy was taken and the
-// offerer's version installed) or the divergence was only flagged because
-// there was nothing yet to revert to (a local-only file the offerer
-// doesn't have — see applyLocallyModified in apply.go). Session keeps a
-// log of these (Session.LocallyModifiedWarnings) for the API and UI to
-// surface.
-type LocallyModifiedWarning struct {
-	ShareID  string
-	RelPath  string
-	At       time.Time
-	Reverted bool
-	Reason   string
-}
-
 // ActionKind identifies what a reconciled Action instructs the caller
 // (session.go/apply.go) to do.
 type ActionKind int
@@ -205,7 +190,7 @@ const (
 	// filesystem/index; no fetch from the peer is required.
 	SourceLocal
 	// SourceRemote means the content must be fetched from the peer (a
-	// FileRequest/FileChunk exchange in session.go).
+	// FileRequest/FileChunk exchange in transfer.go).
 	SourceRemote
 )
 
@@ -264,7 +249,7 @@ type Action struct {
 	// have now resolved the conflict. The peer never has that value; they
 	// only ever have what they last told us about. A FileRequest must
 	// carry SourceVersion, or the peer's Equal(row.Version, req.Version)
-	// freshness check (handleFileRequest in session.go) can never match,
+	// freshness check (handleFileRequest in transfer.go) can never match,
 	// and the pull always fails with "version_changed" on its first
 	// attempt — see apply.go's pullAndInstall, the only consumer of this
 	// field. Zero/unused when Source != SourceRemote.
@@ -313,6 +298,20 @@ type Direction struct {
 	// handling, they are reported via ActionLocallyModified. Reverting them
 	// via trash happens in apply.go's applyLocallyModified (SPEC.md §1).
 	OutboundBlocked bool
+}
+
+// DirectionFor derives a share's inbound/outbound constraints from its
+// offerer permission and our subscription mode (SPEC.md §5). Pass
+// permission == "" when we are not the offerer in this pairing (we are
+// purely a subscriber), and subscriptionMode == "" when we are not a
+// subscriber (we are purely the offerer). In practice exactly one of the
+// two is non-empty for any single reconciliation, since a share is offered
+// by one node and subscribed to by others (SPEC.md §5 "Fan-out").
+func DirectionFor(permission, subscriptionMode string) Direction {
+	return Direction{
+		InboundBlocked:  permission == config.PermissionReadOnly,
+		OutboundBlocked: subscriptionMode == config.ModeReceiveOnly,
+	}
 }
 
 // --- conflict-copy filenames (SPEC.md §5) ------------------------------
@@ -388,20 +387,6 @@ func splitExt(base string) (name, ext string) {
 // inject a fixed or stepped function so conflict-filename timestamps (and
 // any other time-dependent behavior added later) are deterministic.
 type Clock func() time.Time
-
-// DirectionFor derives a share's inbound/outbound constraints from its
-// offerer permission and our subscription mode (SPEC.md §5). Pass
-// permission == "" when we are not the offerer in this pairing (we are
-// purely a subscriber), and subscriptionMode == "" when we are not a
-// subscriber (we are purely the offerer). In practice exactly one of the
-// two is non-empty for any single reconciliation, since a share is offered
-// by one node and subscribed to by others (SPEC.md §5 "Fan-out").
-func DirectionFor(permission, subscriptionMode string) Direction {
-	return Direction{
-		InboundBlocked:  permission == config.PermissionReadOnly,
-		OutboundBlocked: subscriptionMode == config.ModeReceiveOnly,
-	}
-}
 
 // Reconcile compares this node's index rows for a share (local) against a
 // peer's rows for the same share (remote), and returns one Action per
@@ -575,45 +560,8 @@ func reconcileConcurrent(relpath string, l, r protocol.FileInfo, nodeID string, 
 			Reason: "tombstone vs tombstone, concurrent: merge versions"}
 	}
 
-	// Same bytes on both sides: this concurrency isn't a real divergence to
-	// preserve, only version-vector bookkeeping that hasn't caught up yet —
-	// overwhelmingly because both peers just independently resolved this
-	// very conflict on their own (each bumping its own counter per
-	// SPEC.md §5's "element-wise max + local bump"), which leaves their two
-	// results *mutually concurrent with each other* even though the bytes
-	// they each landed on are identical (see conflictWinnerIsRemote's doc
-	// comment on the same equal-content case for the tie-break itself).
-	//
-	// Two things make it essential to short-circuit here rather than fall
-	// through to the generic conflict-copy handling below:
-	//
-	//  1. Correctness: a conflict copy of content that's identical to the
-	//     winner is a no-op at best. At worst it's actively destructive —
-	//     ConflictRelPath is a deterministic function of (relpath, nodeID,
-	//     second), so a second pass through this branch within the same
-	//     second computes the *same* path as this node's own earlier,
-	//     genuinely-different conflict copy and silently overwrites it,
-	//     destroying the very losing content that copy existed to
-	//     preserve.
-	//  2. Liveness: without this, each side keeps re-bumping its own
-	//     counter every time it reconciles the other's already-resolved
-	//     result, which (unlike the merged+bump growing past the *other*
-	//     side's last-known value and settling into a normal dominates
-	//     relationship) has no guarantee of ever converging — under
-	//     symmetric timing both sides can keep leapfrogging each other's
-	//     bump indefinitely. Folding the vectors with a plain Merge (no
-	//     extra local Bump) instead is deterministic and commutative: both
-	//     sides compute the exact same union regardless of processing
-	//     order, so they land on one *equal* vector after this single
-	//     round and the whole thing stops for good, rather than each side
-	//     manufacturing a fresh "local modification" out of applying no
-	//     actual local modification at all.
 	if bytes.Equal(l.SHA256, r.SHA256) {
-		resolved := l
-		resolved.Version = Merge(l.Version, r.Version)
-		resolved.RelPath = relpath
-		return Action{Kind: ActionPull, RelPath: relpath, Resolved: resolved, Source: SourceNone,
-			Reason: "concurrent but content identical: reconcile version only, no conflict copy"}
+		return reconcileIdenticalContent(relpath, l, r)
 	}
 
 	// Genuine content conflict: both sides have live, differing content.
@@ -646,6 +594,48 @@ func reconcileConcurrent(relpath string, l, r protocol.FileInfo, nodeID string, 
 		ConflictSource:  loserSource,
 		Reason:          "concurrent modification",
 	}
+}
+
+// reconcileIdenticalContent handles the concurrent-but-same-bytes case
+// (bytes.Equal(l.SHA256, r.SHA256)). This concurrency isn't a real
+// divergence to preserve, only version-vector bookkeeping that hasn't
+// caught up yet — overwhelmingly because both peers just independently
+// resolved this very conflict on their own (each bumping its own counter
+// per SPEC.md §5's "element-wise max + local bump"), which leaves their two
+// results *mutually concurrent with each other* even though the bytes they
+// each landed on are identical (see conflictWinnerIsRemote's doc comment
+// on the same equal-content case for the tie-break itself).
+//
+// Two things make it essential to short-circuit here rather than fall
+// through to reconcileConcurrent's generic conflict-copy handling:
+//
+//  1. Correctness: a conflict copy of content that's identical to the
+//     winner is a no-op at best. At worst it's actively destructive —
+//     ConflictRelPath is a deterministic function of (relpath, nodeID,
+//     second), so a second pass through this branch within the same
+//     second computes the *same* path as this node's own earlier,
+//     genuinely-different conflict copy and silently overwrites it,
+//     destroying the very losing content that copy existed to
+//     preserve.
+//  2. Liveness: without this, each side keeps re-bumping its own
+//     counter every time it reconciles the other's already-resolved
+//     result, which (unlike the merged+bump growing past the *other*
+//     side's last-known value and settling into a normal dominates
+//     relationship) has no guarantee of ever converging — under
+//     symmetric timing both sides can keep leapfrogging each other's
+//     bump indefinitely. Folding the vectors with a plain Merge (no
+//     extra local Bump) instead is deterministic and commutative: both
+//     sides compute the exact same union regardless of processing
+//     order, so they land on one *equal* vector after this single
+//     round and the whole thing stops for good, rather than each side
+//     manufacturing a fresh "local modification" out of applying no
+//     actual local modification at all.
+func reconcileIdenticalContent(relpath string, l, r protocol.FileInfo) Action {
+	resolved := l
+	resolved.Version = Merge(l.Version, r.Version)
+	resolved.RelPath = relpath
+	return Action{Kind: ActionPull, RelPath: relpath, Resolved: resolved, Source: SourceNone,
+		Reason: "concurrent but content identical: reconcile version only, no conflict copy"}
 }
 
 // conflictWinnerIsRemote applies SPEC.md §5's conflict tie-break: the

@@ -54,6 +54,23 @@ var ErrRestoreDestExists = errors.New("sync: trash: restore destination already 
 // the collision counter, if any.
 var trashSuffixRe = regexp.MustCompile(`^(.*)\.(\d{1,19})(?:-(\d+))?$`)
 
+// parseTrashName splits the last path element of a trash file back into
+// the original file name and the unix timestamp Put encoded in it. ok is
+// false for a name Put didn't produce (no timestamp suffix, or one that
+// doesn't fit in an int64), which List and Sweep both treat as "not ours;
+// skip it".
+func parseTrashName(base string) (origName string, ts time.Time, ok bool) {
+	m := trashSuffixRe.FindStringSubmatch(base)
+	if m == nil {
+		return "", time.Time{}, false
+	}
+	sec, err := strconv.ParseInt(m[2], 10, 64)
+	if err != nil {
+		return "", time.Time{}, false
+	}
+	return m[1], time.Unix(sec, 0), true
+}
+
 // Trash implements the trash can described in SPEC.md §7: any
 // remote-initiated delete or overwrite moves the old content to
 // <datadir>/trash/<share-id>/<relpath>.<unix-ts> before the change lands.
@@ -249,13 +266,13 @@ func copyFileOrSymlink(src, dst string, fi os.FileInfo) error {
 	return nil
 }
 
-// Entry describes one trashed file: enough for a UI trash browser
+// TrashEntry describes one trashed file: enough for a UI trash browser
 // (relpath, trashed-at time, size) and, opaquely, enough for Restore to
 // find the exact physical trash file to bring back — including
 // disambiguating two entries that happen to share both RelPath and
-// TrashedAt (a same-second collision), which is why Restore takes an
-// Entry rather than a (relpath, time) pair.
-type Entry struct {
+// TrashedAt (a same-second collision), which is why Restore takes a
+// TrashEntry rather than a (relpath, time) pair.
+type TrashEntry struct {
 	ShareID   string
 	RelPath   string
 	TrashedAt time.Time
@@ -270,7 +287,7 @@ type Entry struct {
 // Files under the share's trash directory whose name doesn't match the
 // "<relpath-last-element>.<unix-ts>[-n]" pattern Put produces are skipped
 // rather than aborting the whole listing.
-func (tr *Trash) List(shareID string) ([]Entry, error) {
+func (tr *Trash) List(shareID string) ([]TrashEntry, error) {
 	root := filepath.Join(tr.root, shareID)
 	if _, err := os.Stat(root); err != nil {
 		if os.IsNotExist(err) {
@@ -279,7 +296,7 @@ func (tr *Trash) List(shareID string) ([]Entry, error) {
 		return nil, fmt.Errorf("sync: trash: list %s: %w", shareID, err)
 	}
 
-	var entries []Entry
+	var entries []TrashEntry
 	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -293,22 +310,18 @@ func (tr *Trash) List(shareID string) ([]Entry, error) {
 		}
 		relSlash := filepath.ToSlash(rel)
 		dir, base := path.Split(relSlash)
-		m := trashSuffixRe.FindStringSubmatch(base)
-		if m == nil {
+		origName, ts, ok := parseTrashName(base)
+		if !ok {
 			return nil // not a name Put produced; skip
-		}
-		ts, err := strconv.ParseInt(m[2], 10, 64)
-		if err != nil {
-			return nil
 		}
 		info, err := d.Info()
 		if err != nil {
 			return nil
 		}
-		entries = append(entries, Entry{
+		entries = append(entries, TrashEntry{
 			ShareID:   shareID,
-			RelPath:   dir + m[1],
-			TrashedAt: time.Unix(ts, 0),
+			RelPath:   dir + origName,
+			TrashedAt: ts,
 			Size:      info.Size(),
 			trashAbs:  p,
 		})
@@ -340,7 +353,7 @@ func (tr *Trash) List(shareID string) ([]Entry, error) {
 // ErrRestoreDestExists rather than silently clobbering it — the caller
 // must clear the path (or, in a future UI, choose to restore under a
 // different name) and retry.
-func (tr *Trash) Restore(ctx context.Context, store *index.Store, nodeID, shareRoot string, e Entry) (index.FileRow, error) {
+func (tr *Trash) Restore(ctx context.Context, store *index.Store, nodeID, shareRoot string, e TrashEntry) (index.FileRow, error) {
 	if ctx.Err() != nil {
 		return index.FileRow{}, ctx.Err()
 	}
@@ -575,14 +588,9 @@ func (j *Janitor) Sweep(ctx context.Context) (int, error) {
 		if d.IsDir() {
 			return nil
 		}
-		base := filepath.Base(p)
-		m := trashSuffixRe.FindStringSubmatch(base)
-		if m == nil {
+		_, ts, ok := parseTrashName(filepath.Base(p))
+		if !ok {
 			return nil // not one of ours; leave it alone
-		}
-		ts, err := parseUnixSeconds(m[2])
-		if err != nil {
-			return nil
 		}
 		if ts.Before(cutoff) {
 			if rmErr := os.Remove(p); rmErr != nil && !os.IsNotExist(rmErr) {
@@ -622,12 +630,4 @@ func pruneEmptyDirs(root string) {
 			_ = os.Remove(dir)
 		}
 	}
-}
-
-func parseUnixSeconds(s string) (time.Time, error) {
-	var sec int64
-	if _, err := fmt.Sscanf(s, "%d", &sec); err != nil {
-		return time.Time{}, err
-	}
-	return time.Unix(sec, 0), nil
 }
