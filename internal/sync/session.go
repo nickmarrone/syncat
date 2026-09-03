@@ -91,7 +91,7 @@ type pullEntry struct {
 type Session struct {
 	conn   net.Conn
 	reader *protocol.Reader
-	writer *protocol.Writer
+	writer *protocol.StreamWriter
 
 	store  *index.Store
 	nodeID string // this node's ShortID
@@ -162,6 +162,13 @@ type Session struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
+	// done is closed when the read loop exits, i.e. the moment this session
+	// stops being usable — a peer that closed the connection, a broken
+	// socket, a frame we couldn't read. See [Session.Done]: the owner
+	// (internal/core's peer manager) watches it so a disconnect is acted on
+	// when it happens rather than when the keepalive's dead timer next
+	// notices.
+	done      chan struct{}
 	closeOnce sync.Once
 }
 
@@ -181,7 +188,7 @@ func NewSession(conn net.Conn, store *index.Store, nodeID, peerID string, clock 
 	return &Session{
 		conn:     conn,
 		reader:   protocol.NewReader(conn),
-		writer:   protocol.NewWriter(conn),
+		writer:   protocol.NewStreamWriter(conn, 0),
 		store:    store,
 		nodeID:   nodeID,
 		peerID:   peerID,
@@ -191,6 +198,7 @@ func NewSession(conn net.Conn, store *index.Store, nodeID, peerID string, clock 
 		pullSem:  make(chan struct{}, maxConcurrentPulls),
 		pullTbl:  make(map[transferKey]*pullEntry),
 		serveSem: make(chan struct{}, maxConcurrentServes),
+		done:     make(chan struct{}),
 	}
 }
 
@@ -240,13 +248,15 @@ func (s *Session) SetFrameObserver(fn func(typ protocol.MsgType)) {
 	s.ctrlMu.Unlock()
 }
 
-// Writer returns this Session's underlying protocol.Writer, so
-// internal/core's peer manager can send ShareList / SubscribeRequest /
-// AccessUpdate / Ping frames on the same connection Session writes
-// IndexUpdate/FileRequest/FileChunk/Error to. Writer is safe for
-// concurrent use (see message.go), so sharing it this way never risks
-// torn or interleaved frames.
-func (s *Session) Writer() *protocol.Writer {
+// Writer returns this Session's protocol.StreamWriter, so internal/core's
+// peer manager can send ShareList / SubscribeRequest / AccessUpdate / Ping
+// frames on the same connection Session writes
+// IndexUpdate/FileRequest/FileChunk/Error to. It is safe for concurrent
+// use, never tears or interleaves frames, and — because all of those are
+// control frames, which it drains ahead of file bytes — never makes its
+// caller wait behind a transfer. That last property is what lets the read
+// loop reply to a Ping inline (see SetControlHandler).
+func (s *Session) Writer() *protocol.StreamWriter {
 	return s.writer
 }
 
@@ -277,25 +287,50 @@ func (s *Session) getShare(shareID string) (ShareConfig, bool) {
 	return *cfg, true
 }
 
-// Start begins the session's read loop in a background goroutine and
-// returns immediately. ctx bounds the session's lifetime in addition to
-// Close: canceling ctx (or calling Close) stops all background work.
+// Start begins the session's read loop and its writer in background
+// goroutines and returns immediately. ctx bounds the session's lifetime in
+// addition to Close: canceling ctx (or calling Close) stops all background
+// work.
+//
+// Writes before Start fail with protocol.ErrWriterNotStarted — the writer
+// is started here rather than in NewSession so that a Session constructed
+// for something other than driving a connection (see internal/sync's own
+// tests, which build one over a nil conn purely to reach its trash
+// helpers) never starts a goroutine.
 func (s *Session) Start(ctx context.Context) {
 	s.ctx, s.cancel = context.WithCancel(ctx)
+	s.writer.Start()
 	s.wg.Add(1)
 	go s.readLoop()
 }
 
+// Done returns a channel closed when the session's read loop has exited:
+// the peer closed the connection, the socket broke, or Close was called.
+// It is the session's own "this connection is finished" signal, and the
+// owner is expected to watch it — nothing else in the session reacts to a
+// disconnect, so a caller that instead waits for protocol.Keepalive's dead
+// timer to notice pays SPEC.md §4's full 90s before it reconnects, even
+// when the peer said goodbye cleanly and immediately.
+//
+// The channel is never closed for a Session that was never started.
+func (s *Session) Done() <-chan struct{} {
+	return s.done
+}
+
 // Close stops the session: it cancels the internal context, closes the
 // underlying connection (unblocking any pending Read in the read loop),
-// and waits for every goroutine Session started to exit. Safe to call
-// more than once.
+// stops the writer, and waits for every goroutine Session started to
+// exit. Safe to call more than once.
 func (s *Session) Close() error {
 	s.closeOnce.Do(func() {
 		if s.cancel != nil {
 			s.cancel()
 		}
+		// Before the writer: closing the connection is what unblocks a
+		// write already in progress, and StreamWriter.Close waits for its
+		// goroutine to return.
 		_ = s.conn.Close()
+		_ = s.writer.Close()
 	})
 	s.wg.Wait()
 	return nil
