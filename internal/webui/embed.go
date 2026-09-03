@@ -10,9 +10,9 @@ import (
 	"strings"
 )
 
-// Assets embeds internal/webui/static/ (SPEC.md §9's hand-written,
+// embedded holds internal/webui/static/ (SPEC.md §9's hand-written,
 // build-step-free single-page UI: index.html, app.js, style.css,
-// favicon.svg).
+// favicon.svg), still rooted at "static/". Use Assets instead.
 //
 //go:embed static
 var embedded embed.FS

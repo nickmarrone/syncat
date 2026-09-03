@@ -1,9 +1,10 @@
 // Package api serves the localhost REST API that both the web UI and the CLI subcommands drive (SPEC.md §8).
 //
 // internal/core deliberately imports neither encoding/json nor any HTTP
-// package (SPEC.md §12), so this package owns all JSON marshaling (see
-// handlers.go) and all HTTP concerns: routing, auth, request size limits, and
-// error shaping.
+// package (SPEC.md §12), so this package owns all JSON marshaling (the DTO
+// types and converters in dto.go) and all HTTP concerns: routing, auth,
+// request size limits, and error shaping (server.go); the per-endpoint
+// handlers live in handlers.go.
 //
 // Auth: every request under /api/ must carry header
 // "X-Syncat-Token: <api.token contents>", compared with
@@ -27,6 +28,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/nickmarrone/syncat/internal/config"
 	"github.com/nickmarrone/syncat/internal/core"
 	syncsvc "github.com/nickmarrone/syncat/internal/sync"
 	"github.com/nickmarrone/syncat/internal/webui"
@@ -100,14 +102,6 @@ func ListenLoopback(addr string) (net.Listener, error) {
 	return ln, nil
 }
 
-func isLoopbackHost(host string) bool {
-	if host == "localhost" {
-		return true
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
-}
-
 // routes registers every SPEC.md §8 endpoint. Go 1.22+ ServeMux patterns
 // (METHOD /path/{wildcard}) need no router library, matching the
 // dependency budget in SPEC.md §10/CLAUDE.md.
@@ -170,6 +164,92 @@ func (s *Server) auth(h http.HandlerFunc) http.HandlerFunc {
 		}
 		h(w, r)
 	}
+}
+
+// --- /ui-token ---------------------------------------------------------------
+
+// handleUIToken implements SPEC.md §8's "login-less same-origin bootstrap
+// endpoint ... only served to localhost": it hands back the API token
+// with no X-Syncat-Token required, so a freshly loaded web UI (which has
+// no token yet) can fetch one. Because that makes it the one endpoint a
+// malicious *local* web page could try to abuse, it applies three
+// independent checks before answering:
+//
+//  1. RemoteAddr must be loopback. Read from the actual TCP connection
+//     (http.Request.RemoteAddr), never a client-supplied header like
+//     X-Forwarded-For — this server has no reverse proxy in front of it
+//     (it binds loopback-only, see ListenLoopback), so RemoteAddr is
+//     trustworthy and a spoofable header would only weaken the check.
+//
+//  2. Host header must equal this server's own bind address. This is the
+//     specific defense against DNS rebinding: a page served from
+//     attacker.com can have its DNS re-pointed at 127.0.0.1 mid-session,
+//     after which a same-origin fetch("/ui-token") from that page really
+//     does connect to this loopback server (RemoteAddr genuinely is
+//     loopback) — but the browser still sets the Host header from the
+//     URL's authority, "attacker.com", which it never lets page JS
+//     override. Comparing Host against our real listener address catches
+//     exactly that case, which the RemoteAddr check alone cannot.
+//
+//  3. Origin header, if present, must equal this server's own origin.
+//     A cross-origin fetch/XHR from any other page (no rebinding
+//     involved, just attacker.com directly requesting
+//     http://127.0.0.1:<port>/ui-token) carries an Origin header the
+//     browser also won't let page JS override; requiring it to match
+//     rejects that request outright rather than relying solely on the
+//     browser's same-origin policy to stop the attacker page from
+//     *reading* the response (this server also sends no
+//     Access-Control-Allow-Origin header, so that read would already be
+//     blocked — this check adds defense in depth and a clean 403 instead
+//     of quietly processing a request that came from nowhere legitimate).
+//     Origin is intentionally *not* required to be present: some
+//     legitimate same-origin requests (plain top-level navigation, and
+//     historically some same-origin fetches) omit it, and Host has
+//     already done the load-bearing check.
+func (s *Server) handleUIToken(w http.ResponseWriter, r *http.Request) {
+	if !isLoopbackAddr(r.RemoteAddr) {
+		writeError(w, http.StatusForbidden, "forbidden", "this endpoint is only served to localhost")
+		return
+	}
+	if r.Host != s.selfAddr {
+		writeError(w, http.StatusForbidden, "forbidden", "request Host does not match this server")
+		return
+	}
+	if origin := r.Header.Get("Origin"); origin != "" && origin != "http://"+s.selfAddr {
+		writeError(w, http.StatusForbidden, "forbidden", "request Origin does not match this server")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"token": s.token})
+}
+
+// isLoopbackHost and isLoopbackAddr are deliberately two functions with
+// slightly different semantics, matched to their two call sites:
+//
+//   - isLoopbackHost takes a bare host (already split from its port by
+//     ListenLoopback) and accepts the literal "localhost" as well as any
+//     loopback IP, because a user configuring api.addr = "localhost:8347"
+//     means loopback and should be allowed to bind.
+//
+//   - isLoopbackAddr takes a host:port as found in http.Request.RemoteAddr
+//     and accepts *only* loopback IP literals. RemoteAddr comes from the
+//     TCP connection, which is always an IP, so a name like "localhost"
+//     can never legitimately appear there; refusing it keeps the
+//     /ui-token check (a security boundary) as narrow as possible.
+func isLoopbackHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func isLoopbackAddr(remoteAddr string) bool {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		host = remoteAddr
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // handleNotImplemented returns a handler that always reports 501 with a
@@ -248,6 +328,41 @@ func requireField(w http.ResponseWriter, name, value string) bool {
 		return false
 	}
 	return true
+}
+
+// normalizePermission accepts both the shorthand the CLI's --perm flag
+// uses (ro/rw) and the full config.Permission* values, so the API and CLI
+// agree on what's valid without the CLI needing to translate first.
+func normalizePermission(v string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "ro", "read-only", "readonly":
+		return config.PermissionReadOnly, nil
+	case "rw", "read-write", "readwrite":
+		return config.PermissionReadWrite, nil
+	default:
+		return "", fmt.Errorf("invalid permission %q (want \"ro\"/\"read-only\" or \"rw\"/\"read-write\")", v)
+	}
+}
+
+// normalizeMode accepts both the shorthand the CLI's --mode flag uses
+// (mirror/receive) and the full config.Mode* values.
+func normalizeMode(v string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "mirror":
+		return config.ModeMirror, nil
+	case "receive", "receive-only", "receiveonly":
+		return config.ModeReceiveOnly, nil
+	default:
+		return "", fmt.Errorf("invalid mode %q (want \"mirror\" or \"receive\"/\"receive-only\")", v)
+	}
+}
+
+// writeMutationError classifies err with mutationError and writes the
+// resulting error response. It is the one way handlers report a failed
+// core.Node mutation.
+func writeMutationError(w http.ResponseWriter, err error) {
+	status, code, msg := mutationError(err)
+	writeError(w, status, code, msg)
 }
 
 // mutationError classifies an error returned by one of core.Node's
