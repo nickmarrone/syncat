@@ -45,9 +45,8 @@ func TestPipeTransportBidirectional(t *testing.T) {
 	defer acceptedConn.Close()
 
 	const clientMsg = "hello from client"
-	if _, err := dialConn.Write([]byte(clientMsg)); err != nil {
-		t.Fatalf("client write: %v", err)
-	}
+	writeErr := make(chan error, 1)
+	go func() { _, err := dialConn.Write([]byte(clientMsg)); writeErr <- err }()
 	buf := make([]byte, len(clientMsg))
 	if _, err := io.ReadFull(acceptedConn, buf); err != nil {
 		t.Fatalf("server read: %v", err)
@@ -55,17 +54,21 @@ func TestPipeTransportBidirectional(t *testing.T) {
 	if string(buf) != clientMsg {
 		t.Fatalf("server got %q, want %q", buf, clientMsg)
 	}
+	if err := <-writeErr; err != nil {
+		t.Fatalf("client write: %v", err)
+	}
 
 	const serverMsg = "hello from server, a longer reply"
-	if _, err := acceptedConn.Write([]byte(serverMsg)); err != nil {
-		t.Fatalf("server write: %v", err)
-	}
+	go func() { _, err := acceptedConn.Write([]byte(serverMsg)); writeErr <- err }()
 	buf2 := make([]byte, len(serverMsg))
 	if _, err := io.ReadFull(dialConn, buf2); err != nil {
 		t.Fatalf("client read: %v", err)
 	}
 	if string(buf2) != serverMsg {
 		t.Fatalf("client got %q, want %q", buf2, serverMsg)
+	}
+	if err := <-writeErr; err != nil {
+		t.Fatalf("server write: %v", err)
 	}
 }
 
@@ -274,7 +277,7 @@ func TestPipeTransportWriteFailsAfterPeerClose(t *testing.T) {
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if err := conn.SetWriteDeadline(time.Now().Add(time.Second)); err != nil {
-			t.Fatalf("SetWriteDeadline: %v", err)
+			return // net.Pipe reports the already-closed peer here
 		}
 		if _, err := conn.Write(payload); err != nil {
 			return // expected: EPIPE/ECONNRESET, or the deadline
