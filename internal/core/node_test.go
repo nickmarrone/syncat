@@ -1693,3 +1693,89 @@ func TestConnectedPeerNeverReportsDialFailure(t *testing.T) {
 		nodeB.Close()
 	}
 }
+
+// TestDisabledPeerReportsDisconnected covers a peer that is configured but
+// switched off. Its supervisor is never started, so nothing in the connect
+// path ever runs for it — and nothing else set an initial state, so it
+// reached `syncat peer ls` and the REST API as an empty string rather than
+// as any of the four documented ConnStates.
+func TestDisabledPeerReportsDisconnected(t *testing.T) {
+	other := newTestNode(t, "disabledPeerRemote")
+	token := peerToken(t, other)
+
+	dir := t.TempDir()
+	paths, err := config.ResolvePaths(filepath.Join(dir, "config"), filepath.Join(dir, "data"))
+	if err != nil {
+		t.Fatalf("resolve paths: %v", err)
+	}
+	if err := paths.EnsureDirs(); err != nil {
+		t.Fatalf("ensure dirs: %v", err)
+	}
+	identity, _, err := config.LoadOrCreateIdentityKey(paths.IdentityKeyFile())
+	if err != nil {
+		t.Fatalf("load identity: %v", err)
+	}
+	cfg := config.Default()
+	cfg.NodeName = "disabledPeerLocal"
+	cfg.Peers = []config.Peer{{Name: "off", Token: token, Enabled: false}}
+
+	n, err := Open(context.Background(), Options{
+		Paths: paths, Config: cfg, Identity: identity,
+		Transport: transport.NewPipeTransport(newPipeAddr(t)),
+		Logger:    log.New(io.Discard, "", 0), DisableJitter: true,
+	})
+	if err != nil {
+		t.Fatalf("open node: %v", err)
+	}
+	t.Cleanup(func() { n.Close() })
+
+	peers := n.Status().Peers
+	if len(peers) != 1 {
+		t.Fatalf("Status().Peers = %d, want the disabled peer to still be listed", len(peers))
+	}
+	if peers[0].Enabled {
+		t.Errorf("peer reports Enabled = true, want false")
+	}
+	if peers[0].State != ConnStateDisconnected {
+		t.Errorf("disabled peer reports state %q, want %q", peers[0].State, ConnStateDisconnected)
+	}
+}
+
+// TestConnectedSinceClearedOnDisconnect pins PeerStatus.ConnectedSince to
+// its own documented contract — "when the *current* connection was
+// established; zero otherwise". It used to keep the dead connection's
+// timestamp after teardown, so anything rendering "connected for X" from it
+// showed a duration that kept climbing for a peer that was gone.
+// LastConnectedAt is the field that is meant to survive, and this checks it
+// still does.
+func TestConnectedSinceClearedOnDisconnect(t *testing.T) {
+	nodeA := newTestNode(t, "sinceA")
+	nodeB := newTestNode(t, "sinceB")
+
+	tokenA, tokenB := peerToken(t, nodeA), peerToken(t, nodeB)
+	if _, err := nodeA.AddPeer("B", tokenB); err != nil {
+		t.Fatalf("nodeA AddPeer: %v", err)
+	}
+	if _, err := nodeB.AddPeer("A", tokenA); err != nil {
+		t.Fatalf("nodeB AddPeer: %v", err)
+	}
+	waitFor(t, 10*time.Second, func() bool { return peerConnected(nodeA) && peerConnected(nodeB) })
+
+	if got := nodeA.Status().Peers[0].ConnectedSince; got.IsZero() {
+		t.Fatalf("ConnectedSince is zero while connected, want the connection's start time")
+	}
+
+	// Take nodeB away entirely, so nodeA's connection ends for a reason it
+	// cannot immediately redial around.
+	nodeB.Close()
+
+	waitFor(t, 10*time.Second, func() bool {
+		return nodeA.Status().Peers[0].State != ConnStateConnected
+	})
+	waitFor(t, 10*time.Second, func() bool {
+		return nodeA.Status().Peers[0].ConnectedSince.IsZero()
+	})
+	if got := nodeA.Status().Peers[0].LastConnectedAt; got.IsZero() {
+		t.Errorf("LastConnectedAt was cleared along with ConnectedSince, want it to survive the disconnect")
+	}
+}

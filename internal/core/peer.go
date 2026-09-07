@@ -171,7 +171,13 @@ func newPeerConn(n *Node, p config.Peer) (*peerConn, error) {
 		cancel:     cancel,
 		name:       p.Name,
 		enabled:    p.Enabled,
-		subAccess:  map[string]string{},
+		// Not the zero ConnState: a peer configured with "enabled": false
+		// never has its supervisor started (see startConfiguredPeers), so
+		// nothing else would ever set this, and it reached the REST API and
+		// `syncat peer ls` as an empty string. ConnStateDisconnected's own
+		// doc comment already covers the disabled case.
+		state:     ConnStateDisconnected,
+		subAccess: map[string]string{},
 	}, nil
 }
 
@@ -453,6 +459,13 @@ func (pc *peerConn) runConnection(sessCtx context.Context, cancel context.Cancel
 		pc.state = ConnStateDisconnected
 	}
 	uptime := pc.node.clock.Now().Sub(pc.connectedSince)
+	// Read for the log line above, then cleared: PeerStatus.ConnectedSince
+	// documents itself as zero unless the peer is connected, and leaving
+	// the dead connection's timestamp behind makes anything that renders
+	// "connected for X" from it -- the web UI included -- show a duration
+	// that keeps growing for a peer that is gone. lastConnectedAt is the
+	// field that deliberately survives, and it still does.
+	pc.connectedSince = time.Time{}
 	name := pc.name
 	close(done)
 	pc.mu.Unlock()
