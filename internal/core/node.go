@@ -191,7 +191,7 @@ func Open(ctx context.Context, opts Options) (*Node, error) {
 		startTime:    in.clock.Now(),
 	}
 	n.trash = syncsvc.NewTrash(opts.Paths.TrashDir(), asSyncClock(in.clock))
-	n.janitor = syncsvc.NewJanitor(n.trash, time.Duration(in.cfg.TrashRetentionDays)*24*time.Hour, asJanitorClock(in.clock), 0, nil)
+	n.janitor = syncsvc.NewJanitor(n.trash, time.Duration(in.cfg.TrashRetentionDays)*24*time.Hour, asJanitorClock(in.clock), 0, n.onTrashSweep)
 	n.janitor.Start(nodeCtx)
 
 	// From here on a failure has to unwind what has already been started,
@@ -436,6 +436,54 @@ func (n *Node) goTracked(fn func()) bool {
 		fn()
 	}()
 	return true
+}
+
+// onTrashSweep reports the trash janitor's periodic purge (SPEC.md §7).
+//
+// This callback was previously left nil, which made the janitor completely
+// silent: a sweep that failed — a permissions problem on the trash
+// directory, a disk error — was discarded by the janitor's loop with
+// nothing recorded anywhere, and successful purges deleted the user's only
+// remaining copy of a file with no record that it had happened. Retention
+// deletion is irreversible, so it gets a log line whenever it actually
+// removes something; a sweep that purges nothing (the overwhelmingly
+// common case, once a day) stays quiet.
+func (n *Node) onTrashSweep(purged int, err error) {
+	if err != nil {
+		n.logger.Printf("core: trash sweep failed after purging %d entr%s: %v", purged, plural(purged, "y", "ies"), err)
+		return
+	}
+	if purged > 0 {
+		n.logger.Printf("core: trash sweep purged %d expired entr%s past the retention window", purged, plural(purged, "y", "ies"))
+	}
+}
+
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
+}
+
+// debugEnabled reports whether the "debug" config flag is set. It gates the
+// routine-activity logging (per-pass sync summaries, scan results, config
+// mutations) that is useful when diagnosing a share that will not converge
+// and pure noise in a daemon at rest.
+func (n *Node) debugEnabled() bool {
+	n.cfgMu.RLock()
+	defer n.cfgMu.RUnlock()
+	return n.cfg.Debug
+}
+
+// debugf logs one routine, non-error event, suppressed unless the "debug"
+// config flag is set. Used for the config-mutation trail and the scan/sync
+// activity summaries: worth having when reconstructing what a node did and
+// far too chatty otherwise.
+func (n *Node) debugf(format string, args ...any) {
+	if !n.debugEnabled() {
+		return
+	}
+	n.logger.Printf(format, args...)
 }
 
 // nodeName returns the current configured node display name.

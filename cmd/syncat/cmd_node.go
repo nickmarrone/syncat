@@ -162,7 +162,7 @@ func cmdDaemon(paths *config.Paths, args []string) error {
 		return err
 	}
 
-	logger := log.New(os.Stderr, "syncat: ", log.LstdFlags)
+	logger := newDaemonLogger()
 
 	nodeCtx, nodeCancel := context.WithCancel(context.Background())
 	defer nodeCancel()
@@ -180,6 +180,28 @@ func cmdDaemon(paths *config.Paths, args []string) error {
 
 	waitAndShutdown(n, httpServer, serveErrCh, logger)
 	return nil
+}
+
+// newDaemonLogger builds the daemon's stderr logger, dropping the parts
+// of each line that whatever is reading stderr already supplies.
+//
+// systemd sets JOURNAL_STREAM when a service's stdout/stderr is connected
+// directly to the journal, and journald stamps every entry it receives with
+// its own timestamp and the unit's syslog identifier. Our own prefix and
+// LstdFlags are pure duplication there — `journalctl` shows
+//
+//	Sep 07 11:17:31 host syncat[98783]: syncat: 2026/09/07 11:17:31 api: ...
+//
+// with the date and the program name each appearing twice, which is both
+// noise and, in the case of the date, two different formats of the same
+// instant. Under journald we emit the bare message and let journald do the
+// framing; run from a terminal, where nothing else adds context, we keep
+// the full prefix and timestamp.
+func newDaemonLogger() *log.Logger {
+	if os.Getenv("JOURNAL_STREAM") != "" {
+		return log.New(os.Stderr, "", 0)
+	}
+	return log.New(os.Stderr, "syncat: ", log.LstdFlags)
 }
 
 // startDaemon does cmdDaemon's construction half: load config (with the

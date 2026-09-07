@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -83,10 +84,27 @@ type Session struct {
 	// warningsMu/warnings record every LocallyModifiedWarning this Session
 	// has raised (SPEC.md §1/§5's receive-only "flagged as locally
 	// modified" UI warning), for a caller (the API layer) to read back.
+	// warnIndex keys warnings by share+relpath so a file that stays
+	// diverged across many reconcile passes occupies one entry rather
+	// than one per pass — see recordWarning.
 	warningsMu sync.Mutex
 	warnings   []LocallyModifiedWarning
+	warnIndex  map[string]int
 
 	logger *log.Logger
+
+	// peerLabel is what logf puts in front of every line for this session.
+	// It defaults to peerID (an 8-byte hex ShortID) and is replaced by the
+	// peer's configured name via SetPeerLabel, so sync's log lines can be
+	// matched up with core's — which have always used the name — without
+	// cross-referencing `syncat peer ls`.
+	peerLabel string
+
+	// debug enables debugf, the routine-activity log (per-pass reconcile
+	// summaries). Off by default: these fire on every index update from
+	// every peer, which is the right level of detail when diagnosing why a
+	// share will not converge and far too much for a daemon at rest.
+	debug bool
 
 	// ctrlMu guards controlHandler/frameObserver, internal/core's hooks for
 	// driving the parts of the connection lifecycle Session itself doesn't
@@ -175,8 +193,10 @@ func NewSession(conn net.Conn, store *index.Store, nodeID, peerID string, clock 
 		store:     store,
 		nodeID:    nodeID,
 		peerID:    peerID,
+		peerLabel: peerID,
 		clock:     clock,
 		logger:    logger,
+		warnIndex: make(map[string]int),
 		shares:    make(map[string]*ShareConfig),
 		snapshots: make(map[string]protocol.IndexSnapshotBegin),
 		pullSem:   make(chan struct{}, maxConcurrentPulls),
@@ -200,6 +220,21 @@ func (s *Session) AddShare(cfg ShareConfig) {
 // trashHook a no-op.
 func (s *Session) SetTrash(tr *Trash) {
 	s.trash = tr
+}
+
+// SetPeerLabel replaces the peer identifier logf prefixes this session's
+// log lines with (default: the peer's ShortID). internal/core passes the
+// peer's configured name. Call before Start, like the other setters.
+func (s *Session) SetPeerLabel(label string) {
+	if label != "" {
+		s.peerLabel = label
+	}
+}
+
+// SetDebug enables this session's routine-activity logging (see the debug
+// field). Call before Start, like the other setters.
+func (s *Session) SetDebug(debug bool) {
+	s.debug = debug
 }
 
 // SetControlHandler registers fn to be called, synchronously from the read
@@ -271,11 +306,70 @@ func (s *Session) LocallyModifiedWarnings() []LocallyModifiedWarning {
 	return out
 }
 
-// recordWarning appends w to the session's warning log.
-func (s *Session) recordWarning(w LocallyModifiedWarning) {
+// recordWarning records w, replacing any previous warning for the same
+// share and relpath, and reports whether this is a *new* divergence — one
+// for which no warning was already standing.
+//
+// The dedup is not just tidiness. A locally-modified file is a standing
+// condition, not an event: it is re-detected by every reconcile pass for as
+// long as it stays diverged, and a receive-only share with a handful of
+// stray files reaches thousands of entries in an idle afternoon. Appending
+// each one grew this slice without bound for the life of the connection and
+// made the API repeat the same file once per pass in the UI's warning list.
+// Keeping the newest warning per path gives the UI exactly the set of
+// currently-diverged files, which is what it was always trying to show.
+//
+// The returned bool is what lets apply.go log a divergence once, when it
+// starts, instead of on every pass — see its call sites.
+func (s *Session) recordWarning(w LocallyModifiedWarning) bool {
+	key := w.ShareID + "\x00" + w.RelPath
 	s.warningsMu.Lock()
+	defer s.warningsMu.Unlock()
+	if i, ok := s.warnIndex[key]; ok {
+		s.warnings[i] = w
+		return false
+	}
+	s.warnIndex[key] = len(s.warnings)
 	s.warnings = append(s.warnings, w)
-	s.warningsMu.Unlock()
+	return true
+}
+
+// retainWarnings drops every standing warning for shareID whose relpath is
+// not in stillFlagged, and reports how many it dropped.
+//
+// A reconcile pass sees the whole share, so the paths it flags as locally
+// modified *are* the complete set of currently-diverged files for that
+// share. Anything holding a warning from an earlier pass but absent here
+// has converged — the user reverted their edit, or the file was deleted —
+// and its warning is stale. Without this the UI's warning list only ever
+// grew: a divergence that resolved itself stayed on screen for the life of
+// the connection.
+//
+// Called once per pass rather than per file so the whole reconciliation
+// costs one lock acquisition, not one per path in the share.
+func (s *Session) retainWarnings(shareID string, stillFlagged map[string]bool) int {
+	s.warningsMu.Lock()
+	defer s.warningsMu.Unlock()
+
+	kept := s.warnings[:0]
+	dropped := 0
+	for _, w := range s.warnings {
+		if w.ShareID == shareID && !stillFlagged[w.RelPath] {
+			dropped++
+			continue
+		}
+		kept = append(kept, w)
+	}
+	if dropped == 0 {
+		return 0
+	}
+	s.warnings = kept
+	// Positions shifted; rebuild the index rather than patching it.
+	s.warnIndex = make(map[string]int, len(s.warnings))
+	for i, w := range s.warnings {
+		s.warnIndex[w.ShareID+"\x00"+w.RelPath] = i
+	}
+	return dropped
 }
 
 func (s *Session) getShare(shareID string) (ShareConfig, bool) {
@@ -338,7 +432,15 @@ func (s *Session) Close() error {
 }
 
 func (s *Session) logf(format string, args ...any) {
-	s.logger.Printf("sync: session %s: "+format, append([]any{s.peerID}, args...)...)
+	s.logger.Printf("sync: peer %s: "+format, append([]any{s.peerLabel}, args...)...)
+}
+
+// debugf logs routine sync activity, suppressed unless SetDebug was called.
+func (s *Session) debugf(format string, args ...any) {
+	if !s.debug {
+		return
+	}
+	s.logf(format, args...)
 }
 
 // SyncShare sends a full snapshot IndexUpdate (Full: true) for shareID to
@@ -741,8 +843,16 @@ func (s *Session) handleIndexUpdate(ctx context.Context, msg protocol.IndexUpdat
 	var mu sync.Mutex
 	var changed []index.FileRow
 	var wg sync.WaitGroup
+	counts := map[ActionKind]int{}
+	flagged := make(map[string]bool)
 	for _, a := range actions {
 		a := a
+		if a.Kind == ActionLocallyModified {
+			flagged[a.RelPath] = true
+		}
+		if a.Kind != ActionNone {
+			counts[a.Kind]++
+		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -757,11 +867,39 @@ func (s *Session) handleIndexUpdate(ctx context.Context, msg protocol.IndexUpdat
 	}
 	wg.Wait()
 
+	// Every path in the share was just reconciled, so flagged is the
+	// complete current set of locally-modified files for it; anything
+	// still holding a warning from an earlier pass has converged.
+	s.retainWarnings(msg.ShareID, flagged)
+
 	if !cfg.Direction.OutboundBlocked && len(changed) > 0 {
 		if err := s.sendIndexUpdate(msg.ShareID, changed, false); err != nil {
 			s.logf("send delta for %s: %v", msg.ShareID, err)
 		}
 	}
+
+	// A pass over an already-converged share produces nothing but
+	// ActionNone, and there are a great many of those — one per file, on
+	// every update from every peer. Only say anything when the pass
+	// actually did something.
+	if len(counts) > 0 {
+		s.debugf("reconciled %s: %d file(s) in peer update, %s", msg.ShareID, len(msg.Files), formatActionCounts(counts))
+	}
+}
+
+// formatActionCounts renders a reconcile pass's non-ActionNone tally in a
+// stable order, e.g. "Pull=3 Delete=1" (the names come from
+// ActionKind.String). Fixed order rather than ranging the map so repeated
+// passes produce comparable, diffable lines.
+func formatActionCounts(counts map[ActionKind]int) string {
+	order := []ActionKind{ActionPull, ActionDelete, ActionResurrect, ActionConflictCopy, ActionLocallyModified}
+	parts := make([]string, 0, len(order))
+	for _, k := range order {
+		if n := counts[k]; n > 0 {
+			parts = append(parts, fmt.Sprintf("%s=%d", k, n))
+		}
+	}
+	return strings.Join(parts, " ")
 }
 
 // applyAndPersist executes one Action (applyAction) and writes every row it

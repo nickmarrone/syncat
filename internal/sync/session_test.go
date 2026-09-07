@@ -173,3 +173,117 @@ func TestPullFileWriterNotStartedBeforeStart(t *testing.T) {
 		t.Errorf("pullFile before Start = %v, want ErrWriterNotStarted", err)
 	}
 }
+
+// --- locally-modified warnings ----------------------------------------
+
+// newWarningSession builds a bare Session for exercising the warning
+// bookkeeping directly. Nothing here touches the connection, so a nil conn
+// is fine — the same trick session_test's trash helpers use.
+func newWarningSession(t *testing.T) *Session {
+	t.Helper()
+	return NewSession(nil, nil, "self", "peerid", nil, log.New(io.Discard, "", 0))
+}
+
+func warningPaths(s *Session) []string {
+	out := []string{}
+	for _, w := range s.LocallyModifiedWarnings() {
+		out = append(out, w.ShareID+"/"+w.RelPath)
+	}
+	return out
+}
+
+// TestRecordWarningDedupesPerPath is the property that keeps a standing
+// condition from being recorded as an unbounded stream of events. A
+// locally-modified file is re-detected by every reconcile pass for as long
+// as it stays diverged; appending each detection grew the warning slice
+// without bound for the life of the connection and made the UI repeat the
+// same file once per pass.
+func TestRecordWarningDedupesPerPath(t *testing.T) {
+	s := newWarningSession(t)
+
+	for i := 0; i < 10; i++ {
+		isNew := s.recordWarning(LocallyModifiedWarning{ShareID: "sh1", RelPath: "notes.txt", Reason: "diverged"})
+		if want := i == 0; isNew != want {
+			t.Errorf("pass %d: recordWarning new = %v, want %v", i, isNew, want)
+		}
+	}
+
+	got := warningPaths(s)
+	if len(got) != 1 || got[0] != "sh1/notes.txt" {
+		t.Fatalf("warnings = %v, want exactly one entry for sh1/notes.txt", got)
+	}
+}
+
+// TestRecordWarningKeepsLatestPerPath: the retained entry must be the most
+// recent one, so a revert (Reverted: true) replaces the earlier "flagged
+// only" record rather than being swallowed by it.
+func TestRecordWarningKeepsLatestPerPath(t *testing.T) {
+	s := newWarningSession(t)
+
+	s.recordWarning(LocallyModifiedWarning{ShareID: "sh1", RelPath: "notes.txt", Reason: "flagged"})
+	s.recordWarning(LocallyModifiedWarning{ShareID: "sh1", RelPath: "notes.txt", Reason: "reverted", Reverted: true})
+
+	got := s.LocallyModifiedWarnings()
+	if len(got) != 1 {
+		t.Fatalf("warnings = %d entries, want 1", len(got))
+	}
+	if !got[0].Reverted || got[0].Reason != "reverted" {
+		t.Errorf("warning = %+v, want the later Reverted record", got[0])
+	}
+}
+
+// TestRetainWarningsDropsConverged covers the other end of a warning's
+// life. A reconcile pass sees the whole share, so the paths it flags are
+// the complete set of currently-diverged files; anything still holding a
+// warning has converged and its warning is stale. Without this the UI's
+// warning list only ever grew — a divergence the user resolved stayed on
+// screen for the life of the connection.
+func TestRetainWarningsDropsConverged(t *testing.T) {
+	s := newWarningSession(t)
+
+	s.recordWarning(LocallyModifiedWarning{ShareID: "sh1", RelPath: "a.txt"})
+	s.recordWarning(LocallyModifiedWarning{ShareID: "sh1", RelPath: "b.txt"})
+	s.recordWarning(LocallyModifiedWarning{ShareID: "sh2", RelPath: "c.txt"})
+
+	// b.txt converged; a.txt is still diverged. sh2 was not reconciled by
+	// this pass and must be left entirely alone.
+	if dropped := s.retainWarnings("sh1", map[string]bool{"a.txt": true}); dropped != 1 {
+		t.Errorf("retainWarnings dropped %d, want 1", dropped)
+	}
+
+	got := warningPaths(s)
+	want := map[string]bool{"sh1/a.txt": true, "sh2/c.txt": true}
+	if len(got) != len(want) {
+		t.Fatalf("warnings = %v, want %v", got, want)
+	}
+	for _, p := range got {
+		if !want[p] {
+			t.Errorf("unexpected surviving warning %q (all: %v)", p, got)
+		}
+	}
+
+	// The index must still line up with the slice after the compaction:
+	// a re-flag of a surviving path is not new, and a re-flag of the
+	// dropped one is.
+	if s.recordWarning(LocallyModifiedWarning{ShareID: "sh1", RelPath: "a.txt"}) {
+		t.Error("re-flagging a still-standing warning reported it as new")
+	}
+	if !s.recordWarning(LocallyModifiedWarning{ShareID: "sh1", RelPath: "b.txt"}) {
+		t.Error("re-flagging a dropped warning did not report it as new")
+	}
+}
+
+// TestRetainWarningsNoopWhenAllStillFlagged guards the early return: a pass
+// where nothing converged must not rebuild the index or disturb ordering.
+func TestRetainWarningsNoopWhenAllStillFlagged(t *testing.T) {
+	s := newWarningSession(t)
+	s.recordWarning(LocallyModifiedWarning{ShareID: "sh1", RelPath: "a.txt"})
+	s.recordWarning(LocallyModifiedWarning{ShareID: "sh1", RelPath: "b.txt"})
+
+	if dropped := s.retainWarnings("sh1", map[string]bool{"a.txt": true, "b.txt": true}); dropped != 0 {
+		t.Errorf("retainWarnings dropped %d, want 0", dropped)
+	}
+	if got := warningPaths(s); len(got) != 2 {
+		t.Fatalf("warnings = %v, want both retained", got)
+	}
+}

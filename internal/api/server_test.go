@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/nickmarrone/syncat/internal/config"
@@ -710,5 +711,65 @@ func TestSubscriptionsList(t *testing.T) {
 	decodeJSONBody(t, w, &resp)
 	if len(resp.Subscriptions) != 1 || !resp.Subscriptions[0].Paused {
 		t.Fatalf("subscriptions after pause = %+v, want one, paused", resp.Subscriptions)
+	}
+}
+
+// --- access logging --------------------------------------------------------
+
+// captureLogs points srv's logger at a buffer and returns a func that reads
+// back everything logged so far.
+func captureLogs(srv *Server) func() string {
+	var buf bytes.Buffer
+	srv.logger = log.New(&buf, "", 0)
+	return buf.String
+}
+
+// TestLogMiddlewareSkipsSuccessfulStatusPolls covers the noise rule: the web
+// UI polls GET /api/status every 2s for as long as a tab is open, so logging
+// each one buries every other line in the daemon's log. A *failing* poll is
+// still logged — a status request answering 401 is exactly the kind of thing
+// the log exists for.
+func TestLogMiddlewareSkipsSuccessfulStatusPolls(t *testing.T) {
+	srv, _, _ := newTestServer(t)
+	logged := captureLogs(srv)
+
+	for i := 0; i < 5; i++ {
+		if rec := doRequest(t, srv, "GET", "/api/status", testToken, nil); rec.Code != http.StatusOK {
+			t.Fatalf("status poll %d: code = %d, want 200", i, rec.Code)
+		}
+	}
+	if out := logged(); out != "" {
+		t.Errorf("successful status polls logged %q, want nothing", out)
+	}
+
+	// A poll that fails auth must still be logged, with its status.
+	if rec := doRequest(t, srv, "GET", "/api/status", "wrong-token", nil); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("bad-token poll: code = %d, want 401", rec.Code)
+	}
+	out := logged()
+	if !strings.Contains(out, "/api/status") || !strings.Contains(out, "401") {
+		t.Errorf("failed status poll logged %q, want a line naming /api/status and 401", out)
+	}
+}
+
+// TestLogMiddlewareLogsOutcome covers the other half of the change: the
+// access log records what happened, not merely that a request arrived. The
+// old before-the-handler line made a 404 indistinguishable from a 200.
+func TestLogMiddlewareLogsOutcome(t *testing.T) {
+	srv, _, _ := newTestServer(t)
+	logged := captureLogs(srv)
+
+	if rec := doRequest(t, srv, "GET", "/api/peers", testToken, nil); rec.Code != http.StatusOK {
+		t.Fatalf("peers list: code = %d, want 200", rec.Code)
+	}
+	if out := logged(); !strings.Contains(out, "GET /api/peers -> 200") {
+		t.Errorf("logged %q, want a line containing \"GET /api/peers -> 200\"", out)
+	}
+
+	if rec := doRequest(t, srv, "DELETE", "/api/peers/nosuchpeer", testToken, nil); rec.Code == http.StatusOK {
+		t.Fatalf("delete of a missing peer returned 200, want an error status")
+	}
+	if out := logged(); !strings.Contains(out, "DELETE /api/peers/nosuchpeer") {
+		t.Errorf("logged %q, want the failing DELETE to appear", out)
 	}
 }

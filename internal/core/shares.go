@@ -142,6 +142,15 @@ func (n *Node) rescanShare(ctx context.Context, shareID string) error {
 	if len(result.Added) == 0 && len(result.ContentChanged) == 0 && len(result.Deleted) == 0 {
 		return nil
 	}
+	// Only reached when the scan found a real content change, so this does
+	// not fire on the idle periodic rescan — but a busy share still rescans
+	// on every fsnotify batch, which is why it is behind the debug flag.
+	// The counts are the useful part: they are exactly what is about to be
+	// pushed to every peer, so a share that keeps re-scanning the same file
+	// is visible here and nowhere else.
+	if n.debugEnabled() {
+		n.logger.Printf("core: rescan %s: %d added, %d changed, %d deleted; propagating", shareID, len(result.Added), len(result.ContentChanged), len(result.Deleted))
+	}
 	n.propagateShare(ctx, shareID)
 	return nil
 }

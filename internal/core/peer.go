@@ -309,6 +309,10 @@ func (pc *peerConn) offer(ctx context.Context, conn net.Conn, result *protocol.H
 	sessCtx, cancel := context.WithCancel(pc.ctx)
 	sess := syncsvc.NewSession(conn, node.store, node.identity.ShortID(), pc.peerShort, asSyncClock(node.clock), node.logger)
 	sess.SetTrash(node.trash)
+	// So sync's lines say "peer laptop" like core's, not a bare hex ShortID
+	// the reader has to look up in `syncat peer ls`.
+	sess.SetPeerLabel(pc.name)
+	sess.SetDebug(node.debugEnabled())
 
 	ka := protocol.NewKeepalive(asProtocolClock(node.clock), 0, 0)
 	sess.SetFrameObserver(func(protocol.MsgType) { ka.RecordReceived() })
@@ -332,6 +336,18 @@ func (pc *peerConn) offer(ctx context.Context, conn net.Conn, result *protocol.H
 	pc.mu.Unlock()
 
 	sess.Start(sessCtx)
+
+	// The one line that says this pairing is actually up. Without it a
+	// healthy node and one whose peer flaps every thirty seconds produce
+	// almost identical logs — the flapping one simply has less in it,
+	// since every existing line here is an error path. Pairs with
+	// runConnection's teardown line, which reports how long this lasted.
+	direction := "accepted from"
+	if dialed {
+		direction = "dialed"
+	}
+	node.logger.Printf("core: peer %s (%s): connected (%s, remote name %q)", pc.name, pc.peerShort, direction, result.PeerName)
+
 	node.sendShareList(sess, pc.peerKeyHex)
 	node.requestSubscriptions(sess, pc.peerKeyHex)
 
@@ -365,9 +381,18 @@ func (pc *peerConn) runConnection(sessCtx context.Context, cancel context.Cancel
 		pc.runKeepalive(sessCtx, ka, sess, conn)
 	}()
 
+	var why string
 	select {
 	case <-sess.Done(): // the read loop ended: peer closed, or the link broke
+		why = "peer closed the connection or the link broke"
 	case <-kaDone: // the dead rule fired, or the session context was cancelled
+		// runKeepalive distinguishes these two for us; a cancelled session
+		// context is an orderly local teardown (shutdown, peer removal,
+		// notePeerRedialed), not the 90s dead rule.
+		why = "keepalive ended the connection"
+		if sessCtx.Err() != nil {
+			why = "shut down locally"
+		}
 	}
 
 	cancel()
@@ -391,8 +416,15 @@ func (pc *peerConn) runConnection(sessCtx context.Context, cancel context.Cancel
 	if pc.state == ConnStateConnected {
 		pc.state = ConnStateDisconnected
 	}
+	uptime := pc.node.clock.Now().Sub(pc.connectedSince)
+	name := pc.name
 	close(done)
 	pc.mu.Unlock()
+
+	// Uptime is what makes this line worth having: a peer reconnecting
+	// every few seconds and one that has been up for a week both log a
+	// single "disconnected", and only the duration tells them apart.
+	pc.node.logger.Printf("core: peer %s (%s): disconnected after %s (%s)", name, pc.peerShort, uptime.Truncate(time.Second), why)
 }
 
 // runKeepalive drives SPEC.md §4's ping/dead rule for one connection until
@@ -413,6 +445,12 @@ func (pc *peerConn) runKeepalive(ctx context.Context, ka *protocol.Keepalive, se
 		}
 		ka.RecordSent()
 	}, func() {
+		// The single most diagnostic event the transport has: the peer
+		// stopped answering entirely. Silently closing here made it
+		// indistinguishable from the peer hanging up cleanly, which is
+		// the difference between "the other node was restarted" and "the
+		// network between us is black-holing traffic".
+		pc.node.logger.Printf("core: peer %s (%s): no traffic for the keepalive dead interval; treating the connection as dead", pc.name, pc.peerShort)
 		conn.Close() // dead per SPEC.md §4's 90s rule; unblocks the session's read loop
 	})
 }

@@ -110,8 +110,13 @@ func (s *Session) applyLocallyModified(ctx context.Context, cfg ShareConfig, a A
 	}
 
 	if a.Source != SourceRemote {
-		s.logf("locally modified, flagged only (no offerer content to revert to yet): %s/%s (%s)", cfg.ShareID, a.RelPath, a.Reason)
-		s.recordWarning(w)
+		// Log only when the divergence is new. This branch is re-entered
+		// for the same file by every reconcile pass for as long as the
+		// offerer has nothing to revert to, so logging unconditionally
+		// repeated one line per stray file per pass, forever.
+		if s.recordWarning(w) {
+			s.logf("locally modified, flagged only (no offerer content to revert to yet): %s/%s (%s)", cfg.ShareID, a.RelPath, a.Reason)
+		}
 		return nil, nil
 	}
 
@@ -120,6 +125,10 @@ func (s *Session) applyLocallyModified(ctx context.Context, cfg ShareConfig, a A
 		return nil, fmt.Errorf("sync: revert locally modified %s: %w", a.RelPath, err)
 	}
 	w.Reverted = true
+	// A revert resolves the divergence: the local copy now matches the
+	// offerer's. Replace the standing warning with this one (so the UI
+	// shows the revert) rather than leaving a stale "flagged" entry
+	// alongside it.
 	s.recordWarning(w)
 	return []index.FileRow{index.FileRowFromInfo(cfg.ShareID, a.Resolved, now)}, nil
 }

@@ -129,6 +129,7 @@ func (n *Node) AddPeer(name, token string) (string, error) {
 	n.peers[peerKeyHex] = pc
 	n.peersMu.Unlock()
 	n.goTracked(pc.runSupervisor)
+	n.debugf("core: added peer %q (%s)", name, pc.peerShort)
 	return peerKeyHex, nil
 }
 
@@ -211,6 +212,7 @@ func (n *Node) RemovePeer(peerRef string) error {
 	if pc != nil {
 		pc.cancel()
 	}
+	n.debugf("core: removed peer %s (dropped %d subscription(s), revoked access to %d share(s))", peerKeyHex, len(droppedSubs), len(droppedAccess))
 	return nil
 }
 
@@ -248,6 +250,7 @@ func (n *Node) AddShare(path, name, permission string, approvalRequired bool) (s
 		n.logger.Printf("core: add share: initial scan for %s: %v", id, err)
 	}
 	n.broadcastShareList()
+	n.debugf("core: added share %q (%s) at %s [%s, approval=%v]", name, id, path, permission, approvalRequired)
 	return id, nil
 }
 
@@ -273,6 +276,7 @@ func (n *Node) RemoveShare(shareRef string) error {
 	n.stopShareWatch(shareID)
 	n.neuterShareOnSessions(shareID)
 	n.broadcastShareList()
+	n.debugf("core: removed share %s", shareID)
 	return nil
 }
 
@@ -293,6 +297,7 @@ func (n *Node) RenameShare(shareRef, name string) error {
 		return fmt.Errorf("core: rename share: %w", err)
 	}
 	n.broadcastShareList()
+	n.debugf("core: renamed share %s to %q", shareID, name)
 	return nil
 }
 
@@ -336,6 +341,7 @@ func (n *Node) SetSharePermission(shareRef, permission string) error {
 		}
 	}
 	n.broadcastShareList()
+	n.debugf("core: share %s permission set to %s", shareID, permission)
 	return nil
 }
 
@@ -359,6 +365,7 @@ func (n *Node) SetShareApprovalRequired(shareRef string, required bool) error {
 		return fmt.Errorf("core: set share approval required: %w", err)
 	}
 	n.broadcastShareList()
+	n.debugf("core: share %s approval_required set to %v", shareID, required)
 	return nil
 }
 
@@ -400,6 +407,10 @@ func (n *Node) SetShareAccess(shareRef, peerRef, access string) error {
 	}); err != nil {
 		return fmt.Errorf("core: set share access: %w", err)
 	}
+	// Before the live-effect early returns below: the decision is persisted
+	// at this point regardless of whether the peer happens to be connected
+	// to receive the AccessUpdate, and it is the decision that matters here.
+	n.debugf("core: share %s access for peer %s set to %s", shareID, peerKeyHex, access)
 
 	pc := n.lookupPeer(peerKeyHex)
 	if pc == nil {
@@ -484,6 +495,7 @@ func (n *Node) AddSubscription(peerRef, shareRef, localPath, mode string) error 
 			n.logger.Printf("core: send subscribe request %s to %s: %v", shareID, peerKeyHex, err)
 		}
 	}
+	n.debugf("core: added subscription to share %s from peer %s at %s [%s]", shareID, peerKeyHex, localPath, mode)
 	return nil
 }
 
@@ -507,6 +519,7 @@ func (n *Node) RemoveSubscription(peerRef, shareRef string) error {
 	if pc := n.lookupPeer(peerKeyHex); pc != nil {
 		pc.neuterShare(shareID)
 	}
+	n.debugf("core: removed subscription to share %s from peer %s (local copy left on disk)", shareID, peerKeyHex)
 	return nil
 }
 
@@ -535,6 +548,7 @@ func (n *Node) PauseSubscription(peerRef, shareRef string, paused bool) error {
 		if pc != nil {
 			pc.neuterShare(shareID)
 		}
+		n.debugf("core: paused subscription to share %s from peer %s", shareID, peerKeyHex)
 		return nil
 	}
 
@@ -548,6 +562,7 @@ func (n *Node) PauseSubscription(peerRef, shareRef string, paused bool) error {
 			}
 		}
 	}
+	n.debugf("core: resumed subscription to share %s from peer %s", shareID, peerKeyHex)
 	return nil
 }
 
@@ -571,6 +586,7 @@ func (n *Node) RenameNode(name string) error {
 			n.tokenMu.Unlock()
 		}
 	}
+	n.debugf("core: node renamed to %q", name)
 	return nil
 }
 
@@ -655,5 +671,6 @@ func (n *Node) RestoreTrash(ctx context.Context, shareRef, relPath string) (inde
 	if err := n.rescanShare(ctx, shareID); err != nil {
 		n.logger.Printf("core: restore trash: rescan %s after restore: %v", shareID, err)
 	}
+	n.debugf("core: restored %s/%s from trash", shareID, relPath)
 	return row, nil
 }

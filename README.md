@@ -268,6 +268,46 @@ What the restart actually does, and what it can't undo:
   systemctl daemon-reload`) before the restart; replacing the binary alone does
   not.
 
+### Reading the log
+
+The daemon logs to stderr, which under systemd means `journalctl`. Two levels:
+
+**On by default** — everything you need to tell a healthy node from a sick one,
+quiet enough to leave running indefinitely:
+
+- peer connect and disconnect, with how the connection arrived (dialed vs.
+  accepted) and how long it lasted. A peer reconnecting every few seconds and
+  one up for a week both log a single "disconnected"; the duration is what
+  tells them apart.
+- a connection dropped by the keepalive dead rule (SPEC.md §4) — the peer
+  stopped answering entirely, as distinct from hanging up cleanly.
+- dial and handshake failures, rate-limited so a peer that has been unreachable
+  for a day does not fill the journal.
+- trash sweeps that actually purged something, and any sweep that failed.
+  Retention deletion is irreversible, so it leaves a record.
+- API requests, with status and duration. Successful `GET /api/status` polls
+  are skipped: the web UI polls every 2 seconds for as long as a tab is open,
+  and logging those drowns everything else. A *failing* status poll is still
+  logged.
+
+**Behind `debug`** — routine activity, for working out why a share will not
+converge:
+
+```bash
+syncat config set debug true
+systemctl --user restart syncat.service   # picked up at startup
+```
+
+Adds per-pass reconcile summaries (`Pull=3 Delete=1`), scan results with
+added/changed/deleted counts, a trail of every config mutation (peers, shares,
+grants, subscriptions), and tailcat's own network chatter (netcheck reports,
+link-change events). Set it back to `false` and restart when you are done.
+
+When the daemon's stderr goes straight to the journal, it drops its own
+`syncat:` prefix and timestamp, since journald already stamps both — so
+`journalctl` shows one date and one program name, not two. Run from a terminal
+it keeps them.
+
 ## How the three sync modes emerge
 
 There is no single "sync mode" setting. It falls out of the offerer's share

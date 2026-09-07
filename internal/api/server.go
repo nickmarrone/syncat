@@ -27,6 +27,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/nickmarrone/syncat/internal/config"
 	"github.com/nickmarrone/syncat/internal/core"
@@ -273,10 +274,49 @@ func (s *Server) recoverMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// statusRecorder captures the response status so logMiddleware can decide
+// after the fact whether a request was worth a log line. WriteHeader is not
+// guaranteed to be called — a handler that only writes a body implies 200 —
+// so status is seeded with http.StatusOK rather than zero.
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (rec *statusRecorder) WriteHeader(status int) {
+	rec.status = status
+	rec.ResponseWriter.WriteHeader(status)
+}
+
+// Unwrap lets http.ResponseController reach the underlying ResponseWriter,
+// so wrapping here doesn't cost a handler its flush/hijack capabilities.
+func (rec *statusRecorder) Unwrap() http.ResponseWriter { return rec.ResponseWriter }
+
+// isPollEndpoint reports whether path is one the web UI polls on a timer
+// rather than one a user or the CLI drives. The dashboard refreshes
+// GET /api/status every 2s for as long as a browser tab is open, so logging
+// every one of those buries every other line in the daemon's log — 30
+// lines a minute that say only "a tab is still open". A *failing* poll is
+// a different matter (see logMiddleware): a status request that starts
+// answering 401 or 500 is exactly the kind of thing the log should carry.
+func isPollEndpoint(path string) bool {
+	return path == "/api/status"
+}
+
 func (s *Server) logMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		s.logger.Printf("api: %s %s", r.Method, r.URL.Path)
-		next.ServeHTTP(w, r)
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		start := time.Now()
+		next.ServeHTTP(rec, r)
+
+		// Log after the handler, not before, so the line carries the
+		// outcome. The old before-the-call line reported only that a
+		// request had arrived, which made a 401 from a stale token or a
+		// 500 from a broken handler indistinguishable from a success.
+		if rec.status < 400 && isPollEndpoint(r.URL.Path) {
+			return
+		}
+		s.logger.Printf("api: %s %s -> %d (%s)", r.Method, r.URL.Path, rec.status, time.Since(start).Round(time.Millisecond))
 	})
 }
 
