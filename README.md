@@ -20,15 +20,15 @@ of trusted friends/family — not a general file-sharing service.
 
 Requires Go 1.27+. The build is cgo-free (pure-Go SQLite, see [Development](#development)):
 
-```console
-$ CGO_ENABLED=0 go build -o syncat ./cmd/syncat
+```bash
+CGO_ENABLED=0 go build -o syncat ./cmd/syncat
 ```
 
 Run one node:
 
-```console
-$ ./syncat init --name my-laptop
-$ ./syncat daemon &
+```bash
+./syncat init --name my-laptop
+./syncat daemon &
 ```
 
 Open `http://127.0.0.1:8347` for the web UI, or drive it from the CLI — see
@@ -39,14 +39,14 @@ Open `http://127.0.0.1:8347` for the web UI, or drive it from the CLI — see
 This is the flow `scripts/e2e.sh` automates end-to-end; here it is by hand,
 using `--config`/`--data` overrides so two nodes can run on one machine.
 
-```console
+```bash
 # --- terminal 1: alice -------------------------------------------------
-$ ./syncat --config ~/.alice-cfg --data ~/.alice-data init --name alice
-$ ./syncat --config ~/.alice-cfg --data ~/.alice-data daemon --api 127.0.0.1:18347 &
+./syncat --config ~/.alice-cfg --data ~/.alice-data init --name alice
+./syncat --config ~/.alice-cfg --data ~/.alice-data daemon --api 127.0.0.1:18347 &
 
 # --- terminal 2: bob ----------------------------------------------------
-$ ./syncat --config ~/.bob-cfg --data ~/.bob-data init --name bob
-$ ./syncat --config ~/.bob-cfg --data ~/.bob-data daemon --api 127.0.0.1:18348 &
+./syncat --config ~/.bob-cfg --data ~/.bob-data init --name bob
+./syncat --config ~/.bob-cfg --data ~/.bob-data daemon --api 127.0.0.1:18348 &
 ```
 
 `--api` on `daemon` only sets that process's listen address; the CLI reads
@@ -55,25 +55,218 @@ edit `config.json`'s `api_addr` before starting the daemon, or pass
 `--api` and always talk to that node's CLI with a matching `$CONFIG`/`$DATA`
 pair (as above).
 
-```console
+```bash
 # Exchange tokens and peer — both directions, since peering is mutual:
-$ ALICE_TOKEN=$(./syncat --config ~/.alice-cfg --data ~/.alice-data token)
-$ BOB_TOKEN=$(./syncat --config ~/.bob-cfg --data ~/.bob-data token)
-$ ./syncat --config ~/.bob-cfg --data ~/.bob-data peer add "$ALICE_TOKEN" --name alice
-$ ./syncat --config ~/.alice-cfg --data ~/.alice-data peer add "$BOB_TOKEN" --name bob
+ALICE_TOKEN=$(./syncat --config ~/.alice-cfg --data ~/.alice-data token)
+BOB_TOKEN=$(./syncat --config ~/.bob-cfg --data ~/.bob-data token)
+./syncat --config ~/.bob-cfg --data ~/.bob-data peer add "$ALICE_TOKEN" --name alice
+./syncat --config ~/.alice-cfg --data ~/.alice-data peer add "$BOB_TOKEN" --name bob
 
 # Watch them connect (DERP relay setup can take a few seconds):
-$ ./syncat --config ~/.alice-cfg --data ~/.alice-data status --watch
+./syncat --config ~/.alice-cfg --data ~/.alice-data status --watch
 
 # Alice offers a share, bob subscribes to it:
-$ ./syncat --config ~/.alice-cfg --data ~/.alice-data share add ~/Documents --name docs --perm rw
-$ ./syncat --config ~/.bob-cfg --data ~/.bob-data remote ls
-$ ./syncat --config ~/.bob-cfg --data ~/.bob-data subscription add <alice-name-or-id> <share-name-or-id> ~/docs-from-alice --mode mirror
+./syncat --config ~/.alice-cfg --data ~/.alice-data share add ~/Documents --name docs --perm rw
+./syncat --config ~/.bob-cfg --data ~/.bob-data remote ls
+./syncat --config ~/.bob-cfg --data ~/.bob-data subscription add <alice-name-or-id> <share-name-or-id> ~/docs-from-alice --mode mirror
 ```
 
 Write a file under `~/Documents` on alice's side and it appears under
 `~/docs-from-alice` on bob's — and, since the share is `read-write` and the
 subscription is `mirror`, changes flow the other way too.
+
+## Running as a systemd service
+
+`syncat daemon` is a plain foreground process: it logs to stderr, never forks,
+writes no PID file, and shuts down cleanly on SIGINT/SIGTERM
+(`cmd/syncat/cmd_node.go`). That is exactly what `Type=simple` wants, so the
+unit files below are short.
+
+**Prefer a user service.** syncat's whole on-disk layout is per-user — config
+and the API token under `$XDG_CONFIG_HOME/syncat`, keys, index, and trash under
+`$XDG_DATA_HOME/syncat`, and the directories you actually share are normally
+inside your home directory. A `systemctl --user` unit inherits the right `$HOME`
+and the right file ownership for free; a system unit has to be told all of it.
+
+### User service (recommended)
+
+Build once and install the binary somewhere stable, outside the checkout — the
+unit will keep executing whatever path you point it at, and you don't want that
+to be a build tree you might `git clean`:
+
+```bash
+CGO_ENABLED=0 go build -o syncat ./cmd/syncat
+install -Dm755 syncat ~/.local/bin/syncat
+~/.local/bin/syncat init --name my-laptop     # once, if you haven't already
+```
+
+`~/.config/systemd/user/syncat.service`:
+
+```ini
+[Unit]
+Description=syncat peer-to-peer directory sync
+Documentation=https://github.com/nickmarrone/syncat
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/syncat daemon
+Restart=on-failure
+RestartSec=5s
+
+# SIGTERM drains in-flight API requests within shutdownGrace (15s) and then
+# waits for the node's background goroutines; leave room for both.
+TimeoutStopSec=30s
+
+[Install]
+WantedBy=default.target
+```
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now syncat.service
+systemctl --user status syncat.service
+journalctl --user -u syncat.service -f      # the daemon's stderr log
+```
+
+By default a user manager exits with your last session, which would stop syncing
+the moment you log out. Enable lingering so the node runs from boot regardless:
+
+```bash
+loginctl enable-linger "$USER"
+```
+
+Things worth knowing before you tune the unit:
+
+- **Don't put `--api` in `ExecStart`.** It only changes what that *process*
+  listens on; every CLI invocation reads `api_addr` back out of `config.json`
+  and would then talk to the wrong port. To move the API, `syncat config set
+  api_addr 127.0.0.1:9000` and restart the unit.
+- **Hardening that hides `$HOME` breaks syncat.** `ProtectHome=yes` (or
+  `read-only`) makes shares unreadable or unwritable, and a `ProtectSystem=strict`
+  unit needs every share, subscription, config, and data path listed in
+  `ReadWritePaths=`. `NoNewPrivileges=yes` and `PrivateTmp=yes` are free — syncat
+  needs no privileges and no shared tmp. The API is loopback-only regardless
+  (`api.ListenLoopback` refuses to bind anything else).
+- **inotify limits.** The watcher registers a watch per directory, recursively,
+  across every share and subscription (`internal/index/watcher.go`). Big trees
+  can exhaust `fs.inotify.max_user_watches`; if the journal shows watch
+  registration failing, raise it with a `sysctl` drop-in. Missed events are still
+  picked up by the periodic rescan (`rescan_interval_seconds`), just late.
+- **No inbound firewall ports.** tailcat only dials out — directly where NAT
+  traversal succeeds, otherwise relayed over DERP. Port 4197 lives *inside* the
+  tunnel, not on the host.
+
+### System-wide service
+
+Worth it only for a machine-scoped node — a NAS, a backup box, anything with no
+interactive user to log in. Run it as a dedicated unprivileged account (syncat
+never needs root) and be explicit about paths, since the defaults are derived
+from `$HOME`:
+
+`/etc/systemd/system/syncat.service`:
+
+```ini
+[Unit]
+Description=syncat peer-to-peer directory sync
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=syncat
+Group=syncat
+ConfigurationDirectory=syncat
+ConfigurationDirectoryMode=0700
+StateDirectory=syncat
+StateDirectoryMode=0700
+Environment=HOME=/var/lib/syncat
+ExecStart=/usr/local/bin/syncat --config /etc/syncat --data /var/lib/syncat daemon
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/etc/syncat /var/lib/syncat /srv/shared
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`syncat init` and every later CLI call must run as that same user with the same
+overrides — the client reads `api.token` (mode 0600) out of the config dir, so
+running as yourself gets you a permission error, not a different node:
+
+```bash
+sudo -u syncat /usr/local/bin/syncat --config /etc/syncat --data /var/lib/syncat init --name nas
+sudo systemctl enable --now syncat.service
+sudo -u syncat /usr/local/bin/syncat --config /etc/syncat --data /var/lib/syncat status
+journalctl -u syncat.service -f
+```
+
+A shell alias or a two-line wrapper script carrying `--config`/`--data` saves a
+lot of typing here.
+
+### Upgrades
+
+syncat is a single static binary plus on-disk state that migrates itself
+forward, so an upgrade is: build, swap the binary, restart the unit.
+
+```bash
+git pull
+CGO_ENABLED=0 go build -o syncat ./cmd/syncat
+install -Dm755 syncat ~/.local/bin/syncat
+systemctl --user restart syncat.service
+journalctl --user -u syncat.service -n 30
+```
+
+Replace the binary by *swapping the file*, not writing through it — `install`
+(or `mv` from a temp name in the same directory) puts a new inode in place,
+whereas `cp` writes into the inode the running daemon is executing, which Linux
+refuses with `ETXTBSY`. Swapping also means you can stage the new binary at any
+time and choose the restart window separately; the running process holds its old
+inode until it exits.
+
+What the restart actually does, and what it can't undo:
+
+- **The index migrates itself, forward only.** The SQLite index records its
+  schema version in `PRAGMA user_version`, and the daemon runs any pending
+  migration steps at open, one transaction per step
+  (`internal/index/store.go`) — there is nothing to run by hand. There are no
+  down migrations, though: once a newer binary has migrated the index, an older
+  binary refuses to open it with `database schema version N is newer than this
+  binary supports (M)`. If you might roll back across a schema bump, stop the
+  unit and copy `index.db`, `index.db-wal`, and `index.db-shm` out of
+  `~/.local/share/syncat/db/` first.
+- **`config.json` upgrades silently.** It's read at startup and missing fields
+  are filled in by `ApplyDefaults` (`internal/config/config.go`), so a config
+  written by an older build just works. The reverse is lossy: an older binary
+  ignores keys it doesn't know, and the next config mutation rewrites the file
+  without them.
+- **Protocol version is lockstep across peers.** This build speaks
+  `proto_version` 2 and both offers and requires it — `Config.MinVersion`
+  defaults to `CurrentProtoVersion` (`internal/protocol/handshake.go`) — so
+  across a protocol bump the two sides reject each other's handshake with
+  `unsupported_proto_version` rather than negotiating down. Peers you haven't
+  upgraded yet stop syncing (and log rejected handshakes) until you do, so a
+  protocol bump wants a coordinated upgrade of every node. Within a single
+  protocol version, mixed builds are fine and you can upgrade one node at a time.
+- **Restarting mid-sync is safe, just not free.** SIGTERM stops the API, then
+  closes the node, which waits for its background goroutines. Peers see the
+  session drop and reconnect with backoff. Transfers interrupted by the restart
+  are *not* resumed — there is no resume yet (see [Deferred past the
+  MVP](#deferred-past-the-mvp)) — so a file that was half-transferred starts
+  over from byte 0 on reconnect. Restarting during a multi-gigabyte initial sync
+  costs you that file's progress, nothing more; the index and everything already
+  written to disk survive.
+- **Rolling back** is the same three steps in reverse — stop the unit, put the
+  old binary back, start it — and works as long as no schema migration ran. If
+  one did, restore the database copy you took alongside it.
+- **Editing the unit file** needs `systemctl --user daemon-reload` (or `sudo
+  systemctl daemon-reload`) before the restart; replacing the binary alone does
+  not.
 
 ## How the three sync modes emerge
 
@@ -275,13 +468,13 @@ item, in the order it is worth doing.
 
 ## Development
 
-```console
-$ CGO_ENABLED=0 go build ./...
-$ go vet ./...
-$ go test -count=1 ./...
-$ go test -race ./...
-$ go test -fuzz=FuzzDecode ./internal/protocol   # frame decoder, run for a bit then Ctrl-C
-$ scripts/e2e.sh                                  # two real daemons over live tailcat
+```bash
+CGO_ENABLED=0 go build ./...
+go vet ./...
+go test -count=1 ./...
+go test -race ./...
+go test -fuzz=FuzzDecode ./internal/protocol   # frame decoder, run for a bit then Ctrl-C
+scripts/e2e.sh                                  # two real daemons over live tailcat
 ```
 
 `CGO_ENABLED=0` is required, not just convenient: `modernc.org/sqlite` is a
