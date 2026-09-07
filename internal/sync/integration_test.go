@@ -893,3 +893,47 @@ func TestIntegration_RestorePropagatesAsNewChange(t *testing.T) {
 		t.Fatalf("B's version %v does not match A's restored version %v", bRow.Version, row.Version)
 	}
 }
+
+// TestReconcileShareRecoversAfterAFailedPull covers the gap that made an
+// interrupted transfer permanent.
+//
+// handleIndexUpdate was the only thing that reconciled, so "the peer sent us
+// rows" was the only trigger for noticing a file is missing. A pull that
+// fails leaves the peer's rows already recorded in peer_files and the file
+// still absent locally — and on reconnect the peer sends nothing, because its
+// index sync is incremental and its cursor says we already have those rows.
+// Nothing revisited it, so the file stayed missing indefinitely.
+//
+// The setup is that state exactly: the subscriber knows what the offerer has,
+// because a previous session recorded it in peer_files, but has neither the
+// file nor a local index row, because apply is atomic and the interrupted
+// pull never got as far as installing anything. No index update is sent here
+// at all — that is the point, and it is what the reconnected peer would
+// (not) send.
+func TestReconcileShareRecoversAfterAFailedPull(t *testing.T) {
+	ctx := context.Background()
+	a := newTestNode(t, "offerer")
+	b := newTestNode(t, "subscriber")
+
+	writeFile(t, a.root, "big.bin", "the payload")
+	row := indexFile(t, a.store, a.id, "big.bin", a.root)
+
+	sa, sb := connectSessions(t, a, b, Direction{}, Direction{})
+	_ = sa
+
+	// What the interrupted session left behind on the subscriber.
+	if err := b.store.UpsertPeerFiles(ctx, a.id, []index.FileRow{row}); err != nil {
+		t.Fatalf("record what the peer has: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(b.root, "big.bin")); !os.IsNotExist(err) {
+		t.Fatalf("the subscriber should not have the file yet")
+	}
+
+	// Deliberately no mustSync: the offerer has nothing new to say, exactly
+	// as after a reconnect. Without ReconcileShare nothing pulls, ever.
+	if err := sb.ReconcileShare(ctx, testShareID); err != nil {
+		t.Fatalf("ReconcileShare: %v", err)
+	}
+
+	waitForFile(t, 10*time.Second, b.store, testShareID, b.root, "big.bin", "the payload")
+}
