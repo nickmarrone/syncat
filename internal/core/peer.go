@@ -361,6 +361,15 @@ func (pc *peerConn) offer(ctx context.Context, conn net.Conn, result *protocol.H
 	sess.SetControlHandler(func(typ protocol.MsgType, payload []byte) {
 		pc.handleControl(sessCtx, sess, typ, payload)
 	})
+	// SPEC.md §5's fan-out: a change this peer sent us has to reach the
+	// share's *other* peers, and this session is the only thing that knows
+	// it happened. Handed to goTracked rather than run inline because the
+	// callback fires with the session's reconcile lock held for that share,
+	// and SyncShare writes a full snapshot to every other connection —
+	// which can block on their writers' bulk lanes.
+	sess.SetAppliedHandler(func(shareID string) {
+		node.goTracked(func() { node.propagateShareExcept(sessCtx, shareID, pc) })
+	})
 
 	pc.sessCancel = cancel
 	pc.session = sess

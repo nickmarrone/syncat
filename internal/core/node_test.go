@@ -1779,3 +1779,91 @@ func TestConnectedSinceClearedOnDisconnect(t *testing.T) {
 		t.Errorf("LastConnectedAt was cleared along with ConnectedSince, want it to survive the disconnect")
 	}
 }
+
+// TestFanOutThroughHub covers SPEC.md §5's fan-out rule with the smallest
+// topology that can show it: one share offered by a hub to two spokes.
+//
+// Two nodes are not enough. With a single peer, a change pulled from it is
+// answered by the delta Session sends back at the end of handleIndexUpdate,
+// and everything converges. Add a second peer and that delta reaches only
+// the node the change came from. Nothing else was telling the other one:
+// internal/core propagates a share when a *rescan* finds the working tree
+// and the index disagree, and applying a pulled change updates both, so the
+// scan that follows finds nothing and returns before it would propagate.
+// The periodic rescan finds the same nothing, so it never healed either —
+// a write on one spoke simply never reached the other, indefinitely.
+func TestFanOutThroughHub(t *testing.T) {
+	ctx := context.Background()
+	hub := newTestNode(t, "hub")
+	spokeA := newTestNode(t, "spokeA")
+	spokeB := newTestNode(t, "spokeB")
+
+	shareDir := t.TempDir()
+	shareID, err := hub.AddShare(shareDir, "docs", config.PermissionReadWrite, false)
+	if err != nil {
+		t.Fatalf("AddShare: %v", err)
+	}
+
+	// Both spokes peer with the hub, and only with the hub — peers of the
+	// same share never talk to each other.
+	hubToken := peerToken(t, hub)
+	for _, s := range []struct {
+		name string
+		node *Node
+	}{{"spokeA", spokeA}, {"spokeB", spokeB}} {
+		if _, err := hub.AddPeer(s.name, peerToken(t, s.node)); err != nil {
+			t.Fatalf("hub AddPeer %s: %v", s.name, err)
+		}
+		if _, err := s.node.AddPeer("hub", hubToken); err != nil {
+			t.Fatalf("%s AddPeer hub: %v", s.name, err)
+		}
+	}
+	waitFor(t, 10*time.Second, func() bool {
+		return len(hub.Status().Peers) == 2 &&
+			hub.Status().Peers[0].State == ConnStateConnected &&
+			hub.Status().Peers[1].State == ConnStateConnected &&
+			peerConnected(spokeA) && peerConnected(spokeB)
+	})
+
+	dirA, dirB := t.TempDir(), t.TempDir()
+	if err := spokeA.AddSubscription(hub.PeerKey(), shareID, dirA, config.ModeMirror); err != nil {
+		t.Fatalf("spokeA AddSubscription: %v", err)
+	}
+	if err := spokeB.AddSubscription(hub.PeerKey(), shareID, dirB, config.ModeMirror); err != nil {
+		t.Fatalf("spokeB AddSubscription: %v", err)
+	}
+
+	// A change at the hub reaches both spokes — this much always worked,
+	// and is here so a failure below can't be blamed on the topology never
+	// having come up.
+	if err := os.WriteFile(filepath.Join(shareDir, "hub.txt"), []byte("from the hub"), 0o644); err != nil {
+		t.Fatalf("write hub file: %v", err)
+	}
+	if err := hub.RescanShare(ctx, shareID); err != nil {
+		t.Fatalf("RescanShare on hub: %v", err)
+	}
+	waitFor(t, 10*time.Second, func() bool {
+		return fileHas(filepath.Join(dirA, "hub.txt"), "from the hub") &&
+			fileHas(filepath.Join(dirB, "hub.txt"), "from the hub")
+	})
+
+	// The actual subject: a change on one spoke has to reach the other, and
+	// the only path there is through the hub.
+	if err := os.WriteFile(filepath.Join(dirA, "spoke.txt"), []byte("from spoke A"), 0o644); err != nil {
+		t.Fatalf("write spoke file: %v", err)
+	}
+	if err := spokeA.RescanShare(ctx, shareID); err != nil {
+		t.Fatalf("RescanShare on spokeA: %v", err)
+	}
+	waitFor(t, 10*time.Second, func() bool {
+		return fileHas(filepath.Join(shareDir, "spoke.txt"), "from spoke A")
+	})
+	waitFor(t, 10*time.Second, func() bool {
+		return fileHas(filepath.Join(dirB, "spoke.txt"), "from spoke A")
+	})
+}
+
+func fileHas(path, want string) bool {
+	data, err := os.ReadFile(path)
+	return err == nil && string(data) == want
+}

@@ -163,7 +163,23 @@ func (n *Node) rescanShare(ctx context.Context, shareID string) error {
 // multiple peers propagates through the offerer; peers of the same share
 // never sync directly with each other).
 func (n *Node) propagateShare(ctx context.Context, shareID string) {
+	n.propagateShareExcept(ctx, shareID, nil)
+}
+
+// propagateShareExcept is propagateShare with one peer left out: the one a
+// change just arrived from, which its own Session has already answered with
+// a delta at the end of handleIndexUpdate.
+//
+// This is the other half of SPEC.md §5's fan-out rule. A change that
+// originates locally reaches every peer through rescanShare, but a change
+// *pulled* from one peer reaches the rest only through here — see
+// syncsvc.Session.SetAppliedHandler for why no rescan will do it, and
+// scripts/net/08-three-node-fanout.sh for the case that proves it.
+func (n *Node) propagateShareExcept(ctx context.Context, shareID string, except *peerConn) {
 	for _, pc := range n.snapshotPeers() {
+		if pc == except {
+			continue
+		}
 		pc.mu.Lock()
 		sess := pc.session
 		active := pc.activeShares != nil && pc.activeShares[shareID]
