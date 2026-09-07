@@ -13,6 +13,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/nickmarrone/syncat/internal/index"
@@ -27,6 +28,60 @@ import (
 // directory delete that was skipped). The caller (handleIndexUpdate)
 // persists the returned rows via Store.PutFile and, unless outbound is
 // blocked, reports them back to the peer.
+// TempFilePrefix is the name prefix apply gives its staging files. It is
+// exported so internal/core can sweep orphans (see SweepTempFiles) and so
+// path.go's validation and index's ignore list can agree on one spelling.
+const TempFilePrefix = ".syncat.tmp."
+
+// SweepTempFiles removes staging files left in root by transfers that never
+// finished, and returns how many it removed.
+//
+// Apply stages a download in a temp file beside its destination and only
+// renames it into place once the content verifies, so a transfer interrupted
+// part-way leaves that file behind. In-process failures unwind and clean up
+// after themselves; a killed daemon cannot, and the orphan is then permanent.
+// That is not cosmetic for a tool built to move large files: the leftover is
+// full-size, it sits in the user's own synced directory, and it is hidden, so
+// nothing draws attention to it while it accumulates one copy per crash.
+//
+// Meant to be called at startup, before any session exists — with no transfer
+// in flight, every file matching the prefix is by definition an orphan.
+// Calling it while a transfer is running would delete that transfer's staging
+// file, so don't.
+func SweepTempFiles(root string) (int, error) {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("sync: sweep temp files in %s: %w", root, err)
+	}
+	removed := 0
+	var firstErr error
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() {
+			// Staging files are written beside their destination, so a
+			// nested share needs the subdirectories swept too.
+			n, err := SweepTempFiles(filepath.Join(root, name))
+			removed += n
+			if err != nil && firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if !strings.HasPrefix(name, TempFilePrefix) {
+			continue
+		}
+		if err := os.Remove(filepath.Join(root, name)); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("sync: sweep temp files in %s: %w", root, err)
+			continue
+		}
+		removed++
+	}
+	return removed, firstErr
+}
+
 func (s *Session) applyAction(ctx context.Context, cfg ShareConfig, a Action) ([]index.FileRow, error) {
 	now := time.Now()
 
@@ -313,7 +368,7 @@ func (s *Session) pullAndInstall(ctx context.Context, shareID, root, wireRelPath
 		return nil
 	}
 
-	tmp, err := os.CreateTemp(filepath.Dir(destAbs), ".syncat.tmp.*")
+	tmp, err := os.CreateTemp(filepath.Dir(destAbs), TempFilePrefix+"*")
 	if err != nil {
 		return fmt.Errorf("sync: install %s: create temp file: %w", destRelPath, err)
 	}

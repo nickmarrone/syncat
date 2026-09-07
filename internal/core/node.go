@@ -301,12 +301,33 @@ func loadOpenInputs(opts Options) (openInputs, error) {
 	return openInputs{cfg: cfg, identity: identity, clock: clock, rand: rnd, logger: logger}, nil
 }
 
+// sweepTempFiles removes staging files a previous run left in root, before
+// anything can start a transfer into it.
+//
+// Apply only renames a download into place once its content verifies, so a
+// daemon killed mid-transfer leaves a full-size staging file behind with no
+// one to clean it up. Startup is the one moment this is unambiguously safe:
+// no session exists yet, so nothing matching the prefix can belong to a
+// transfer in flight. Without it the orphans are permanent, and they are
+// hidden files inside the user's own synced directory, so they accumulate a
+// copy per crash without anything drawing attention to them.
+func (n *Node) sweepTempFiles(shareID, root string) {
+	removed, err := syncsvc.SweepTempFiles(root)
+	if err != nil {
+		n.logger.Printf("core: open: sweep interrupted-transfer files for %s: %v", shareID, err)
+	}
+	if removed > 0 {
+		n.logger.Printf("core: open: removed %d interrupted-transfer file(s) left in %s", removed, root)
+	}
+}
+
 // startConfiguredWatches starts a watcher and runs the initial synchronous
 // scan for every share and every non-paused subscription in cfg. Failures
 // are logged per entry rather than failing Open: one bad directory should
 // not keep the rest of the node from starting.
 func (n *Node) startConfiguredWatches(cfg *config.Config) {
 	for _, s := range cfg.Shares {
+		n.sweepTempFiles(s.ID, s.Path)
 		if _, err := n.startShareWatch(s.ID, s.Path); err != nil {
 			n.logger.Printf("core: open: start watcher for share %s: %v", s.ID, err)
 			continue
@@ -319,6 +340,7 @@ func (n *Node) startConfiguredWatches(cfg *config.Config) {
 		if sub.Paused {
 			continue
 		}
+		n.sweepTempFiles(sub.ShareID, sub.LocalPath)
 		if _, err := n.startShareWatch(sub.ShareID, sub.LocalPath); err != nil {
 			n.logger.Printf("core: open: start watcher for subscription %s: %v", sub.ShareID, err)
 			continue
