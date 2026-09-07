@@ -18,7 +18,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 harness_init restart-mid-transfer
 
-SOAK_FILE_MB="${SOAK_FILE_MB:-256}"
+# Larger than 22's default: this one has to still be running when we kill it,
+# and a direct path moves bytes fast enough that a small file is gone before
+# the kill can land.
+SOAK_FILE_MB="${SOAK_FILE_MB:-512}"
 
 node_add alice
 node_add bob
@@ -36,16 +39,20 @@ dd if=/dev/urandom of="$ALICE_SHARE/big.bin" bs=1M count="$SOAK_FILE_MB" status=
 WANT="$(sha_of "$ALICE_SHARE/big.bin")"
 
 log "Waiting for the transfer to be genuinely under way"
-# A temp file with something in it is the proof that bytes are actually
-# moving; killing before that would test a reconnect, not an interruption.
+# A temp file is apply.go's staging area, so its existence is the proof that
+# bytes are actually moving; killing before that would test a reconnect, not
+# an interruption.
+#
+# Busy-polled, and deliberately not waiting for any particular size. When the
+# two nodes find a direct path rather than a relay, hundreds of megabytes
+# cross in a couple of seconds — a once-a-second poll misses the window
+# outright and then times out waiting for a transfer that has already
+# finished, which is a bug in the test and looks exactly like a bug in the
+# product.
 transfer_started() {
-	local f
-	for f in "$BOB_SYNC"/.syncat.tmp.*; do
-		[ -f "$f" ] && [ "$(stat -c %s "$f" 2>/dev/null || echo 0)" -gt 1000000 ] && return 0
-	done
-	return 1
+	compgen -G "$BOB_SYNC/.syncat.tmp.*" >/dev/null 2>&1
 }
-wait_for 300 "bob to have pulled at least a megabyte into a temp file" transfer_started
+wait_fast 300 "bob to start staging the file into a temp file" transfer_started
 
 log "SIGKILLing bob mid-transfer"
 node_kill bob

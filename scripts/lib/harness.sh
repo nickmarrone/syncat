@@ -153,6 +153,28 @@ wait_while() {
 	info "ok: $desc (${elapsed}s)"
 }
 
+# wait_fast TIMEOUT_SECS DESCRIPTION PREDICATE [ARGS...]
+#
+# wait_for with a busy poll instead of a 1s tick, for conditions that exist
+# only briefly. Catching a transfer *while it is running* is the case that
+# needs it: on a direct path a few hundred megabytes can cross in a couple of
+# seconds, and a once-a-second poll will happily miss the entire window and
+# then report a timeout waiting for something that already finished.
+wait_fast() {
+	local timeout="$1" desc="$2"
+	shift 2
+	local start elapsed
+	start=$(date +%s)
+	until "$@" >/dev/null 2>&1; do
+		elapsed=$(($(date +%s) - start))
+		if [ "$elapsed" -ge "$timeout" ]; then
+			fail "timed out after ${timeout}s waiting for: $desc"
+		fi
+		sleep 0.02
+	done
+	info "ok: $desc ($(($(date +%s) - start))s)"
+}
+
 # hold_for SECONDS DESCRIPTION PREDICATE [ARGS...]
 #
 # The opposite of wait_for, and the shape most of the soak scenarios need:
@@ -188,6 +210,21 @@ harness_init() {
 	}
 
 	WORK="${TMPDIR:-/tmp}/syncat-test/$HARNESS_NAME"
+
+	# The work dir is a fixed path per scenario — reused and wiped on every
+	# run, so there is always exactly one place to look afterwards. That only
+	# works if one instance runs at a time: two concurrent runs of the same
+	# scenario share config dirs and stomp each other, and the result is
+	# baffling rather than obviously wrong (two shares with the same name, a
+	# lookup by name that returns both, and a wait that can never succeed).
+	# The runner is sequential, so this only catches a hand-started scenario
+	# racing one already in flight — which is exactly when it is confusing.
+	if pgrep -f "$WORK" >/dev/null 2>&1; then
+		echo "FAIL[$HARNESS_NAME]: another run of this scenario is still using $WORK" >&2
+		echo "  processes: $(pgrep -f "$WORK" | tr '\n' ' ')" >&2
+		exit 1
+	fi
+
 	rm -rf "$WORK"
 	mkdir -p "$WORK"
 
@@ -295,6 +332,12 @@ node_pid() { eval "echo \"\${NODE_$1_PID:-}\""; }
 node_start() {
 	local name="$1"
 	[ -z "$(node_pid "$name")" ] || fail "node $name is already running"
+	# A node's log accumulates across restarts, which is what makes it useful
+	# — and also what makes it misleading without this line. Reading a
+	# restart scenario's log, the previous process's final moments sit
+	# directly above the new one's first, and it is very easy to attribute
+	# both to the same daemon and conclude something impossible is happening.
+	printf '\n===== %s: daemon starting (%s) =====\n' "$name" "$(date -u +%H:%M:%S)" >>"$WORK/$name/daemon.log"
 	(exec "$BIN" --config "$WORK/$name/config" --data "$WORK/$name/data" daemon) >>"$WORK/$name/daemon.log" 2>&1 &
 	eval "NODE_${name}_PID=$!"
 	wait_for "$API_TIMEOUT" "$name's API to accept requests" node_api_up "$name"
@@ -393,8 +436,17 @@ peer_connected_since() {
 
 peer_key_of() { nx "$1" status --json 2>/dev/null | jq -r '.peer_key'; }
 
+# share_id_of echoes the single share named $2, and fails loudly if the name
+# is ambiguous. Returning two ids on two lines is worse than returning none:
+# every predicate downstream then compares against a two-line string, matches
+# nothing, and times out pointing at the wrong thing entirely.
 share_id_of() {
-	nx "$1" share ls --json 2>/dev/null | jq -r --arg n "$2" '.[]? | select(.name==$n) | .id'
+	local ids
+	ids="$(nx "$1" share ls --json 2>/dev/null | jq -r --arg n "$2" '.[]? | select(.name==$n) | .id')"
+	if [ "$(echo "$ids" | grep -c .)" -gt 1 ]; then
+		fail "$1 has more than one share named '$2': $(echo "$ids" | tr '\n' ' ')"
+	fi
+	echo "$ids"
 }
 
 # peer_id_of NAME PEER is the peer's full hex identity key as NAME knows it,
