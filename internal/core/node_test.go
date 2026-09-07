@@ -1588,10 +1588,10 @@ func TestPeerRedialDropsStaleSession(t *testing.T) {
 	redial := func() {
 		inbound, far := net.Pipe()
 		defer far.Close()
-		if adopted, err := pc.offer(context.Background(), inbound, &protocol.HandshakeResult{
+		if outcome, err := pc.offer(context.Background(), inbound, &protocol.HandshakeResult{
 			PeerPub: lowID.Public(), PeerName: "low",
-		}, false); adopted || err != nil {
-			t.Fatalf("offer(inbound) = (%v, %v), want the dedup rule to reject it", adopted, err)
+		}, false); outcome == offerAdopted || err != nil {
+			t.Fatalf("offer(inbound) = (%v, %v), want the dedup rule to reject it", outcome, err)
 		}
 	}
 
@@ -1622,5 +1622,74 @@ func TestPeerRedialDropsStaleSession(t *testing.T) {
 	}
 	if got := logs.String(); !strings.Contains(got, "so that connection is dead") {
 		t.Errorf("nothing logged about dropping the dead connection; log was:\n%s", got)
+	}
+}
+
+// TestConnectedPeerNeverReportsDialFailure pins the invariant that an
+// adopted connection is the authoritative state of a peer: while a session
+// is live, nothing the dial loop does may report that peer as anything
+// other than connected, and nothing may leave a stale error on it.
+//
+// The bug this covers was a race, not a logic error, so it needs the
+// repeats: two nodes that peer at the same instant both dial, and SPEC.md
+// §2.4 keeps only one of the two connections. The winner closes the loser
+// as soon as its own handshake completes — and when that close lands while
+// the loser is still inside InitiateHandshake (its final SetDeadline is a
+// favourite), the loser saw a hard error rather than a handshake it could
+// then lose dedup on cleanly, and reported it via noteDialFailure. That
+// overwrote the ConnStateConnected which offer had *already* set from the
+// inbound connection that won.
+//
+// The result was sticky, which is what made it worth a test: the next
+// dialAttempt pass sees a session and parks on connDone without ever
+// touching state again, so a node that was connected and actively syncing
+// reported "backing_off", with the teardown's error as its last_error, for
+// the entire life of that healthy connection. It reproduced in roughly a
+// third of setups, and was the reason TestRemovePeerDropsSubscriptions
+// failed most of the time.
+func TestConnectedPeerNeverReportsDialFailure(t *testing.T) {
+	// Each round is a fresh pair racing to connect. One round proves
+	// nothing; the loop is what makes the race show up.
+	for round := range 15 {
+		nodeA := newTestNode(t, "raceA")
+		nodeB := newTestNode(t, "raceB")
+
+		tokenA, tokenB := peerToken(t, nodeA), peerToken(t, nodeB)
+		if _, err := nodeA.AddPeer("B", tokenB); err != nil {
+			t.Fatalf("round %d: nodeA AddPeer: %v", round, err)
+		}
+		if _, err := nodeB.AddPeer("A", tokenA); err != nil {
+			t.Fatalf("round %d: nodeB AddPeer: %v", round, err)
+		}
+
+		// Both sides must reach "connected" — with the bug, the side whose
+		// own dial lost the race never leaves "backing_off", so this is
+		// where the failure surfaces first.
+		waitFor(t, 10*time.Second, func() bool { return peerConnected(nodeA) && peerConnected(nodeB) })
+
+		for _, n := range []struct {
+			name string
+			node *Node
+		}{{"nodeA", nodeA}, {"nodeB", nodeB}} {
+			peers := n.node.Status().Peers
+			if len(peers) != 1 {
+				t.Fatalf("round %d: %s reports %d peers, want 1", round, n.name, len(peers))
+			}
+			p := peers[0]
+			if p.State != ConnStateConnected {
+				t.Errorf("round %d: %s reports peer state %q, want %q (last_error: %q)",
+					round, n.name, p.State, ConnStateConnected, p.LastError)
+			}
+			// A connected peer with an error attached is the other half of
+			// the same bug: the state can be repaired by a later transition
+			// while the error it came with stays on display.
+			if p.LastError != "" {
+				t.Errorf("round %d: %s reports a connected peer carrying last_error %q, want it cleared",
+					round, n.name, p.LastError)
+			}
+		}
+
+		nodeA.Close()
+		nodeB.Close()
 	}
 }

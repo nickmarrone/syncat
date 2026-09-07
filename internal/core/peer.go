@@ -87,6 +87,30 @@ const (
 	ConnStateBackingOff ConnState = "backing_off"
 )
 
+// offerOutcome is what offer did with one authenticated connection. The
+// three cases look alike from the outside — in two of them the connection
+// is closed and nothing is adopted — but they mean very different things
+// about this peer, and dialAttempt reports them differently.
+type offerOutcome int
+
+const (
+	// offerAdopted: this connection won and is now the peer's active one.
+	offerAdopted offerOutcome = iota
+	// offerLostDedup: SPEC.md §2.4 made the *peer* responsible for this
+	// pairing's connection, so this one was closed. Expected, and the
+	// peer's own dial is expected to land within a beat; only losing this
+	// way over and over means something is wrong (see noteDedupLoss).
+	offerLostDedup
+	// offerRedundant: this connection won the dedup rule, but a connection
+	// to the same peer was already adopted, so it was closed as surplus.
+	// Emphatically *not* a dedup loss: nothing about our reachability is in
+	// question, we simply already have what this connection would have
+	// given us. Telling the two apart is what keeps noteDedupLoss from
+	// eventually reporting "the peer ... may not be able to reach us" about
+	// a peer we are connected to and actively syncing with.
+	offerRedundant
+)
+
 // peerConn is one configured peer's connection state machine (SPEC.md
 // §2/§4): it drives the dial-with-backoff loop, adopts whichever
 // connection (dialed or accepted) wins SPEC.md §2.4's dedup rule, and
@@ -201,6 +225,9 @@ func (pc *peerConn) dialAttempt(ctx context.Context) error {
 	conn, err := pc.node.transport.Dial(dialCtx, connBlob)
 	cancel()
 	if err != nil {
+		if pc.supersededByAdoptedConn() {
+			return nil
+		}
 		pc.noteDialFailure("dial", err)
 		return fmt.Errorf("dial: %w", err)
 	}
@@ -213,15 +240,24 @@ func (pc *peerConn) dialAttempt(ctx context.Context) error {
 	})
 	if err != nil {
 		conn.Close()
+		if pc.supersededByAdoptedConn() {
+			return nil
+		}
 		pc.noteDialFailure("handshake", err)
 		return fmt.Errorf("handshake: %w", err)
 	}
 
-	adopted, err := pc.offer(ctx, conn, result, true)
+	outcome, err := pc.offer(ctx, conn, result, true)
 	if err != nil {
 		return err
 	}
-	if !adopted {
+	if outcome == offerRedundant {
+		// A connection to this peer was adopted while we were dialing.
+		// Nothing failed and nothing is pending: return nil so Supervisor
+		// does not back off, and let the next pass park on connDone.
+		return nil
+	}
+	if outcome == offerLostDedup {
 		// We lost SPEC.md §2.4's dedup rule on our own dial: the peer has
 		// the higher key, so it's expected to complete this pairing's
 		// connection via its own dial to us instead. Supervisor.Run
@@ -265,8 +301,8 @@ func (pc *peerConn) dialAttempt(ctx context.Context) error {
 // and, if it wins, adopts it as this peer's active connection: wires a
 // syncsvc.Session with this file's control-message and keepalive hooks,
 // starts it, and sends our initial ShareList/SubscribeRequests. Returns
-// whether this connection was adopted; a losing connection is closed here
-// and never touches pc's state.
+// which of offerOutcome's three cases applied; a connection that is not
+// adopted is closed here and never touches pc's state.
 //
 // transport.KeepConnection's outcome depends only on the two keys and
 // dialed, so this never needs to coordinate with a concurrent offer for
@@ -277,14 +313,14 @@ func (pc *peerConn) dialAttempt(ctx context.Context) error {
 // That does not make the "already have a session" check below dead code.
 // It is where a winning connection lands when this side is still holding
 // a stale session for the same peer — see the comment at that branch.
-func (pc *peerConn) offer(ctx context.Context, conn net.Conn, result *protocol.HandshakeResult, dialed bool) (bool, error) {
+func (pc *peerConn) offer(ctx context.Context, conn net.Conn, result *protocol.HandshakeResult, dialed bool) (offerOutcome, error) {
 	keep := transport.KeepConnection(pc.node.identity.Public(), result.PeerPub, dialed)
 	if !keep {
 		conn.Close()
 		if !dialed {
 			pc.notePeerRedialed()
 		}
-		return false, nil
+		return offerLostDedup, nil
 	}
 
 	pc.mu.Lock()
@@ -302,7 +338,7 @@ func (pc *peerConn) offer(ctx context.Context, conn net.Conn, result *protocol.H
 		if !dialed {
 			pc.notePeerRedialed()
 		}
-		return false, nil
+		return offerRedundant, nil
 	}
 
 	node := pc.node
@@ -352,7 +388,7 @@ func (pc *peerConn) offer(ctx context.Context, conn net.Conn, result *protocol.H
 	node.requestSubscriptions(sess, pc.peerKeyHex)
 
 	node.goTracked(func() { pc.runConnection(sessCtx, cancel, sess, ka, conn, done) })
-	return true, nil
+	return offerAdopted, nil
 }
 
 // runConnection is the adopted connection's lifetime, on its own tracked
@@ -511,10 +547,46 @@ func (pc *peerConn) handleControl(ctx context.Context, sess *syncsvc.Session, ty
 	}
 }
 
+// setState moves the peer to s unless a connection is currently adopted.
+//
+// An adopted connection is the authoritative state of this peer, and the
+// dial loop's own progress reporting must never contradict it. The two
+// race routinely: dialAttempt checks pc.session, finds it nil, and only
+// then calls this — by which point an inbound connection may already have
+// been adopted by offer, on another goroutine. Without the guard, a peer
+// that is connected and syncing reports "connecting". See noteDialFailure
+// for the same race with a worse outcome.
 func (pc *peerConn) setState(s ConnState) {
 	pc.mu.Lock()
-	pc.state = s
+	if pc.session == nil {
+		pc.state = s
+	}
 	pc.mu.Unlock()
+}
+
+// supersededByAdoptedConn reports whether a connection to this peer has
+// been adopted since this dial attempt began, which makes whatever just
+// went wrong with our own dial a non-event rather than a failure.
+//
+// dialAttempt only dials when it holds no session, so a session existing
+// now means one was adopted — from either direction — while we were
+// dialing. SPEC.md §2.4 keeps exactly one connection per pairing, so the
+// other one being torn down is the *expected* consequence of that
+// adoption, not a fault: the peer closes the loser as soon as its own
+// handshake completes, and that close surfaces here as whatever call our
+// handshake happened to be sitting in — a read, a write, or even the
+// SetDeadline that clears the handshake deadline on success.
+//
+// Reporting that as a dial failure is what noteDialFailure would do, and
+// it is sticky in the worst way: state becomes "backing_off" with the
+// teardown's error as lastErr, and the next dialAttempt pass parks on
+// connDone without ever calling setState again. A peer that is connected
+// and actively syncing then reports itself as backing off, with a scary
+// error attached, for the entire life of that healthy connection.
+func (pc *peerConn) supersededByAdoptedConn() bool {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+	return pc.session != nil
 }
 
 // notePeerRedialed reacts to an authenticated inbound connection that the
@@ -568,11 +640,19 @@ func (pc *peerConn) notePeerRedialed() {
 // waits for the dial this node is failing to make.
 func (pc *peerConn) noteDialFailure(stage string, err error) {
 	pc.mu.Lock()
-	pc.state = ConnStateBackingOff
-	pc.lastErr = err.Error()
 	pc.dialFailures++
 	failures := pc.dialFailures
 	name := pc.name
+	// Never contradict an adopted connection. dialAttempt already declines
+	// to call this when supersededByAdoptedConn says a connection landed
+	// during the dial; this closes the remaining window, where adoption
+	// happens between that check and this line. Counting and logging the
+	// failure is still right — the dial really did fail — but a peer we
+	// hold a live session to is connected, whatever our own dial did.
+	if pc.session == nil {
+		pc.state = ConnStateBackingOff
+		pc.lastErr = err.Error()
+	}
 	pc.mu.Unlock()
 
 	if failures == 1 || failures%dialFailureLogEvery == 0 {
