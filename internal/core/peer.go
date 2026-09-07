@@ -37,6 +37,32 @@ const (
 // log lines from noteDialFailure. The first failure always logs.
 const dialFailureLogEvery = 30
 
+// minConnectionLifetime is how long an adopted connection has to last before
+// dialAttempt treats its ending as an ordinary disconnect rather than a
+// failed attempt.
+//
+// A connection that ends this fast never did anything. In practice it means
+// the peer closed it the moment it arrived, because the peer still holds a
+// connection to us that it believes is alive while we have already torn our
+// end down — the two sides disagree about whether the pairing is up, and
+// only the peer's own dead-peer detection or notePeerRedialed's staleness
+// inference will settle it.
+//
+// Until then, the redial path has no brake: an adopted connection ending
+// returns nil from dialAttempt, and Supervisor.Run treats nil as success and
+// retries with no delay whatsoever. So we dial, get adopted, get closed, and
+// dial again, dozens of times a second — building and tearing down a whole
+// tailcat/WireGuard session each time, which is both a lot of pointless
+// relay traffic and (see dedupLossPause, which exists for the same reason on
+// the dedup path) actively counterproductive: it never leaves the peer a
+// quiet window in which to notice its own connection is dead.
+//
+// Treating these as failures puts them on SPEC.md §2.2's backoff schedule
+// instead, which is exactly what that schedule is for. It costs nothing in
+// the healthy case: a connection that lasts longer than this returns nil as
+// before, and one that does not was not carrying traffic anyway.
+const minConnectionLifetime = 5 * time.Second
+
 // staleInboundGrace is how long a freshly adopted connection is immune to
 // notePeerRedialed's staleness inference. It exists only for the
 // simultaneous-start race: when both nodes boot at once, the loser's dial
@@ -258,9 +284,18 @@ func (pc *peerConn) dialAttempt(ctx context.Context) error {
 		return err
 	}
 	if outcome == offerRedundant {
-		// A connection to this peer was adopted while we were dialing.
-		// Nothing failed and nothing is pending: return nil so Supervisor
-		// does not back off, and let the next pass park on connDone.
+		// A connection to this peer was adopted while we were dialing, so
+		// this one is surplus. Nothing failed, so this is not a backoff
+		// case — but it still gets dedupLossPause's brake. Supervisor.Run
+		// retries a nil return with no delay at all, and if the adopted
+		// connection is itself about to be torn down (it may well be the
+		// stale one the peer is trying to replace), returning straight
+		// into another dial rebuilds the tailcat session faster than
+		// either side can settle.
+		select {
+		case <-pc.node.clock.After(dedupLossPause):
+		case <-ctx.Done():
+		}
 		return nil
 	}
 	if outcome == offerLostDedup {
@@ -295,9 +330,18 @@ func (pc *peerConn) dialAttempt(ctx context.Context) error {
 	pc.mu.Lock()
 	done := pc.connDone
 	pc.mu.Unlock()
+	adoptedAt := pc.node.clock.Now()
 	select {
 	case <-done:
 	case <-ctx.Done():
+	}
+	// An ordinary disconnect returns nil so the next dial goes out
+	// immediately — that is what makes reconnection prompt. A connection
+	// that ended almost as soon as it was adopted is not that: see
+	// minConnectionLifetime for why redialing it at full speed makes things
+	// worse rather than better.
+	if lifetime := pc.node.clock.Now().Sub(adoptedAt); ctx.Err() == nil && lifetime < minConnectionLifetime {
+		return fmt.Errorf("connection lasted only %s before closing", lifetime.Truncate(time.Millisecond))
 	}
 	return nil
 }
