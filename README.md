@@ -515,6 +515,8 @@ go test -count=1 ./...
 go test -race ./...
 go test -fuzz=FuzzDecode ./internal/protocol   # frame decoder, run for a bit then Ctrl-C
 scripts/e2e.sh                                  # two real daemons over live tailcat
+scripts/run-net-tests.sh                        # networking failure scenarios (~10 min)
+scripts/run-net-tests.sh --soak                 # ... plus the slow ones (~30 min total)
 ```
 
 `CGO_ENABLED=0` is required, not just convenient: `modernc.org/sqlite` is a
@@ -526,7 +528,29 @@ CLI/HTTP imports inside core packages").
 separate config/data dirs and API ports, peers them over real tailcat,
 shares/subscribes a directory, and asserts bidirectional sync, delete+trash,
 and a two-sided conflict all converge correctly on disk. It cleans up both
-daemons on any exit path and dumps the relevant daemon log tail on failure.
+daemons on any exit path and dumps the relevant daemon state on failure.
+
+`scripts/run-net-tests.sh` is the same machinery pointed at everything that
+can go *wrong* on a network. Both it and `e2e.sh` are built on
+`scripts/lib/harness.sh`, which owns the daemon lifecycle, the polling
+primitives, and the assertions; the scenarios themselves live one per file
+under `scripts/net/`, and any of them can be run on its own.
+
+These exist because the Go suite, by construction, cannot see most
+networking failures: it finishes in well under a minute of wall-clock time
+and never kills a process. The scenarios cover one-sided peering, the
+simultaneous-dial dedup race, SIGTERM and SIGKILL restarts, offline
+divergence, peer removal, a live `--perm` change, and three-node fan-out.
+The `--soak` tier additionally waits out real time: a peer frozen with
+SIGSTOP must be declared dead by SPEC.md §4's 90s rule and recover on
+SIGCONT, a connection must idle for minutes without a single reconnect or
+ping timeout, and a multi-hundred-megabyte file must cross the relay without
+starving the keepalive behind it.
+
+SIGSTOP is how link failure is simulated: the frozen daemon's sockets stay
+open and the kernel keeps acknowledging, but the process answers nothing,
+which is exactly what a pulled cable or a suspended laptop looks like from
+the other end — and it needs no root, firewall, or network namespace.
 
 ## Project layout
 

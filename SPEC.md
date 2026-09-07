@@ -370,6 +370,12 @@ function they mean.)
   rejection, sha256 mismatch leaving the destination untouched, the concurrent-pull
   limit, and restore propagating as a new change. Resume and approval grant/deny are
   not covered, because neither is implemented (see the README).
+- `scripts/run-net-tests.sh` — networking failure scenarios over live tailcat, one per
+  file in `scripts/net/`: one-sided peering, the simultaneous-dial dedup race (§2.4),
+  SIGTERM and SIGKILL restarts, offline divergence, peer removal, a live permission
+  change (§6), and three-node fan-out (§5). With `--soak` it also waits out real time:
+  §4's 90s dead-peer rule against a SIGSTOPped peer, long-idle stability, a large
+  transfer, and a restart mid-transfer. Built on `scripts/lib/harness.sh`.
 - `scripts/e2e.sh` — two real daemons over live tailcat, asserting bidirectional sync,
   delete+trash, and a two-sided conflict all converge on disk.
 - Manual end-to-end: MANUAL-TESTS.md, including the web UI on both nodes.

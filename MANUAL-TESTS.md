@@ -2,24 +2,35 @@
 
 What to exercise by hand before putting syncat in front of other people.
 
-This deliberately skips what `go test ./...` and `scripts/e2e.sh` already
-cover, and concentrates on the things automation here structurally cannot
-see: real time passing, real reboots, two real machines on two real
-networks, and whether an error message actually tells a stranger what to do
-next.
+This deliberately skips what `go test ./...`, `scripts/e2e.sh`, and
+`scripts/run-net-tests.sh` already cover, and concentrates on what remains
+genuinely out of reach of automation on one machine: **two real machines on
+two real networks**, real reboots and suspends, hardware that goes away
+without warning, and whether an error message actually tells a stranger what
+to do next.
 
 ## Before you start
 
 ```console
 $ CGO_ENABLED=0 go build ./...
 $ go vet ./...
-$ go test -count=1 ./...          # includes the live-DERP tests; needs network
-$ bash scripts/e2e.sh             # two real daemons, ~4 min
+$ go test -count=1 ./...             # includes the live-DERP tests; needs network
+$ bash scripts/e2e.sh                # two real daemons, happy path, ~2 min
+$ bash scripts/run-net-tests.sh      # networking failure scenarios, ~10 min
+$ bash scripts/run-net-tests.sh --soak   # ... plus the slow ones, ~30 min
 ```
 
-All four should be clean. `e2e.sh` already proves bidirectional sync,
-delete + trash, and a two-sided offline conflict on one machine — so treat
-those as regression-covered and spend your manual time below.
+All of these should be clean. Between them they prove, on one machine and
+over real DERP: bidirectional sync, delete + trash, offline divergence and
+two-sided conflicts, one-sided peering, the simultaneous-dial race, SIGTERM
+and SIGKILL restarts, peer removal, a live `--perm` change, three-node
+fan-out, and — with `--soak` — the 90s dead-peer rule, long-idle stability,
+and large transfers. Treat all of that as regression-covered and spend your
+manual time on the items below that are still unticked.
+
+Items marked **[automated]** below are covered by a script and are listed
+only so you know what it is you are *not* having to check by hand; the
+script name is given so you can go read what it actually asserts.
 
 You need **two machines** for most of this. At least one round should be on
 two *different* networks (not both on your LAN), because that is the only
@@ -47,10 +58,14 @@ way to exercise the DERP relay path rather than a direct LAN hop.
 
 ## 2. Pairing two nodes
 
-- [ ] Exchange tokens and `syncat peer add` on **both** sides. Peering is
-      mutual — confirm the docs make that obvious to someone who hasn't
-      read the spec.
-- [ ] `syncat status` on both reaches `state=connected`.
+- [automated] Exchanging tokens on both sides reaches `state=connected` on
+      both, including when both `peer add` calls land at the same instant
+      and the two dials race (`scripts/net/02-simultaneous-peering.sh`).
+      Confirm by hand only that the *docs* make the mutuality obvious to
+      someone who hasn't read the spec.
+- [automated] Adding a peer on one side only is rejected and recorded by the
+      other, neither daemon wedges, and completing the pairing recovers with
+      no restart (`scripts/net/01-peering-one-sided.sh`).
 - [ ] **Paste your own token into `syncat peer add`.** Must be rejected with
       a message telling you to use the *other* node's token. This failed
       silently for a long time.
@@ -63,19 +78,33 @@ way to exercise the DERP relay path rather than a direct LAN hop.
 ## 3. Connection durability
 
 **Highest-value section.** A handshake bug used to kill every connection at
-exactly 90–120s, and no automated test could see it, because the whole
+exactly 90–120s, and no automated test could see it, because the whole Go
 suite finishes in under 30 seconds of wall-clock time.
 
-- [ ] Leave two nodes connected and idle for **at least 15 minutes**.
-      `connected since` in `syncat status` climbs continuously and never
-      resets.
-- [ ] Over that window, the log contains **no** `send ping: … i/o timeout`
-      lines and no repeated reconnects.
-- [ ] Leave it connected **overnight**. Still connected in the morning.
-- [ ] Pull the network cable / disable wifi on one side. The other notices
-      within ~90s and shows `connecting`.
-- [ ] Reconnect it. Both return to `connected` without a restart.
-- [ ] Suspend one laptop, resume it later — reconnects on its own.
+Most of this section is now automated — `scripts/net/21-idle-stability.sh`
+holds a connection idle past that 90–120s window and asserts the absence of
+reconnects and ping timeouts, and `scripts/net/20-blackhole-dead-peer.sh`
+freezes a daemon with SIGSTOP so its sockets stay open while it answers
+nothing, which is what a pulled cable looks like from the other end. Both
+are `--soak` scenarios. What is left here is what still needs real hardware
+and a real network in between.
+
+- [automated] Idle stability past the 90–120s window, with no reconnects and
+      no `send ping: … i/o timeout` lines
+      (`21-idle-stability.sh`; `SOAK_MINUTES=15` to lengthen it).
+- [automated] A peer that goes silent is declared dead within ~90s, shows as
+      not connected, and both sides recover with no restart
+      (`20-blackhole-dead-peer.sh`).
+- [ ] Leave it connected **overnight**, on two real machines. Still
+      connected in the morning, and `connected since` has climbed the whole
+      way without resetting.
+- [ ] Actually pull the network cable / disable wifi on one side, rather
+      than freezing the process. The other notices within ~90s and shows
+      `connecting`; reconnecting the cable recovers both without a restart.
+- [ ] Suspend one laptop, resume it later — reconnects on its own. (A
+      suspend stops the clock as well as the process, which SIGSTOP does
+      not, so this one is genuinely different from the automated version.)
+- [ ] Move one machine between networks (wifi → tethered) while connected.
 
 ## 4. Sharing and subscribing
 
@@ -110,8 +139,10 @@ the command succeeds.
 - [ ] On a **read-only** share, edit the subscriber's copy, then change the
       offerer's copy. The local edit is warned about in `syncat status`, a
       trash copy is taken, and it is overwritten.
-- [ ] `syncat share set <id> --perm ro` on a live rw share takes effect on
-      the subscriber without a restart.
+- [automated] `syncat share set <id> --perm ro` on a live rw share takes
+      effect on the subscriber without a restart, stops its writes, and
+      leaves its existing files alone
+      (`scripts/net/07-live-permission-change.sh`).
 - [ ] Changing a subscription's *mode* is refused with a message saying to
       remove and re-add. (Known limitation, but the message should say so.)
 
@@ -150,7 +181,11 @@ across two real machines.
 
 ## 8. Peer removal cleanup
 
-- [ ] `syncat peer rm <peer>` drops that peer's subscriptions, and says so.
+- [automated] `syncat peer rm <peer>` over a live connection drops that
+      peer's subscriptions, tears the session down on both sides, leaves the
+      already-synced files on disk, blocks any further sync, and re-adds
+      cleanly (`scripts/net/06-peer-removal.sh`).
+- [ ] It says so clearly — check the wording, not the behaviour.
 - [ ] It also revokes that peer's entries from your own shares' access
       lists. Verify by re-adding the *same* peer key and confirming it does
       **not** silently regain access to everything.
@@ -159,17 +194,28 @@ across two real machines.
 
 ## 9. Restart, reboot, and persistence
 
-- [ ] Restart one daemon. Peers reconnect, subscriptions resume, no
-      re-pairing needed.
-- [ ] Reboot the machine. Same.
+- [automated] Restart one daemon (SIGTERM). Peers reconnect, subscriptions
+      resume, no re-pairing needed, and the survivor notices the shutdown
+      immediately rather than waiting out the 90s dead timer
+      (`scripts/net/03-graceful-restart.sh`).
+- [automated] The same after a SIGKILL, where the survivor is left holding a
+      connection to a process that no longer exists
+      (`scripts/net/04-hard-kill-restart.sh`).
+- [ ] Reboot the machine. Same. (A reboot is not a restart: the clock jumps,
+      the network comes up underneath the daemon, and DERP has to be
+      re-resolved.)
 - [ ] Install as a systemd user service with `loginctl enable-linger`, then
       reboot **without logging in**. The daemon comes up anyway.
-- [ ] `systemctl --user restart syncat` mid-sync leaves no corruption; the
-      transfer restarts (resume is not implemented — it starts over).
+- [automated] A restart mid-transfer leaves no corruption and no partial file
+      in place; the transfer starts over, since resume is not implemented
+      (`scripts/net/23-restart-mid-transfer.sh`, `--soak`).
+- [ ] `systemctl --user restart syncat` mid-sync specifically — the unit's
+      `TimeoutStopSec` and the daemon's own drain interacting.
 - [ ] Send `SIGTERM` during a large transfer. Shutdown is graceful and
       bounded — no partial files left in the share, no hang.
-- [ ] Edit files on both sides **while both daemons are down**, then start
-      both. Converges.
+- [automated] Edit files on both sides **while both daemons are down**, then
+      start both. Converges, keeping both versions
+      (`scripts/net/05-offline-divergence.sh`).
 - [ ] `journalctl --user -u syncat` shows clean startup with no panics or
       goroutine dumps.
 
@@ -215,11 +261,18 @@ Read these as a stranger would. Every one should say what to do next.
 
 - [ ] A directory with **thousands** of small files. Initial scan and sync
       complete; note how long.
-- [ ] A **multi-GB** file. Completes; memory stays flat (watch RSS).
+- [automated] A large file completes with a matching sha256, without
+      starving the keepalive behind its own chunks
+      (`scripts/net/22-large-file.sh`, `--soak`; `SOAK_FILE_MB=2048` for a
+      multi-GB run).
+- [ ] Watch RSS during that multi-GB run — memory must stay flat. The script
+      asserts correctness, not memory.
 - [ ] Many rapid edits in a row — the watcher coalesces rather than
       thrashing.
-- [ ] Three or more peers on one share. Remember it is hub-and-spoke: spokes
-      sync only through the offerer, never with each other.
+- [automated] Three peers on one share, confirming hub-and-spoke: spokes
+      converge only through the offerer and never peer with each other
+      (`scripts/net/08-three-node-fanout.sh`).
+- [ ] Four or more peers, on separate machines, with a large share.
 - [ ] Idle CPU with several shares configured is near zero.
 - [ ] Sync a directory that is also being written by another application
       (a Git checkout, say) and confirm nothing is corrupted.
