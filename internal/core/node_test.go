@@ -1588,10 +1588,10 @@ func TestPeerRedialDropsStaleSession(t *testing.T) {
 	redial := func() {
 		inbound, far := net.Pipe()
 		defer far.Close()
-		if adopted, err := pc.offer(context.Background(), inbound, &protocol.HandshakeResult{
+		if outcome, err := pc.offer(context.Background(), inbound, &protocol.HandshakeResult{
 			PeerPub: lowID.Public(), PeerName: "low",
-		}, false); adopted || err != nil {
-			t.Fatalf("offer(inbound) = (%v, %v), want the dedup rule to reject it", adopted, err)
+		}, false); outcome == offerAdopted || err != nil {
+			t.Fatalf("offer(inbound) = (%v, %v), want the dedup rule to reject it", outcome, err)
 		}
 	}
 
@@ -1623,4 +1623,247 @@ func TestPeerRedialDropsStaleSession(t *testing.T) {
 	if got := logs.String(); !strings.Contains(got, "so that connection is dead") {
 		t.Errorf("nothing logged about dropping the dead connection; log was:\n%s", got)
 	}
+}
+
+// TestConnectedPeerNeverReportsDialFailure pins the invariant that an
+// adopted connection is the authoritative state of a peer: while a session
+// is live, nothing the dial loop does may report that peer as anything
+// other than connected, and nothing may leave a stale error on it.
+//
+// The bug this covers was a race, not a logic error, so it needs the
+// repeats: two nodes that peer at the same instant both dial, and SPEC.md
+// §2.4 keeps only one of the two connections. The winner closes the loser
+// as soon as its own handshake completes — and when that close lands while
+// the loser is still inside InitiateHandshake (its final SetDeadline is a
+// favourite), the loser saw a hard error rather than a handshake it could
+// then lose dedup on cleanly, and reported it via noteDialFailure. That
+// overwrote the ConnStateConnected which offer had *already* set from the
+// inbound connection that won.
+//
+// The result was sticky, which is what made it worth a test: the next
+// dialAttempt pass sees a session and parks on connDone without ever
+// touching state again, so a node that was connected and actively syncing
+// reported "backing_off", with the teardown's error as its last_error, for
+// the entire life of that healthy connection. It reproduced in roughly a
+// third of setups, and was the reason TestRemovePeerDropsSubscriptions
+// failed most of the time.
+func TestConnectedPeerNeverReportsDialFailure(t *testing.T) {
+	// Each round is a fresh pair racing to connect. One round proves
+	// nothing; the loop is what makes the race show up.
+	for round := range 15 {
+		nodeA := newTestNode(t, "raceA")
+		nodeB := newTestNode(t, "raceB")
+
+		tokenA, tokenB := peerToken(t, nodeA), peerToken(t, nodeB)
+		if _, err := nodeA.AddPeer("B", tokenB); err != nil {
+			t.Fatalf("round %d: nodeA AddPeer: %v", round, err)
+		}
+		if _, err := nodeB.AddPeer("A", tokenA); err != nil {
+			t.Fatalf("round %d: nodeB AddPeer: %v", round, err)
+		}
+
+		// Both sides must reach "connected" — with the bug, the side whose
+		// own dial lost the race never leaves "backing_off", so this is
+		// where the failure surfaces first.
+		waitFor(t, 10*time.Second, func() bool { return peerConnected(nodeA) && peerConnected(nodeB) })
+
+		for _, n := range []struct {
+			name string
+			node *Node
+		}{{"nodeA", nodeA}, {"nodeB", nodeB}} {
+			peers := n.node.Status().Peers
+			if len(peers) != 1 {
+				t.Fatalf("round %d: %s reports %d peers, want 1", round, n.name, len(peers))
+			}
+			p := peers[0]
+			if p.State != ConnStateConnected {
+				t.Errorf("round %d: %s reports peer state %q, want %q (last_error: %q)",
+					round, n.name, p.State, ConnStateConnected, p.LastError)
+			}
+			// A connected peer with an error attached is the other half of
+			// the same bug: the state can be repaired by a later transition
+			// while the error it came with stays on display.
+			if p.LastError != "" {
+				t.Errorf("round %d: %s reports a connected peer carrying last_error %q, want it cleared",
+					round, n.name, p.LastError)
+			}
+		}
+
+		nodeA.Close()
+		nodeB.Close()
+	}
+}
+
+// TestDisabledPeerReportsDisconnected covers a peer that is configured but
+// switched off. Its supervisor is never started, so nothing in the connect
+// path ever runs for it — and nothing else set an initial state, so it
+// reached `syncat peer ls` and the REST API as an empty string rather than
+// as any of the four documented ConnStates.
+func TestDisabledPeerReportsDisconnected(t *testing.T) {
+	other := newTestNode(t, "disabledPeerRemote")
+	token := peerToken(t, other)
+
+	dir := t.TempDir()
+	paths, err := config.ResolvePaths(filepath.Join(dir, "config"), filepath.Join(dir, "data"))
+	if err != nil {
+		t.Fatalf("resolve paths: %v", err)
+	}
+	if err := paths.EnsureDirs(); err != nil {
+		t.Fatalf("ensure dirs: %v", err)
+	}
+	identity, _, err := config.LoadOrCreateIdentityKey(paths.IdentityKeyFile())
+	if err != nil {
+		t.Fatalf("load identity: %v", err)
+	}
+	cfg := config.Default()
+	cfg.NodeName = "disabledPeerLocal"
+	cfg.Peers = []config.Peer{{Name: "off", Token: token, Enabled: false}}
+
+	n, err := Open(context.Background(), Options{
+		Paths: paths, Config: cfg, Identity: identity,
+		Transport: transport.NewPipeTransport(newPipeAddr(t)),
+		Logger:    log.New(io.Discard, "", 0), DisableJitter: true,
+	})
+	if err != nil {
+		t.Fatalf("open node: %v", err)
+	}
+	t.Cleanup(func() { n.Close() })
+
+	peers := n.Status().Peers
+	if len(peers) != 1 {
+		t.Fatalf("Status().Peers = %d, want the disabled peer to still be listed", len(peers))
+	}
+	if peers[0].Enabled {
+		t.Errorf("peer reports Enabled = true, want false")
+	}
+	if peers[0].State != ConnStateDisconnected {
+		t.Errorf("disabled peer reports state %q, want %q", peers[0].State, ConnStateDisconnected)
+	}
+}
+
+// TestConnectedSinceClearedOnDisconnect pins PeerStatus.ConnectedSince to
+// its own documented contract — "when the *current* connection was
+// established; zero otherwise". It used to keep the dead connection's
+// timestamp after teardown, so anything rendering "connected for X" from it
+// showed a duration that kept climbing for a peer that was gone.
+// LastConnectedAt is the field that is meant to survive, and this checks it
+// still does.
+func TestConnectedSinceClearedOnDisconnect(t *testing.T) {
+	nodeA := newTestNode(t, "sinceA")
+	nodeB := newTestNode(t, "sinceB")
+
+	tokenA, tokenB := peerToken(t, nodeA), peerToken(t, nodeB)
+	if _, err := nodeA.AddPeer("B", tokenB); err != nil {
+		t.Fatalf("nodeA AddPeer: %v", err)
+	}
+	if _, err := nodeB.AddPeer("A", tokenA); err != nil {
+		t.Fatalf("nodeB AddPeer: %v", err)
+	}
+	waitFor(t, 10*time.Second, func() bool { return peerConnected(nodeA) && peerConnected(nodeB) })
+
+	if got := nodeA.Status().Peers[0].ConnectedSince; got.IsZero() {
+		t.Fatalf("ConnectedSince is zero while connected, want the connection's start time")
+	}
+
+	// Take nodeB away entirely, so nodeA's connection ends for a reason it
+	// cannot immediately redial around.
+	nodeB.Close()
+
+	waitFor(t, 10*time.Second, func() bool {
+		return nodeA.Status().Peers[0].State != ConnStateConnected
+	})
+	waitFor(t, 10*time.Second, func() bool {
+		return nodeA.Status().Peers[0].ConnectedSince.IsZero()
+	})
+	if got := nodeA.Status().Peers[0].LastConnectedAt; got.IsZero() {
+		t.Errorf("LastConnectedAt was cleared along with ConnectedSince, want it to survive the disconnect")
+	}
+}
+
+// TestFanOutThroughHub covers SPEC.md §5's fan-out rule with the smallest
+// topology that can show it: one share offered by a hub to two spokes.
+//
+// Two nodes are not enough. With a single peer, a change pulled from it is
+// answered by the delta Session sends back at the end of handleIndexUpdate,
+// and everything converges. Add a second peer and that delta reaches only
+// the node the change came from. Nothing else was telling the other one:
+// internal/core propagates a share when a *rescan* finds the working tree
+// and the index disagree, and applying a pulled change updates both, so the
+// scan that follows finds nothing and returns before it would propagate.
+// The periodic rescan finds the same nothing, so it never healed either —
+// a write on one spoke simply never reached the other, indefinitely.
+func TestFanOutThroughHub(t *testing.T) {
+	ctx := context.Background()
+	hub := newTestNode(t, "hub")
+	spokeA := newTestNode(t, "spokeA")
+	spokeB := newTestNode(t, "spokeB")
+
+	shareDir := t.TempDir()
+	shareID, err := hub.AddShare(shareDir, "docs", config.PermissionReadWrite, false)
+	if err != nil {
+		t.Fatalf("AddShare: %v", err)
+	}
+
+	// Both spokes peer with the hub, and only with the hub — peers of the
+	// same share never talk to each other.
+	hubToken := peerToken(t, hub)
+	for _, s := range []struct {
+		name string
+		node *Node
+	}{{"spokeA", spokeA}, {"spokeB", spokeB}} {
+		if _, err := hub.AddPeer(s.name, peerToken(t, s.node)); err != nil {
+			t.Fatalf("hub AddPeer %s: %v", s.name, err)
+		}
+		if _, err := s.node.AddPeer("hub", hubToken); err != nil {
+			t.Fatalf("%s AddPeer hub: %v", s.name, err)
+		}
+	}
+	waitFor(t, 10*time.Second, func() bool {
+		return len(hub.Status().Peers) == 2 &&
+			hub.Status().Peers[0].State == ConnStateConnected &&
+			hub.Status().Peers[1].State == ConnStateConnected &&
+			peerConnected(spokeA) && peerConnected(spokeB)
+	})
+
+	dirA, dirB := t.TempDir(), t.TempDir()
+	if err := spokeA.AddSubscription(hub.PeerKey(), shareID, dirA, config.ModeMirror); err != nil {
+		t.Fatalf("spokeA AddSubscription: %v", err)
+	}
+	if err := spokeB.AddSubscription(hub.PeerKey(), shareID, dirB, config.ModeMirror); err != nil {
+		t.Fatalf("spokeB AddSubscription: %v", err)
+	}
+
+	// A change at the hub reaches both spokes — this much always worked,
+	// and is here so a failure below can't be blamed on the topology never
+	// having come up.
+	if err := os.WriteFile(filepath.Join(shareDir, "hub.txt"), []byte("from the hub"), 0o644); err != nil {
+		t.Fatalf("write hub file: %v", err)
+	}
+	if err := hub.RescanShare(ctx, shareID); err != nil {
+		t.Fatalf("RescanShare on hub: %v", err)
+	}
+	waitFor(t, 10*time.Second, func() bool {
+		return fileHas(filepath.Join(dirA, "hub.txt"), "from the hub") &&
+			fileHas(filepath.Join(dirB, "hub.txt"), "from the hub")
+	})
+
+	// The actual subject: a change on one spoke has to reach the other, and
+	// the only path there is through the hub.
+	if err := os.WriteFile(filepath.Join(dirA, "spoke.txt"), []byte("from spoke A"), 0o644); err != nil {
+		t.Fatalf("write spoke file: %v", err)
+	}
+	if err := spokeA.RescanShare(ctx, shareID); err != nil {
+		t.Fatalf("RescanShare on spokeA: %v", err)
+	}
+	waitFor(t, 10*time.Second, func() bool {
+		return fileHas(filepath.Join(shareDir, "spoke.txt"), "from spoke A")
+	})
+	waitFor(t, 10*time.Second, func() bool {
+		return fileHas(filepath.Join(dirB, "spoke.txt"), "from spoke A")
+	})
+}
+
+func fileHas(path, want string) bool {
+	data, err := os.ReadFile(path)
+	return err == nil && string(data) == want
 }

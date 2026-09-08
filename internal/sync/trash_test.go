@@ -690,3 +690,58 @@ func TestJanitor_BackgroundLoopRunsOnFakeClockAndStopsCleanly(t *testing.T) {
 		t.Fatalf("second Close: %v", err)
 	}
 }
+
+// TestSweepTempFiles covers the cleanup for staging files a killed daemon
+// could not remove itself. Apply only renames a download into place once its
+// content verifies, so an interrupted transfer leaves a full-size file behind
+// — hidden, inside the user's own synced directory, one per crash.
+func TestSweepTempFiles(t *testing.T) {
+	root := t.TempDir()
+	nested := filepath.Join(root, "sub", "deeper")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	// Two orphans, one of them in a subdirectory — staging files are written
+	// beside their destination, so a nested tree leaves them nested too.
+	orphans := []string{
+		filepath.Join(root, TempFilePrefix+"123"),
+		filepath.Join(nested, TempFilePrefix+"456"),
+	}
+	// ... and real files that must survive, including one whose name merely
+	// resembles the prefix.
+	keepers := []string{
+		filepath.Join(root, "real.txt"),
+		filepath.Join(nested, "also-real.txt"),
+		filepath.Join(root, ".syncat.tmpsomething"),
+	}
+	for _, p := range append(append([]string{}, orphans...), keepers...) {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatalf("seed %s: %v", p, err)
+		}
+	}
+
+	removed, err := SweepTempFiles(root)
+	if err != nil {
+		t.Fatalf("SweepTempFiles: %v", err)
+	}
+	if removed != len(orphans) {
+		t.Errorf("removed %d files, want %d", removed, len(orphans))
+	}
+	for _, p := range orphans {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Errorf("%s survived the sweep", filepath.Base(p))
+		}
+	}
+	for _, p := range keepers {
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("%s was removed by the sweep, want it left alone", filepath.Base(p))
+		}
+	}
+
+	// A root that does not exist is not an error: a subscription can be
+	// configured for a directory that has not been created yet.
+	if n, err := SweepTempFiles(filepath.Join(root, "nope")); err != nil || n != 0 {
+		t.Errorf("SweepTempFiles on a missing dir = (%d, %v), want (0, nil)", n, err)
+	}
+}

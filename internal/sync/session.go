@@ -117,6 +117,7 @@ type Session struct {
 	ctrlMu         sync.Mutex
 	controlHandler func(typ protocol.MsgType, payload []byte)
 	frameObserver  func(typ protocol.MsgType)
+	appliedHandler func(shareID string)
 
 	sharesMu   sync.RWMutex
 	shares     map[string]*ShareConfig
@@ -264,6 +265,32 @@ func (s *Session) SetControlHandler(fn func(typ protocol.MsgType, payload []byte
 func (s *Session) SetFrameObserver(fn func(typ protocol.MsgType)) {
 	s.ctrlMu.Lock()
 	s.frameObserver = fn
+	s.ctrlMu.Unlock()
+}
+
+// SetAppliedHandler registers fn to be called after a reconcile pass that
+// actually changed something on disk, naming the share it changed —
+// internal/core's hook for fanning that change out to this share's *other*
+// peers.
+//
+// Session cannot do that itself: it owns one connection and knows nothing
+// about the others. It already tells the peer it just heard from, by
+// sending a delta back at the end of handleIndexUpdate, and for a two-node
+// pairing that is the whole story. It is not the whole story for a share
+// offered to more than one peer. SPEC.md §5's fan-out rule routes those
+// through the offerer, so when bob's change reaches alice it is alice who
+// has to pass it to carol — and nothing else will. The rescan that
+// internal/core triggers from fsnotify compares the working tree against
+// the index, and applying a pulled change updates both, so that scan finds
+// no difference and stops before it would propagate. The periodic rescan
+// finds the same nothing, so it never self-heals either.
+//
+// fn is called from the goroutine handling the peer's update, not the read
+// loop, but it should still hand off anything slow: it runs while
+// reconcileMu is held for that share.
+func (s *Session) SetAppliedHandler(fn func(shareID string)) {
+	s.ctrlMu.Lock()
+	s.appliedHandler = fn
 	s.ctrlMu.Unlock()
 }
 
@@ -827,14 +854,59 @@ func (s *Session) handleIndexUpdate(ctx context.Context, msg protocol.IndexUpdat
 		return
 	}
 
-	localRows, err := s.store.ListShare(ctx, msg.ShareID, true)
+	s.reconcileLocked(ctx, cfg, fmt.Sprintf("%d file(s) in peer update", len(msg.Files)))
+}
+
+// ReconcileShare runs a reconcile pass for shareID against what this session
+// already knows about the peer, without waiting for the peer to send
+// anything.
+//
+// handleIndexUpdate is otherwise the only thing that reconciles, which makes
+// "the peer sent us rows" the only trigger for noticing that a file is
+// missing. That is not the only way to end up owing work. A pull that fails
+// — the connection drops mid-transfer, the transfer stalls, the write errors
+// — leaves the peer's rows already recorded in peer_files and the file still
+// absent locally, and nothing revisits it: the offerer's index sync is
+// incremental, so on reconnect its cursor says this peer already has those
+// rows and it sends nothing at all. The reconciler never runs, and the file
+// stays missing indefinitely.
+//
+// Measured, on a 192 MiB transfer interrupted by killing the receiver: the
+// file did not arrive on its own after two minutes on a healthy reconnected
+// connection, and then arrived within five seconds of an *unrelated* file
+// being touched in the same share — because that finally produced an index
+// update. Calling this when a share becomes active on a session closes that
+// gap: reconnecting is itself a reason to re-examine.
+func (s *Session) ReconcileShare(ctx context.Context, shareID string) error {
+	cfg, ok := s.getShare(shareID)
+	if !ok {
+		return fmt.Errorf("sync: reconcile share: %s is not active on this session", shareID)
+	}
+	if cfg.Direction.InboundBlocked {
+		// Offerer of a read-only share: it never applies anything inbound,
+		// so there is nothing for a reconcile to do (SPEC.md §5).
+		return nil
+	}
+	s.reconcileMu.Lock()
+	defer s.reconcileMu.Unlock()
+	s.reconcileLocked(ctx, cfg, "reconnect")
+	return nil
+}
+
+// reconcileLocked is the reconcile-and-apply pass shared by handleIndexUpdate
+// and ReconcileShare. Callers must hold reconcileMu and must have already
+// recorded any newly-received peer rows. why names what prompted the pass,
+// for the debug line.
+func (s *Session) reconcileLocked(ctx context.Context, cfg ShareConfig, why string) {
+	shareID := cfg.ShareID
+	localRows, err := s.store.ListShare(ctx, shareID, true)
 	if err != nil {
-		s.logf("list share %s: %v", msg.ShareID, err)
+		s.logf("list share %s: %v", shareID, err)
 		return
 	}
-	remoteRows, err := s.store.ListPeerFiles(ctx, s.peerID, msg.ShareID)
+	remoteRows, err := s.store.ListPeerFiles(ctx, s.peerID, shareID)
 	if err != nil {
-		s.logf("list peer files %s: %v", msg.ShareID, err)
+		s.logf("list peer files %s: %v", shareID, err)
 		return
 	}
 
@@ -870,11 +942,23 @@ func (s *Session) handleIndexUpdate(ctx context.Context, msg protocol.IndexUpdat
 	// Every path in the share was just reconciled, so flagged is the
 	// complete current set of locally-modified files for it; anything
 	// still holding a warning from an earlier pass has converged.
-	s.retainWarnings(msg.ShareID, flagged)
+	s.retainWarnings(shareID, flagged)
 
 	if !cfg.Direction.OutboundBlocked && len(changed) > 0 {
-		if err := s.sendIndexUpdate(msg.ShareID, changed, false); err != nil {
-			s.logf("send delta for %s: %v", msg.ShareID, err)
+		if err := s.sendIndexUpdate(shareID, changed, false); err != nil {
+			s.logf("send delta for %s: %v", shareID, err)
+		}
+	}
+
+	// The delta above only reaches the peer this update came from. Every
+	// *other* peer of this share learns about it here — see
+	// SetAppliedHandler for why nothing else would tell them.
+	if len(changed) > 0 {
+		s.ctrlMu.Lock()
+		applied := s.appliedHandler
+		s.ctrlMu.Unlock()
+		if applied != nil {
+			applied(shareID)
 		}
 	}
 
@@ -883,7 +967,7 @@ func (s *Session) handleIndexUpdate(ctx context.Context, msg protocol.IndexUpdat
 	// every update from every peer. Only say anything when the pass
 	// actually did something.
 	if len(counts) > 0 {
-		s.debugf("reconciled %s: %d file(s) in peer update, %s", msg.ShareID, len(msg.Files), formatActionCounts(counts))
+		s.debugf("reconciled %s (%s): %s", shareID, why, formatActionCounts(counts))
 	}
 }
 

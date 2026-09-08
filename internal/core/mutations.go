@@ -430,6 +430,12 @@ func (n *Node) SetShareAccess(shareRef, peerRef, access string) error {
 		if err := sess.SyncShare(n.ctx, shareID); err != nil {
 			n.logger.Printf("core: sync share %s to %s: %v", shareID, peerKeyHex, err)
 		}
+		// The offerer half of the same gap finishAccessUpdate closes on the
+		// subscriber side: a read-write share means work can be owed in this
+		// direction too, and a reconnect is the moment to look.
+		if err := sess.ReconcileShare(n.ctx, shareID); err != nil {
+			n.logger.Printf("core: reconcile share %s for %s on connect: %v", shareID, peerKeyHex, err)
+		}
 	} else {
 		pc.neuterShare(shareID)
 	}

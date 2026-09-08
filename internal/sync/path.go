@@ -104,7 +104,7 @@ func ValidateRelPath(relpath string) error {
 		case "..":
 			return fmt.Errorf("sync: relpath %q contains a %q element", relpath, "..")
 		}
-		if strings.HasPrefix(elem, ".syncat.tmp.") {
+		if strings.HasPrefix(elem, TempFilePrefix) {
 			return fmt.Errorf("sync: relpath %q uses the reserved .syncat.tmp. prefix", relpath)
 		}
 		name := elem

@@ -128,6 +128,17 @@ func (n *Node) finishAccessUpdate(ctx context.Context, sess *syncsvc.Session, sh
 	if err := n.rescanShare(n.ctx, shareID); err != nil {
 		n.logger.Printf("core: initial local scan for subscription %s: %v", shareID, err)
 	}
+	// Neither of the two above notices work we already owed this peer. They
+	// push our state outwards -- our index to the peer, our directory into
+	// our index -- and the reconciler that decides what to *pull* only runs
+	// when the peer sends rows. After a reconnect the peer usually sends
+	// none: its index sync is incremental, and its cursor says we already
+	// have everything it has. Anything a previous session left unfinished --
+	// a pull interrupted by the disconnect, most obviously -- is then
+	// invisible to both sides. See Session.ReconcileShare.
+	if err := sess.ReconcileShare(ctx, shareID); err != nil {
+		n.logger.Printf("core: reconcile subscription %s on connect: %v", shareID, err)
+	}
 }
 
 // --- share list / subscribe-request announcements --------------------------

@@ -362,6 +362,16 @@ ids would ping-pong edits forever (README "Topology").
 - `scripts/e2e.sh` builds the binary and runs two daemons over live
   tailcat, asserting bidirectional sync, delete+trash, and conflict
   convergence on disk.
+- `scripts/run-net-tests.sh` runs the networking *failure* scenarios in
+  `scripts/net/`, one per file, over the same live tailcat. Both it and
+  `e2e.sh` sit on `scripts/lib/harness.sh`, which owns the daemon lifecycle
+  (start/SIGTERM/SIGKILL/SIGSTOP/SIGCONT), the `wait_for`/`wait_while`/
+  `hold_for` polling primitives, the `status --json` predicates, and the
+  end-of-scenario assertions. These cover what the Go suite structurally
+  cannot: the suite finishes in under a minute of wall-clock time and never
+  kills a process, so SPEC.md §4's 90s dead-peer rule, restart recovery, and
+  long-idle stability were all unreachable from it. Scenarios numbered from
+  20 up are soak tests and run only with `--soak`.
 - On some machines the tailscale dependency's init-time toolchain check
   panics before any test runs; `TS_PERMIT_TOOLCHAIN_MISMATCH=1` disables
   it. This is an environment quirk, not a code issue.
@@ -370,6 +380,7 @@ ids would ping-pong edits forever (README "Topology").
 gofmt -l . && go vet ./... && CGO_ENABLED=0 go build ./...
 TS_PERMIT_TOOLCHAIN_MISMATCH=1 go test -count=1 ./...
 TS_PERMIT_TOOLCHAIN_MISMATCH=1 go test -race ./internal/core ./internal/sync ./internal/protocol
+scripts/e2e.sh && scripts/run-net-tests.sh
 ```
 
 ## Conventions
