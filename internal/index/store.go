@@ -58,7 +58,7 @@ type Store struct {
 // file header) rather than a table we'd have to query separately — it's
 // exactly what PRAGMA user_version exists for, and it's readable/writable
 // in the same connection setup step as the other pragmas below.
-const currentSchemaVersion = 2
+const currentSchemaVersion = 3
 
 // migrations[i] upgrades a database from schema version i to i+1.
 // Migrations run inside a single transaction per step (see migrate) so a
@@ -66,6 +66,7 @@ const currentSchemaVersion = 2
 var migrations = []func(ctx context.Context, tx *sql.Tx) error{
 	migrateV1,
 	migrateV2,
+	migrateV3,
 }
 
 func migrateV2(ctx context.Context, tx *sql.Tx) error {
@@ -113,6 +114,8 @@ func migrateV2(ctx context.Context, tx *sql.Tx) error {
 			version_json TEXT NOT NULL,
 			deleted INTEGER NOT NULL,
 			PRIMARY KEY(peer_key,share_id,snapshot_id,relpath))`,
+		// dirty_paths is dropped again by migrateV3 — it is kept here so
+		// this step still describes what a v2 database looked like.
 		`CREATE TABLE dirty_paths (
 			peer_key TEXT NOT NULL,
 			share_id TEXT NOT NULL,
@@ -217,6 +220,25 @@ func (s *Store) migrate(ctx context.Context) error {
 		if err := tx.Commit(); err != nil {
 			return fmt.Errorf("index: commit migration to schema %d: %w", version, err)
 		}
+	}
+	return nil
+}
+
+// migrateV3 drops dirty_paths. It was added in migrateV2 as the work queue
+// for an incremental reconciler that was never built: CommitSnapshot and
+// ApplyPeerDelta wrote it, nothing ever read it, and nothing ever deleted
+// from it. Reconciliation instead re-walks a share in full each pass
+// (internal/sync.Session.reconcileLocked over ListShare + ListPeerFiles),
+// so there was no reader to wire up — only an unbounded table, one row per
+// path per share, growing on every snapshot commit and delta.
+//
+// Unlike pending_transfers (migrateV1), which is inert schema reserved for
+// a planned feature, this one cost a write per row. If incremental
+// reconciliation lands later it will want a queue shaped for that
+// reconciler, not this one.
+func migrateV3(ctx context.Context, tx *sql.Tx) error {
+	if _, err := tx.ExecContext(ctx, `DROP TABLE dirty_paths`); err != nil {
+		return fmt.Errorf("drop dirty_paths: %w", err)
 	}
 	return nil
 }

@@ -359,6 +359,25 @@ func EncodedMessageSize(typ MsgType, v any) (int, error) {
 	return len(b), err
 }
 
+// EncodedEntrySize returns how many bytes v contributes as one element of
+// a CBOR array, which is exactly its own encoded length: array elements
+// are self-delimiting values written back to back, with no separators and
+// nothing but the array header ahead of them.
+//
+// It exists so that batch planning can be linear. internal/sync fills a
+// frame by asking "does one more entry still fit?", and answering that by
+// re-encoding the whole growing message once per candidate entry is
+// quadratic — for a 20k-file share it cost tens of gigabytes of garbage
+// and over a minute of CPU to plan a single snapshot. Summing per-entry
+// sizes against a fixed envelope costs one encode per entry instead.
+func EncodedEntrySize(v any) (int, error) {
+	b, err := cbor.Marshal(v)
+	if err != nil {
+		return 0, fmt.Errorf("protocol: frame: encode batch entry: %w", err)
+	}
+	return len(b), nil
+}
+
 // Writer encodes messages onto an underlying io.Writer as length-prefixed
 // frames (SPEC.md §4).
 //

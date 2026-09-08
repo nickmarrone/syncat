@@ -54,9 +54,30 @@ type pullChunk struct {
 	err  error
 }
 
+// pullQueueDepth is how many received chunks one in-flight pull will hold
+// ahead of the goroutine writing them to disk.
+//
+// Every slot can hold a full protocol.MaxFileChunkData payload, and it
+// holds the whole frame buffer that payload was sliced out of, so this
+// number is a memory bound before it is anything else: depth x 1 MiB x
+// maxConcurrentPulls per connected peer, resident for as long as transfers
+// are running. At the depth of 8 this started at, three busy peers held
+// close to 100 MiB in chunk buffers alone -- which the Go scavenger then
+// returns to the OS only slowly, so the daemon's RSS climbed with transfer
+// activity and stayed there.
+//
+// Two is enough to serve the purpose the buffer actually has: one chunk
+// being written while the next arrives, so the read loop is not made to
+// wait on a disk write. Anything deeper is buffering the transfer rather
+// than smoothing it, and there is nothing to buffer against -- writing and
+// hashing a 1 MiB chunk takes a millisecond or two, while delivering one
+// over a relayed tunnel takes far longer. Blocking here when the queue is
+// full is safe backpressure, unlike the control lane in
+// protocol.StreamWriter: the read loop ends up waiting on a file write,
+// which does not need the read loop to make progress.
+const pullQueueDepth = 2
+
 // pullEntry is the read loop's handle on one in-flight pull's consumer.
-// The channel is buffered so a burst of chunks doesn't stall the read loop
-// while the consumer is briefly busy writing the previous one to disk.
 type pullEntry struct {
 	ch chan pullChunk
 }
@@ -114,7 +135,7 @@ func (s *Session) pullFile(ctx context.Context, shareID, wireRelPath string, ver
 	defer done()
 
 	key := transferKey{shareID, wireRelPath}
-	entry := &pullEntry{ch: make(chan pullChunk, 8)}
+	entry := &pullEntry{ch: make(chan pullChunk, pullQueueDepth)}
 	s.pullMu.Lock()
 	if _, exists := s.pullTbl[key]; exists {
 		s.pullMu.Unlock()

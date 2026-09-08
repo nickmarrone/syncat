@@ -179,6 +179,11 @@ type Session struct {
 	// silent peer time out.
 	testPullStallTimeout time.Duration
 
+	// testJournalPageSize, if non-zero, replaces journalPageSize. Same deal
+	// again: journalling 20,000 changes to watch a second page happen is
+	// not a test anyone will keep running.
+	testJournalPageSize int
+
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -531,43 +536,15 @@ func (s *Session) answerSyncRequest(ctx context.Context, req protocol.IndexSyncR
 	// so this answers unfiltered exactly as it did before.
 	cfg, _ := s.getShare(req.ShareID)
 
-	if req.Epoch == epoch && (oldest == 0 || req.AppliedSeq+1 >= oldest) {
-		rows, err := s.store.JournalSince(ctx, req.ShareID, epoch, req.AppliedSeq, 100000)
+	if canAnswerWithDeltas(req, epoch, high, oldest) {
+		done, err := s.sendJournalDeltas(ctx, cfg, epoch, req.AppliedSeq)
 		if err != nil {
 			return err
 		}
-		if journalHasIgnored(cfg, rows) {
-			// A delta batch cannot simply omit an entry: the receiver
-			// requires the entries to be contiguous from FromSeq (see
-			// readLoop) and Store.ApplyPeerDelta additionally requires
-			// FromSeq == cursor+1 and len(rows) == ToSeq-FromSeq+1. Drop
-			// one and the peer rejects the batch and resyncs, forever.
-			//
-			// So fall through to a full snapshot, which carries no
-			// per-entry sequence contract and re-anchors the peer's
-			// cursor at HighSeq. This is reachable only for a path that
-			// was journalled while still syncing and has since become
-			// ignored, with a peer whose cursor predates that entry —
-			// and the snapshot moves that peer past it for good.
-			s.debugf("share %s: journal range holds a now-ignored path; answering with a full snapshot", req.ShareID)
-		} else {
-			for len(rows) > 0 {
-				n := deltaBatchLen(req.ShareID, epoch, rows)
-				if n == 0 {
-					return fmt.Errorf("sync: journal entry %s cannot fit in a frame", rows[0].Row.RelPath)
-				}
-				entries := make([]protocol.IndexDeltaEntry, n)
-				for i := range entries {
-					entries[i] = protocol.IndexDeltaEntry{Seq: rows[i].Seq, File: rows[i].Row.Info()}
-				}
-				m := protocol.IndexDeltaBatch{ShareID: req.ShareID, Epoch: epoch, FromSeq: entries[0].Seq, ToSeq: entries[n-1].Seq, Entries: entries}
-				if err = s.writer.WriteMessage(protocol.MsgIndexDeltaBatch, m); err != nil {
-					return err
-				}
-				rows = rows[n:]
-			}
+		if done {
 			return nil
 		}
+		s.debugf("share %s: journal range holds a now-ignored path; answering with a full snapshot", req.ShareID)
 	}
 	rows, err := s.store.ListShare(ctx, req.ShareID, true)
 	if err != nil {
@@ -599,6 +576,104 @@ func (s *Session) answerSyncRequest(ctx context.Context, req protocol.IndexSyncR
 		rows = rows[n:]
 	}
 	return s.writer.WriteMessage(protocol.MsgIndexSnapshotEnd, protocol.IndexSnapshotEnd{ShareID: req.ShareID, SnapshotID: id, BatchCount: batch})
+}
+
+// journalPageSize bounds how many journal rows one read holds in memory at
+// a time.
+//
+// This is a memory bound, not a protocol one: the peer acknowledges each
+// batch as it lands, so where one read ends and the next begins is
+// invisible on the wire. The page is sized to still fill a delta batch
+// (protocol.TargetIndexBatchSize) for typical entries, so paging costs no
+// extra frames in practice, while a share with a long journal no longer
+// materialises tens of thousands of rows -- version-vector map and all --
+// in one slice per peer asking to resync.
+const journalPageSize = 20000
+
+// sendJournalDeltas walks the journal from applied to the end, sending each
+// page as one or more IndexDeltaBatch frames. done is false when the range
+// holds a path this share now ignores, which means the caller must answer
+// with a full snapshot instead.
+//
+// A delta batch cannot simply omit an entry: the receiver requires the
+// entries to be contiguous from FromSeq (see readLoop) and
+// Store.ApplyPeerDelta additionally requires FromSeq == cursor+1 and
+// len(rows) == ToSeq-FromSeq+1. Drop one and the peer rejects the batch and
+// resyncs, forever. So an ignored path anywhere in the range hands the
+// whole answer over to a snapshot, which carries no per-entry sequence
+// contract and re-anchors the peer's cursor at HighSeq. This is reachable
+// only for a path that was journalled while still syncing and has since
+// become ignored, with a peer whose cursor predates that entry -- and the
+// snapshot moves that peer past it for good. Pages already sent before the
+// ignored entry was reached are not a problem: the snapshot supersedes
+// them.
+func (s *Session) sendJournalDeltas(ctx context.Context, cfg ShareConfig, epoch string, applied uint64) (done bool, err error) {
+	shareID := cfg.ShareID
+	pageSize := journalPageSize
+	if s.testJournalPageSize > 0 {
+		pageSize = s.testJournalPageSize
+	}
+	for {
+		rows, err := s.store.JournalSince(ctx, shareID, epoch, applied, pageSize)
+		if err != nil {
+			return false, err
+		}
+		if len(rows) == 0 {
+			return true, nil
+		}
+		if journalHasIgnored(cfg, rows) {
+			return false, nil
+		}
+		page := rows
+		for len(page) > 0 {
+			n := deltaBatchLen(shareID, epoch, page)
+			if n == 0 {
+				return false, fmt.Errorf("sync: journal entry %s cannot fit in a frame", page[0].Row.RelPath)
+			}
+			entries := make([]protocol.IndexDeltaEntry, n)
+			for i := range entries {
+				entries[i] = protocol.IndexDeltaEntry{Seq: page[i].Seq, File: page[i].Row.Info()}
+			}
+			m := protocol.IndexDeltaBatch{ShareID: shareID, Epoch: epoch, FromSeq: entries[0].Seq, ToSeq: entries[n-1].Seq, Entries: entries}
+			if err := s.writer.WriteMessage(protocol.MsgIndexDeltaBatch, m); err != nil {
+				return false, err
+			}
+			page = page[n:]
+		}
+		if len(rows) < pageSize {
+			return true, nil
+		}
+		applied = rows[len(rows)-1].Seq
+	}
+}
+
+// canAnswerWithDeltas reports whether the journal can carry this peer from
+// its cursor to ours, given the share's current epoch, its highest
+// journalled sequence, and the oldest sequence still on hand (0 when the
+// journal holds nothing for this epoch).
+//
+// Every clause is a way of *not* being able to, and each one falls back to
+// a full snapshot, which re-anchors the peer's cursor unconditionally:
+//
+//   - A different epoch means the sequence numbers are not comparable.
+//   - A peer claiming a sequence past our own high-water mark is not a
+//     peer we can compute a delta for. (It happens: restore this node's
+//     database from a backup and every peer is ahead of it.)
+//   - An entry the peer needs may have aged out of the journal, which is
+//     pruned on a retention window (see core's journal sweep). Requiring
+//     oldest <= AppliedSeq+1 is what makes pruning safe; note that oldest
+//     == 0 — an empty journal — is only "nothing to send" when the peer is
+//     already at high, and otherwise means the entries it needs are gone.
+func canAnswerWithDeltas(req protocol.IndexSyncRequest, epoch string, high, oldest uint64) bool {
+	if req.Epoch != epoch || req.AppliedSeq > high {
+		return false
+	}
+	if req.AppliedSeq == high {
+		// Already current: the delta path sends nothing, which is both
+		// correct and cheaper than a snapshot the peer would discard.
+		return true
+	}
+	return oldest > 0 && oldest <= req.AppliedSeq+1
 }
 
 // journalHasIgnored reports whether any journal entry in rows names a path
@@ -635,25 +710,67 @@ func filterIgnoredRows(cfg ShareConfig, rows []index.FileRow) []index.FileRow {
 	return out
 }
 
+// batchArrayHeaderSlack covers the one part of a batch envelope that grows
+// with the number of entries in it: CBOR writes an array header of 1 byte
+// for up to 23 elements, 2 up to 255, 3 up to 65535 and 5 beyond, while
+// the envelope below is measured with an empty array (1 byte). Four bytes
+// is therefore the exact worst case; eight leaves room and costs at most
+// one entry at a frame boundary.
+const batchArrayHeaderSlack = 8
+
+// snapshotBatchLen reports how many of rows fit in one IndexSnapshotBatch
+// frame, and 0 if even the first one does not.
+//
+// It measures the fixed envelope once and then adds each row's own encoded
+// length, because CBOR array elements are self-delimiting values laid down
+// back to back: an entry contributes exactly its own encoding, wherever it
+// sits in the array. The obvious alternative — re-encode the whole growing
+// message after each candidate row and look at the total — is quadratic,
+// and not mildly so. Planning one snapshot of a 20k-file share that way
+// allocated 28 GB and took 77 seconds; the same plan here is one encode
+// per row. Anything that reintroduces a whole-message encode inside this
+// loop reintroduces that.
 func snapshotBatchLen(share, id string, b uint64, rows []index.FileRow) int {
-	files := make([]protocol.FileInfo, 0)
+	envelope, err := protocol.EncodedMessageSize(protocol.MsgIndexSnapshotBatch,
+		protocol.IndexSnapshotBatch{ShareID: share, SnapshotID: id, Batch: b, Files: []protocol.FileInfo{}})
+	if err != nil {
+		return 0
+	}
+	total := envelope + batchArrayHeaderSlack
 	for i, r := range rows {
-		files = append(files, r.Info())
-		n, e := protocol.EncodedMessageSize(protocol.MsgIndexSnapshotBatch, protocol.IndexSnapshotBatch{ShareID: share, SnapshotID: id, Batch: b, Files: files})
-		if e != nil || n > protocol.TargetIndexBatchSize {
+		n, e := protocol.EncodedEntrySize(r.Info())
+		if e != nil || total+n > protocol.TargetIndexBatchSize {
 			return i
 		}
+		total += n
 	}
 	return len(rows)
 }
+
+// deltaBatchLen is snapshotBatchLen for an IndexDeltaBatch. Its envelope is
+// measured with the *last* row's sequence number as ToSeq: sequence numbers
+// ascend, and CBOR's integer width grows with the value, so whatever ToSeq
+// the chosen batch ends on cannot encode wider than that.
 func deltaBatchLen(share, epoch string, rows []index.JournalRow) int {
-	entries := make([]protocol.IndexDeltaEntry, 0)
+	if len(rows) == 0 {
+		return 0
+	}
+	envelope, err := protocol.EncodedMessageSize(protocol.MsgIndexDeltaBatch,
+		protocol.IndexDeltaBatch{
+			ShareID: share, Epoch: epoch,
+			FromSeq: rows[0].Seq, ToSeq: rows[len(rows)-1].Seq,
+			Entries: []protocol.IndexDeltaEntry{},
+		})
+	if err != nil {
+		return 0
+	}
+	total := envelope + batchArrayHeaderSlack
 	for i, r := range rows {
-		entries = append(entries, protocol.IndexDeltaEntry{Seq: r.Seq, File: r.Row.Info()})
-		n, e := protocol.EncodedMessageSize(protocol.MsgIndexDeltaBatch, protocol.IndexDeltaBatch{ShareID: share, Epoch: epoch, FromSeq: entries[0].Seq, ToSeq: r.Seq, Entries: entries})
-		if e != nil || n > protocol.TargetIndexBatchSize {
+		n, e := protocol.EncodedEntrySize(protocol.IndexDeltaEntry{Seq: r.Seq, File: r.Row.Info()})
+		if e != nil || total+n > protocol.TargetIndexBatchSize {
 			return i
 		}
+		total += n
 	}
 	return len(rows)
 }
