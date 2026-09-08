@@ -342,9 +342,11 @@ Rules that keep this sound:
 
 ## Security boundaries
 
-- **The `sc1` token is a secret.** It carries the tailcat connection blob,
-  the Ed25519 public key, and a display name. Anyone holding it can attempt
-  to connect; the handshake is what proves they are the peer you added.
+- **The `sc1` token is a secret.** It carries the tailcat address, the
+  Ed25519 public key, and a display name. Since tailcat 0.6.0 that address
+  also carries a WireGuard pre-shared key, so the token is key material
+  rather than just a reachability hint. Anyone holding it can attempt to
+  connect; the handshake is what proves they are the peer you added.
 - **Handshake** (`protocol/handshake.go`): mutual challenge/response;
   unknown inbound keys rejected and recorded. Known limit: the transcript
   does not bind the tunnel, so a token tampered in transit enables a relay
@@ -370,7 +372,7 @@ Rules that keep this sound:
 ~/.config/syncat/config.json          Config: node_name, api_addr, peers[], shares[], subscriptions[], …
 ~/.config/syncat/api.token            REST token the CLI and UI present
 ~/.local/share/syncat/keys/identity.key   Ed25519 seed
-~/.local/share/syncat/keys/tailcat.key    tailcat node key
+~/.local/share/syncat/keys/tailcat.key    tailcat node key + pre-shared key
 ~/.local/share/syncat/db/index.db         SQLite: files, peer_files, pending_transfers
 ~/.local/share/syncat/trash/<share-id>/<relpath>.<unix-ts>
 ```

@@ -18,7 +18,8 @@ of trusted friends/family — not a general file-sharing service.
 
 ## Build and quick start
 
-Requires Go 1.27+. The build is cgo-free (pure-Go SQLite, see [Development](#development)):
+Requires Go 1.27.1+ (tailcat 0.6.0's minimum). The build is cgo-free (pure-Go
+SQLite, see [Development](#development)):
 
 ```bash
 CGO_ENABLED=0 go build -o syncat ./cmd/syncat
@@ -317,6 +318,32 @@ What the restart actually does, and what it can't undo:
   upgraded yet stop syncing (and log rejected handshakes) until you do, so a
   protocol bump wants a coordinated upgrade of every node. Within a single
   protocol version, mixed builds are fine and you can upgrade one node at a time.
+- **The tailcat generation is lockstep too, and the upgrade to tailcat 0.6.0
+  invalidates every existing token.** Two things changed inside the address the
+  `sc1` token carries: tailcat 0.3.0 split path discovery from node identity
+  (adding a disco key), and 0.6.0 added a WireGuard pre-shared key. Neither is
+  negotiated, so a node on this build and a node on a pre-0.6.0 build cannot
+  connect in *either* direction — verified by dialing all four version pairings
+  over real DERP:
+
+  | server | client | result |
+  | --- | --- | --- |
+  | 0.6.0 | 0.6.0 | connects |
+  | 0.2.0 | 0.2.0 | connects |
+  | 0.2.0 | 0.6.0 | fails fast: `legacy tailcat address lacks a separate disco key` |
+  | 0.6.0 | 0.2.0 | **fails silently**: the old client drops the two fields it doesn't know, then the WireGuard handshake never completes and the dial just times out |
+
+  The last row is the one to plan around: the un-upgraded side reports nothing
+  more useful than a timeout. So upgrade every node first, then have each run
+  `syncat token` and re-add the others from the freshly printed tokens — the
+  old tokens in `config.json` are dead, and a node that keeps dialing one just
+  retries forever.
+
+  Your own key file migrates itself on first start: `LoadOrCreateTailcatKey`
+  backfills the disco key (derived from the node key you already have) and
+  mints the pre-shared key (it can only be minted, not recovered), then writes
+  both back to `keys/tailcat.key`. The node key — and so the node's identity —
+  is unchanged; only the address it is reachable at changes, once.
 - **Restarting mid-sync is safe, just not free.** SIGTERM stops the API, then
   closes the node, which waits for its background goroutines. Peers see the
   session drop and reconnect with backoff. Transfers interrupted by the restart
@@ -446,10 +473,15 @@ C` through a node that was only ever supposed to be a spoke.
 
 ## Security model
 
-- **The node token is a secret.** `syncat token` prints a `sc1…` blob wrapping
-  your tailcat connection info, Ed25519 public key, and suggested display
-  name. Anyone holding it can *attempt* to connect — treat it like a password,
-  not a username.
+- **The node token is a secret**, and as of tailcat 0.6.0 more so than before.
+  `syncat token` prints a `sc1…` blob wrapping your tailcat connection info,
+  Ed25519 public key, and suggested display name. That connection info now
+  carries a WireGuard pre-shared key — an independent random secret mixed into
+  the handshake, which adds post-quantum confidentiality and keeps the DERP
+  operator relaying your packets from being able to join the tunnel. So the
+  token is no longer merely "enough to attempt a connection": it is key
+  material. Treat it like a password, not a username, and prefer a channel you
+  would send a password over.
 - **Mutual authentication.** The tailcat tunnel gives you an encrypted pipe to
   *some* endpoint; syncat's own handshake (Ed25519 challenge/response over
   that pipe) is what proves it's the peer you actually added. An inbound

@@ -38,7 +38,7 @@ type TailcatTransport struct {
 	closed  bool
 
 	clientsMu sync.Mutex
-	clients   map[string]*tailcat.Client // keyed by peer addr (ConnBlob string); reused across dials
+	clients   map[string]*tailcat.Client // keyed by peer addr (tailcat.Addr string); reused across dials
 }
 
 // NewTailcatTransport returns a transport using key as this node's tailcat
@@ -71,6 +71,14 @@ func (t *TailcatTransport) Start(ctx context.Context, onConn func(net.Conn)) err
 		Key:      t.key.Private,
 		RegionID: t.key.Public.RegionID,
 		Logf:     t.logf,
+		// The pre-shared key is part of our address, so it has to be
+		// restored from disk alongside Key: tailcat generates a fresh
+		// random one whenever Server.PresharedKey is zero, which would
+		// mint a different address on every daemon start and silently
+		// invalidate every `sc1` token we have ever handed out. See
+		// config.LoadOrCreateTailcatKey, which is what guarantees the
+		// field is non-zero by the time we get here.
+		PresharedKey: t.key.Public.PresharedKey,
 	}
 	srv.OnTCP = func(port uint16) func(net.Conn) {
 		if port != SyncatPort {
@@ -140,7 +148,7 @@ func (t *TailcatTransport) clientFor(addr string) (*tailcat.Client, error) {
 		return c, nil
 	}
 	c := &tailcat.Client{
-		Server: tailcat.ConnBlob(addr),
+		Server: tailcat.Addr(addr),
 		Logf:   t.logf,
 	}
 	if t.clients == nil {
@@ -234,7 +242,7 @@ func (t *TailcatTransport) LocalAddress() (string, error) {
 	if !started || srv == nil {
 		return "", errors.New("transport: tailcat: LocalAddress called before Start completed")
 	}
-	return string(srv.ConnBlob()), nil
+	return string(srv.TailcatAddr()), nil
 }
 
 func (t *TailcatTransport) Close() error {

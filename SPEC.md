@@ -70,21 +70,34 @@ the next change from the offerer (after a trash copy is taken).
 - The tailcat key gives a stable node address; the Ed25519 key signs the application
   handshake so peers are authenticated at the syncat layer regardless of what the
   tailcat transport exposes.
+- The saved tailcat key file holds more than the private key: it persists the whole
+  `tailcat.PrivateKey`, including the resolved DERP region and (since tailcat 0.6.0)
+  the WireGuard pre-shared key. All three are inputs to the node's address, so all
+  three must be restored on every start or the node advertises a different address
+  than the one `syncat token` prints. A key file predating these fields is migrated
+  in place on load: the disco key is derived from the node key, the pre-shared key
+  is minted once and written back.
 
 ### Syncat node token
 The user-visible token wraps the tailcat connection blob plus app identity:
 
 ```
 sc1<base64url(CBOR{
-  tc:   <tailcat ConnBlob string, "tc...">,
+  tc:   <tailcat address string, "tc..."; tailcat's ConnBlob was renamed Addr in 0.5.0>,
   id:   <Ed25519 public key, 32 bytes>,
   name: <suggested display name, string>
 })>
 ```
 
 Prefix `sc1` versions the token format. `syncat token` prints it; the UI shows it with
-a copy button. Treat it as a secret: possession lets someone *attempt* to connect
-(they still land in the pending-approval list below).
+a copy button. Treat it as a secret: the `tc` address embeds a WireGuard pre-shared
+key, and possession lets someone *attempt* to connect (they still land in the
+pending-approval list below).
+
+The `tc` address is not version-negotiated. Its contents changed in tailcat 0.3.0
+(disco key) and 0.6.0 (pre-shared key), and nodes on either side of those changes
+cannot connect in either direction, so a tailcat upgrade is a flag day: upgrade every
+node, then re-exchange tokens.
 
 ### Peering flow
 1. Alice pastes Bob's token (UI "Add peer" or `syncat peer add <token>`). Bob does the

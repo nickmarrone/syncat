@@ -4,10 +4,13 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/tailscale/tailcat"
 )
 
 func TestIdentityKeyLoadOrCreateThenReloadIsStable(t *testing.T) {
@@ -100,23 +103,23 @@ func TestTailcatKeyStableAcrossReload(t *testing.T) {
 	if k1.Private.Public() != k2.Private.Public() {
 		t.Errorf("tailcat public key changed across reload")
 	}
-	if k1.Public.ConnBlob() != k2.Public.ConnBlob() {
-		t.Errorf("ConnBlob changed across reload:\n  first:  %s\n  second: %s", k1.Public.ConnBlob(), k2.Public.ConnBlob())
+	if k1.Public.Addr() != k2.Public.Addr() {
+		t.Errorf("address changed across reload:\n  first:  %s\n  second: %s", k1.Public.Addr(), k2.Public.Addr())
 	}
 
 	k3, err := LoadTailcatKey(path)
 	if err != nil {
 		t.Fatalf("LoadTailcatKey: %v", err)
 	}
-	if k1.Public.ConnBlob() != k3.Public.ConnBlob() {
-		t.Errorf("ConnBlob changed via LoadTailcatKey:\n  first: %s\n  third: %s", k1.Public.ConnBlob(), k3.Public.ConnBlob())
+	if k1.Public.Addr() != k3.Public.Addr() {
+		t.Errorf("address changed via LoadTailcatKey:\n  first: %s\n  third: %s", k1.Public.Addr(), k3.Public.Addr())
 	}
 
-	// Repeated calls to ConnBlob() itself (no reload) must also agree,
+	// Repeated calls to Addr() itself (no reload) must also agree,
 	// since token stability ultimately rests on this being deterministic
 	// for a fixed ConnInfo.
-	if k1.Public.ConnBlob() != k1.Public.ConnBlob() {
-		t.Errorf("ConnBlob() is not deterministic for a fixed ConnInfo")
+	if k1.Public.Addr() != k1.Public.Addr() {
+		t.Errorf("Addr() is not deterministic for a fixed ConnInfo")
 	}
 }
 
@@ -243,5 +246,112 @@ func TestAPITokenRegenerateIsNoOp(t *testing.T) {
 	}
 	if tok1 != tok2 {
 		t.Errorf("token changed across reload: %s != %s", tok1, tok2)
+	}
+}
+
+// TestMigrateTailcatKeyBackfillsDiscoAndPresharedKey covers upgrading a key
+// file written by a syncat built against tailcat v0.2.0, which knew about
+// neither the disco key (added in v0.3.0) nor the pre-shared key (v0.6.0).
+//
+// Both matter for reachability, not tidiness: peers reject an address with
+// no disco key outright, and a zero pre-shared key makes tailcat mint a
+// throwaway one at every Server.Start, so the daemon would advertise a
+// different address on each run than the one `syncat token` prints.
+func TestMigrateTailcatKeyBackfillsDiscoAndPresharedKey(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "tailcat.key")
+
+	// A v0.2.0-shaped key file: node keypair and a resolved region, but
+	// neither of the fields tailcat added later.
+	legacy := tailcat.NewPrivateKey()
+	legacy.Public.ServerDiscoPublic = tailcat.DiscoPublic{}
+	legacy.Public.PresharedKey = tailcat.PresharedKey{}
+	legacy.Public.RegionID = 1
+	data, err := json.MarshalIndent(legacy, "", "\t")
+	if err != nil {
+		t.Fatalf("marshal legacy key: %v", err)
+	}
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatalf("write legacy key: %v", err)
+	}
+
+	// Loading an existing key does no network I/O, so this needs no guard.
+	got, created, err := LoadOrCreateTailcatKey(context.Background(), path)
+	if err != nil {
+		t.Fatalf("LoadOrCreateTailcatKey: %v", err)
+	}
+	if created {
+		t.Fatal("created = true, want false: the key file already existed")
+	}
+	if got.Private.Public() != legacy.Private.Public() {
+		t.Error("migration changed the node key; it must be preserved")
+	}
+	if got.Public.RegionID != 1 {
+		t.Errorf("RegionID = %d, want the persisted 1", got.Public.RegionID)
+	}
+	if got.Public.ServerDiscoPublic.IsZero() {
+		t.Error("ServerDiscoPublic still zero after migration")
+	}
+	if want := tailcat.DiscoPublicForNode(legacy.Private); !got.Public.ServerDiscoPublic.Equal(want) {
+		t.Error("ServerDiscoPublic is not the key derived from the node key")
+	}
+	if got.Public.PresharedKey.IsZero() {
+		t.Error("PresharedKey still zero after migration")
+	}
+
+	// The migration must have been written back, or every restart would
+	// mint a different pre-shared key and a different address with it.
+	reloaded, err := LoadTailcatKey(path)
+	if err != nil {
+		t.Fatalf("LoadTailcatKey after migration: %v", err)
+	}
+	if !reloaded.Public.PresharedKey.Equal(got.Public.PresharedKey) {
+		t.Error("PresharedKey was not persisted: it differs after reload")
+	}
+	if !reloaded.Public.ServerDiscoPublic.Equal(got.Public.ServerDiscoPublic) {
+		t.Error("ServerDiscoPublic was not persisted: it differs after reload")
+	}
+	if reloaded.Public.Addr() != got.Public.Addr() {
+		t.Errorf("address changed across reload:\n  migrated: %s\n  reloaded: %s",
+			got.Public.Addr(), reloaded.Public.Addr())
+	}
+
+	// A second load must be a no-op, not another round of minting.
+	again, _, err := LoadOrCreateTailcatKey(context.Background(), path)
+	if err != nil {
+		t.Fatalf("LoadOrCreateTailcatKey (second): %v", err)
+	}
+	if again.Public.Addr() != got.Public.Addr() {
+		t.Errorf("re-migrating a migrated key changed the address:\n  first:  %s\n  second: %s",
+			got.Public.Addr(), again.Public.Addr())
+	}
+}
+
+// TestTailcatKeyCarriesPresharedKey pins that a freshly generated key gets a
+// pre-shared key persisted with it. It is what makes the node's address
+// reproducible: transport.TailcatTransport feeds this field back to
+// tailcat.Server, which would otherwise generate a throwaway one per start.
+func TestTailcatKeyCarriesPresharedKey(t *testing.T) {
+	if testing.Short() {
+		t.Skip("requires network access to resolve a DERP region")
+	}
+
+	path := filepath.Join(t.TempDir(), "tailcat.key")
+	key, _, err := LoadOrCreateTailcatKey(context.Background(), path)
+	if err != nil {
+		t.Fatalf("LoadOrCreateTailcatKey: %v", err)
+	}
+	if key.Public.PresharedKey.IsZero() {
+		t.Fatal("a newly created tailcat key has no pre-shared key")
+	}
+
+	// It has to survive the JSON round-trip through disk, not just exist
+	// in memory.
+	reloaded, err := LoadTailcatKey(path)
+	if err != nil {
+		t.Fatalf("LoadTailcatKey: %v", err)
+	}
+	if !reloaded.Public.PresharedKey.Equal(key.Public.PresharedKey) {
+		t.Error("pre-shared key did not survive the round-trip through disk")
 	}
 }

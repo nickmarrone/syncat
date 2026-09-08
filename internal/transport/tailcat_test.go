@@ -286,3 +286,78 @@ func TestClientCacheDiscardsFailedDials(t *testing.T) {
 		t.Fatal("a stale discard evicted the replacement Client")
 	}
 }
+
+// TestLocalAddressMatchesPersistedKeyAcrossRestarts is the regression test
+// for the tailcat v0.6.0 upgrade: an address now carries a WireGuard
+// pre-shared key, and tailcat.Server mints a throwaway one whenever
+// Server.PresharedKey is left zero.
+//
+// syncat produces its address two different ways and both have to agree —
+// the daemon serves LocalAddress() from a running Server, while `syncat
+// token` derives it offline from the persisted PrivateKey.Public. Without
+// feeding the persisted pre-shared key back into the Server, the daemon
+// advertised a fresh random one on every start: `syncat token` printed a
+// token that no longer reached the node, and every token already handed to
+// a peer went stale at the next restart. Nothing failed loudly; peers just
+// stopped connecting.
+//
+// The assertions deliberately compare the parsed key material rather than
+// the address strings, which legitimately differ: LocalAddress() embeds the
+// full DERP region while the offline form carries only a region id, and the
+// region is re-picked by latency on each Start.
+func TestLocalAddressMatchesPersistedKeyAcrossRestarts(t *testing.T) {
+	if testing.Short() {
+		t.Skip("starts a real tailcat server; skipped under -short")
+	}
+
+	key := tailcat.NewPrivateKey()
+	if key.Public.PresharedKey.IsZero() {
+		t.Fatal("tailcat.NewPrivateKey returned no pre-shared key")
+	}
+
+	// What `syncat token` would print, derived offline from the key alone.
+	offline, err := tailcat.ParseAddr(key.Public.Addr())
+	if err != nil {
+		t.Fatalf("ParseAddr(persisted): %v", err)
+	}
+
+	// Two successive daemon lifetimes on the same persisted key.
+	for run := 1; run <= 2; run++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+
+		tr := NewTailcatTransport(key, t.Logf)
+		if err := tr.Start(ctx, func(net.Conn) {}); err != nil {
+			cancel()
+			t.Fatalf("run %d: Start: %v", run, err)
+		}
+
+		addr, err := tr.LocalAddress()
+		if err != nil {
+			tr.Close()
+			cancel()
+			t.Fatalf("run %d: LocalAddress: %v", run, err)
+		}
+		served, err := tailcat.ParseAddr(tailcat.Addr(addr))
+		if err != nil {
+			tr.Close()
+			cancel()
+			t.Fatalf("run %d: ParseAddr(served): %v", run, err)
+		}
+
+		if !served.ServerPublic.Equal(offline.ServerPublic) {
+			t.Errorf("run %d: served node key differs from the persisted one", run)
+		}
+		if !served.ServerDiscoPublic.Equal(offline.ServerDiscoPublic) {
+			t.Errorf("run %d: served disco key differs from the persisted one", run)
+		}
+		if !served.PresharedKey.Equal(offline.PresharedKey) {
+			t.Errorf("run %d: served pre-shared key differs from the persisted one; "+
+				"the daemon is advertising an address `syncat token` cannot reproduce", run)
+		}
+
+		if err := tr.Close(); err != nil {
+			t.Errorf("run %d: Close: %v", run, err)
+		}
+		cancel()
+	}
+}

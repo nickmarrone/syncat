@@ -112,7 +112,8 @@ func LoadTailcatKey(path string) (*tailcat.PrivateKey, error) {
 
 // LoadOrCreateTailcatKey loads the tailcat saved key at path, generating and
 // persisting a new one if none exists. created reports whether a new key
-// was generated.
+// was generated. An existing key is migrated in place if it predates
+// fields tailcat has since added to the address (see migrateTailcatKey).
 //
 // Generating a key requires resolving a concrete DERP relay region once
 // (network access) and baking it into PrivateKey.Public.RegionID. This
@@ -124,6 +125,9 @@ func LoadTailcatKey(path string) (*tailcat.PrivateKey, error) {
 // the life of the key, matching cmd/tailcat's `genkey --fixed-region`.
 func LoadOrCreateTailcatKey(ctx context.Context, path string) (key *tailcat.PrivateKey, created bool, err error) {
 	if key, err := LoadTailcatKey(path); err == nil {
+		if err := migrateTailcatKey(path, key); err != nil {
+			return nil, false, err
+		}
 		return key, false, nil
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, false, err
@@ -147,14 +151,66 @@ func LoadOrCreateTailcatKey(ctx context.Context, path string) (key *tailcat.Priv
 	}
 	priv.Public.RegionID = regionID
 
-	data, err := json.MarshalIndent(priv, "", "\t")
-	if err != nil {
-		return nil, false, fmt.Errorf("config: encode tailcat key: %w", err)
-	}
-	if err := writeFileAtomic(path, data, 0600); err != nil {
-		return nil, false, fmt.Errorf("config: save tailcat key %s: %w", path, err)
+	if err := saveTailcatKey(path, priv); err != nil {
+		return nil, false, err
 	}
 	return priv, true, nil
+}
+
+// saveTailcatKey writes key to path as JSON, mode 0600. The whole
+// PrivateKey is persisted, Public included: despite the field name it
+// holds the WireGuard pre-shared key, which is a secret and is required to
+// reproduce this node's address after a restart.
+func saveTailcatKey(path string, key *tailcat.PrivateKey) error {
+	data, err := json.MarshalIndent(key, "", "\t")
+	if err != nil {
+		return fmt.Errorf("config: encode tailcat key: %w", err)
+	}
+	if err := writeFileAtomic(path, data, 0600); err != nil {
+		return fmt.Errorf("config: save tailcat key %s: %w", path, err)
+	}
+	return nil
+}
+
+// migrateTailcatKey fills in address fields that tailcat added after this
+// key file may have been written, rewriting path if anything changed. A key
+// written by syncat built against tailcat v0.2.0 has neither, and without
+// them the node cannot be reached at all by a current peer.
+//
+// The two fields differ in an important way:
+//
+//   - ServerDiscoPublic (tailcat v0.3.0, which split path discovery from
+//     node identity) is *derived* from the private key, so backfilling it
+//     just records what the running server would compute anyway. Peers
+//     reject an address without it outright ("legacy tailcat address lacks
+//     a separate disco key").
+//
+//   - PresharedKey (tailcat v0.6.0) is *new randomness*, so it cannot be
+//     recovered — only minted. Leaving it zero is not an option: tailcat
+//     generates a throwaway one at every Server.Start, so the daemon would
+//     advertise a different address on each run and never match what
+//     `syncat token` prints. Minting one here and persisting it pins the
+//     address for the life of the key.
+//
+// Both change this node's address, so peers paired before the upgrade must
+// be re-added from a freshly printed token. That re-pairing is forced by
+// the disco-key split regardless of what we do with the pre-shared key,
+// which is why minting one is the right trade: same cost, and the address
+// gains a post-quantum secret that keeps a DERP operator out of the tunnel.
+func migrateTailcatKey(path string, key *tailcat.PrivateKey) error {
+	changed := false
+	if key.Public.ServerDiscoPublic.IsZero() {
+		key.Public.ServerDiscoPublic = tailcat.DiscoPublicForNode(key.Private)
+		changed = true
+	}
+	if key.Public.PresharedKey.IsZero() {
+		key.Public.PresharedKey = tailcat.NewPresharedKey()
+		changed = true
+	}
+	if !changed {
+		return nil
+	}
+	return saveTailcatKey(path, key)
 }
 
 // --- sc1 node tokens (SPEC.md §2) --------------------------------------
