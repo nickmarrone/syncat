@@ -424,6 +424,15 @@ func (n *Node) SetShareAccess(shareRef, peerRef, access string) error {
 	if err := sess.Writer().WriteMessage(protocol.MsgAccessUpdate, protocol.AccessUpdate{ShareID: shareID, Access: access}); err != nil {
 		n.logger.Printf("core: send access update for %s to %s: %v", shareID, peerKeyHex, err)
 	}
+	// An access decision changes what this peer's ShareList looks like, and
+	// SPEC.md §4 says ShareList is sent on connect *and on change*. The
+	// AccessUpdate above doesn't cover it: the subscriber files that against
+	// a subscription it already has, while the access it shows for an
+	// offered share comes from the ShareList and nowhere else. Without this,
+	// a share we just granted keeps reading as "no access" on the peer's
+	// side — and a grant made before the peer ever subscribes reaches it
+	// with nothing at all — until the next reconnect.
+	n.sendShareList(sess, peerKeyHex)
 	if access == protocol.AccessGranted {
 		sess.AddShare(syncsvc.ShareConfig{ShareID: shareID, Root: share.Path, Direction: syncsvc.DirectionFor(share.Permission, ""), Ignore: n.shareIgnoreFunc(shareID)})
 		pc.markShareActive(shareID)

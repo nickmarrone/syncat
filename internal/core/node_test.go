@@ -1190,6 +1190,51 @@ func TestRemoveSubscriptionResolvesNames(t *testing.T) {
 	}
 }
 
+// TestGrantReannouncesShareList is the bug where `syncat subscription ls`
+// said "granted" and files were flowing, while the UI's peer page still
+// showed the same share as "no access". The two read different fields:
+// a subscription's access comes from the AccessUpdate the offerer pushed,
+// but a remote share's comes from the offerer's ShareList and nowhere
+// else — and an access decision used to send only the AccessUpdate, so
+// the ShareList the subscriber held stayed at its connect-time "none"
+// until the next reconnect. A grant to a peer that has not subscribed at
+// all is the same gap with no AccessUpdate to mask it: nothing reached
+// the peer until it reconnected.
+func TestGrantReannouncesShareList(t *testing.T) {
+	nodeA, nodeB, shareID := connectedPairWithShare(t, "docs")
+
+	remoteAccess := func() string {
+		for _, rs := range nodeB.Status().RemoteShares {
+			if rs.ShareID == shareID {
+				return rs.Access
+			}
+		}
+		return ""
+	}
+	if got := remoteAccess(); got != protocol.AccessNone {
+		t.Fatalf("remote share access before any grant = %q, want %q", got, protocol.AccessNone)
+	}
+
+	// A grant with no subscription behind it: the ShareList is the only
+	// way nodeB can hear about it.
+	if err := nodeA.SetShareAccess(shareID, nodeB.PeerKey(), protocol.AccessGranted); err != nil {
+		t.Fatalf("SetShareAccess: %v", err)
+	}
+	waitFor(t, 5*time.Second, func() bool { return remoteAccess() == protocol.AccessGranted })
+
+	if err := nodeA.SetShareAccess(shareID, nodeB.PeerKey(), protocol.AccessRevoked); err != nil {
+		t.Fatalf("SetShareAccess revoke: %v", err)
+	}
+	waitFor(t, 5*time.Second, func() bool { return remoteAccess() == protocol.AccessRevoked })
+
+	// And the reported case: subscribing auto-grants, and the peer page
+	// must follow along without waiting for a reconnect.
+	if err := nodeB.AddSubscription("nodeA", "docs", t.TempDir(), config.ModeMirror); err != nil {
+		t.Fatalf("AddSubscription: %v", err)
+	}
+	waitFor(t, 5*time.Second, func() bool { return remoteAccess() == protocol.AccessGranted })
+}
+
 // connectedPairWithShare returns two connected nodes, where nodeA offers a
 // read-only share by the given name and nodeB has already received nodeA's
 // ShareList — the precondition for resolving share names.
