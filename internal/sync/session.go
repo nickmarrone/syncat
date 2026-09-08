@@ -179,6 +179,11 @@ type Session struct {
 	// silent peer time out.
 	testPullStallTimeout time.Duration
 
+	// testJournalPageSize, if non-zero, replaces journalPageSize. Same deal
+	// again: journalling 20,000 changes to watch a second page happen is
+	// not a test anyone will keep running.
+	testJournalPageSize int
+
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -532,42 +537,14 @@ func (s *Session) answerSyncRequest(ctx context.Context, req protocol.IndexSyncR
 	cfg, _ := s.getShare(req.ShareID)
 
 	if canAnswerWithDeltas(req, epoch, high, oldest) {
-		rows, err := s.store.JournalSince(ctx, req.ShareID, epoch, req.AppliedSeq, 100000)
+		done, err := s.sendJournalDeltas(ctx, cfg, epoch, req.AppliedSeq)
 		if err != nil {
 			return err
 		}
-		if journalHasIgnored(cfg, rows) {
-			// A delta batch cannot simply omit an entry: the receiver
-			// requires the entries to be contiguous from FromSeq (see
-			// readLoop) and Store.ApplyPeerDelta additionally requires
-			// FromSeq == cursor+1 and len(rows) == ToSeq-FromSeq+1. Drop
-			// one and the peer rejects the batch and resyncs, forever.
-			//
-			// So fall through to a full snapshot, which carries no
-			// per-entry sequence contract and re-anchors the peer's
-			// cursor at HighSeq. This is reachable only for a path that
-			// was journalled while still syncing and has since become
-			// ignored, with a peer whose cursor predates that entry —
-			// and the snapshot moves that peer past it for good.
-			s.debugf("share %s: journal range holds a now-ignored path; answering with a full snapshot", req.ShareID)
-		} else {
-			for len(rows) > 0 {
-				n := deltaBatchLen(req.ShareID, epoch, rows)
-				if n == 0 {
-					return fmt.Errorf("sync: journal entry %s cannot fit in a frame", rows[0].Row.RelPath)
-				}
-				entries := make([]protocol.IndexDeltaEntry, n)
-				for i := range entries {
-					entries[i] = protocol.IndexDeltaEntry{Seq: rows[i].Seq, File: rows[i].Row.Info()}
-				}
-				m := protocol.IndexDeltaBatch{ShareID: req.ShareID, Epoch: epoch, FromSeq: entries[0].Seq, ToSeq: entries[n-1].Seq, Entries: entries}
-				if err = s.writer.WriteMessage(protocol.MsgIndexDeltaBatch, m); err != nil {
-					return err
-				}
-				rows = rows[n:]
-			}
+		if done {
 			return nil
 		}
+		s.debugf("share %s: journal range holds a now-ignored path; answering with a full snapshot", req.ShareID)
 	}
 	rows, err := s.store.ListShare(ctx, req.ShareID, true)
 	if err != nil {
@@ -599,6 +576,75 @@ func (s *Session) answerSyncRequest(ctx context.Context, req protocol.IndexSyncR
 		rows = rows[n:]
 	}
 	return s.writer.WriteMessage(protocol.MsgIndexSnapshotEnd, protocol.IndexSnapshotEnd{ShareID: req.ShareID, SnapshotID: id, BatchCount: batch})
+}
+
+// journalPageSize bounds how many journal rows one read holds in memory at
+// a time.
+//
+// This is a memory bound, not a protocol one: the peer acknowledges each
+// batch as it lands, so where one read ends and the next begins is
+// invisible on the wire. The page is sized to still fill a delta batch
+// (protocol.TargetIndexBatchSize) for typical entries, so paging costs no
+// extra frames in practice, while a share with a long journal no longer
+// materialises tens of thousands of rows -- version-vector map and all --
+// in one slice per peer asking to resync.
+const journalPageSize = 20000
+
+// sendJournalDeltas walks the journal from applied to the end, sending each
+// page as one or more IndexDeltaBatch frames. done is false when the range
+// holds a path this share now ignores, which means the caller must answer
+// with a full snapshot instead.
+//
+// A delta batch cannot simply omit an entry: the receiver requires the
+// entries to be contiguous from FromSeq (see readLoop) and
+// Store.ApplyPeerDelta additionally requires FromSeq == cursor+1 and
+// len(rows) == ToSeq-FromSeq+1. Drop one and the peer rejects the batch and
+// resyncs, forever. So an ignored path anywhere in the range hands the
+// whole answer over to a snapshot, which carries no per-entry sequence
+// contract and re-anchors the peer's cursor at HighSeq. This is reachable
+// only for a path that was journalled while still syncing and has since
+// become ignored, with a peer whose cursor predates that entry -- and the
+// snapshot moves that peer past it for good. Pages already sent before the
+// ignored entry was reached are not a problem: the snapshot supersedes
+// them.
+func (s *Session) sendJournalDeltas(ctx context.Context, cfg ShareConfig, epoch string, applied uint64) (done bool, err error) {
+	shareID := cfg.ShareID
+	pageSize := journalPageSize
+	if s.testJournalPageSize > 0 {
+		pageSize = s.testJournalPageSize
+	}
+	for {
+		rows, err := s.store.JournalSince(ctx, shareID, epoch, applied, pageSize)
+		if err != nil {
+			return false, err
+		}
+		if len(rows) == 0 {
+			return true, nil
+		}
+		if journalHasIgnored(cfg, rows) {
+			return false, nil
+		}
+		page := rows
+		for len(page) > 0 {
+			n := deltaBatchLen(shareID, epoch, page)
+			if n == 0 {
+				return false, fmt.Errorf("sync: journal entry %s cannot fit in a frame", page[0].Row.RelPath)
+			}
+			entries := make([]protocol.IndexDeltaEntry, n)
+			for i := range entries {
+				entries[i] = protocol.IndexDeltaEntry{Seq: page[i].Seq, File: page[i].Row.Info()}
+			}
+			m := protocol.IndexDeltaBatch{ShareID: shareID, Epoch: epoch, FromSeq: entries[0].Seq, ToSeq: entries[n-1].Seq, Entries: entries}
+			if err := s.writer.WriteMessage(protocol.MsgIndexDeltaBatch, m); err != nil {
+				return false, err
+			}
+			page = page[n:]
+		}
+		if len(rows) < pageSize {
+			return true, nil
+		}
+		applied = rows[len(rows)-1].Seq
+	}
 }
 
 // canAnswerWithDeltas reports whether the journal can carry this peer from

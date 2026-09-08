@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"runtime"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -191,4 +192,59 @@ func TestPrunedJournalFallsBackToSnapshot(t *testing.T) {
 
 	mustSync(t, sa, testShareID)
 	waitForFile(t, 10*time.Second, b.store, testShareID, b.root, "second.txt", "two")
+}
+
+// TestJournalDeltasPageAcrossReads checks that walking the journal in
+// bounded pages still delivers every entry, in one clean pass. Where one
+// read ends and the next begins is a memory bound, not a protocol one, so
+// it must be invisible to the peer.
+//
+// Convergence alone would not prove that: a page boundary that skipped or
+// repeated an entry produces a delta the receiver rejects for a sequence
+// gap, and it recovers by asking for a resync, so the files still arrive.
+// The assertion that actually bites is that the peer never had to ask --
+// an IndexSyncRequest coming back is precisely the sound of a page
+// boundary having gone wrong.
+func TestJournalDeltasPageAcrossReads(t *testing.T) {
+	ctx := context.Background()
+	a := newTestNode(t, "aaaaaaaaaaaaaaaa")
+	b := newTestNode(t, "bbbbbbbbbbbbbbbb")
+	sa, _ := connectSessions(t, a, b, Direction{}, Direction{})
+	sa.testJournalPageSize = 3 // several pages out of a handful of entries
+
+	// The first sync is always a full snapshot: a's outgoing cursor starts
+	// on the empty epoch, which no journal range can serve. Get past it,
+	// and past the ack that anchors the cursor, so that what follows is
+	// genuinely the delta path.
+	writeFile(t, a.root, "anchor.txt", "anchor")
+	indexFile(t, a.store, a.id, "anchor.txt", a.root)
+	mustSync(t, sa, testShareID)
+	waitForFile(t, 10*time.Second, b.store, testShareID, b.root, "anchor.txt", "anchor")
+	waitFor(t, 10*time.Second, func() bool {
+		c, err := a.store.Cursor(ctx, b.id, testShareID, "outgoing")
+		return err == nil && c.Epoch != ""
+	})
+
+	var resyncs atomic.Int32
+	sa.SetFrameObserver(func(typ protocol.MsgType) {
+		if typ == protocol.MsgIndexSyncRequest {
+			resyncs.Add(1)
+		}
+	})
+
+	const files = 10
+	for i := 0; i < files; i++ {
+		rel := fmt.Sprintf("f%02d.txt", i)
+		writeFile(t, a.root, rel, fmt.Sprintf("body %d", i))
+		indexFile(t, a.store, a.id, rel, a.root)
+	}
+
+	mustSync(t, sa, testShareID)
+	for i := 0; i < files; i++ {
+		waitForFile(t, 10*time.Second, b.store, testShareID, b.root,
+			fmt.Sprintf("f%02d.txt", i), fmt.Sprintf("body %d", i))
+	}
+	if n := resyncs.Load(); n != 0 {
+		t.Fatalf("peer asked to resync %d time(s); the paged journal walk lost or repeated an entry", n)
+	}
 }
