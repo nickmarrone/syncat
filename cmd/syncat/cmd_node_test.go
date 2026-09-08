@@ -212,6 +212,71 @@ func TestDaemonRunningFallsBackWhenConfigIsUnreadable(t *testing.T) {
 	}
 }
 
+func TestOwnershipConflictFindsTheFirstForeignOwner(t *testing.T) {
+	const me = 1000
+	owners := map[string]int{
+		"/etc/syncat":             1000,
+		"/etc/syncat/config.json": 999, // the packaged-install case: owned by `syncat`
+		"/etc/syncat/api.token":   998,
+	}
+	ownerOf := func(p string) (int, bool) {
+		uid, ok := owners[p]
+		return uid, ok
+	}
+	paths := []string{"/etc/syncat", "/etc/syncat/config.json", "/etc/syncat/api.token"}
+
+	path, owner, conflict := ownershipConflict(paths, me, ownerOf)
+	if !conflict || path != "/etc/syncat/config.json" || owner != 999 {
+		t.Errorf("ownershipConflict = (%q, %d, %v), want (/etc/syncat/config.json, 999, true)", path, owner, conflict)
+	}
+}
+
+func TestOwnershipConflictAllowsOurOwnStateAndUnknowns(t *testing.T) {
+	const me = 1000
+	mine := func(string) (int, bool) { return me, true }
+	if _, _, conflict := ownershipConflict([]string{"/a", "/b"}, me, mine); conflict {
+		t.Error("reset refused state this user already owns")
+	}
+
+	// Absent paths, and platforms that won't name an owner, are skipped
+	// rather than treated as a conflict.
+	unknown := func(string) (int, bool) { return 0, false }
+	if _, _, conflict := ownershipConflict([]string{"/a", "/b"}, me, unknown); conflict {
+		t.Error("reset refused on paths with no determinable owner")
+	}
+
+	// currentUID reports -1 where the concept doesn't apply; the check
+	// has to stand down, not compare against a sentinel.
+	if _, _, conflict := ownershipConflict([]string{"/a"}, -1, mine); conflict {
+		t.Error("reset refused when the platform has no uid to compare")
+	}
+}
+
+func TestStatOwnerReportsUsForFilesWeCreate(t *testing.T) {
+	if currentUID() < 0 {
+		t.Skip("no file ownership on this platform")
+	}
+	f := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(f, []byte("{}"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	owner, ok := statOwner(f)
+	if !ok || owner != currentUID() {
+		t.Errorf("statOwner = (%d, %v), want (%d, true)", owner, ok, currentUID())
+	}
+	if _, ok := statOwner(filepath.Join(t.TempDir(), "absent")); ok {
+		t.Error("statOwner claimed an owner for a path that does not exist")
+	}
+}
+
+func TestCheckResetOwnershipPassesOnOurOwnLayout(t *testing.T) {
+	p := tempPaths(t)
+	populate(t, p)
+	if err := checkResetOwnership(p, resetTargets(p)); err != nil {
+		t.Errorf("checkResetOwnership on a layout we own: %v", err)
+	}
+}
+
 func TestInitRejectsYesWithoutReset(t *testing.T) {
 	err := cmdInit(tempPaths(t), []string{"--yes"})
 	if err == nil || !strings.Contains(err.Error(), "--yes") {

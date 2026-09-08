@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"os/user"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -128,6 +129,11 @@ const resetConfirmWord = "RESET"
 // in and out are parameters rather than os.Stdin/os.Stdout so the prompt
 // is testable; cmdInit passes the real ones.
 func resetState(paths *config.Paths, in io.Reader, out io.Writer, assumeYes bool) error {
+	targets := resetTargets(paths)
+
+	if err := checkResetOwnership(paths, targets); err != nil {
+		return err
+	}
 	if addr, running := daemonRunning(paths); running {
 		return fmt.Errorf("something is listening on %s — stop the syncat daemon before running `init --reset`", addr)
 	}
@@ -140,7 +146,6 @@ func resetState(paths *config.Paths, in io.Reader, out io.Writer, assumeYes bool
 		cfg = nil
 	}
 
-	targets := resetTargets(paths)
 	kept := keptPaths(cfg)
 
 	if !assumeYes {
@@ -150,6 +155,83 @@ func resetState(paths *config.Paths, in io.Reader, out io.Writer, assumeYes bool
 	}
 
 	return removeState(targets)
+}
+
+// checkResetOwnership refuses a reset that would hand this node's state
+// to a different user than the one that owns it today.
+//
+// The case this exists for is the packaged install (README, "System-wide
+// service"): state under /etc/syncat and /var/lib/syncat owned by a
+// dedicated `syncat` user, and a reset run as root instead. Nothing stops
+// root from doing it — that is the problem. EnsureDirs and
+// writeFileAtomic create as whoever is running, so the reset deletes
+// syncat-owned files and puts root-owned ones back, and the daemon
+// (User=syncat) can no longer read its own config or keys. It fails to
+// start, and with Restart=on-failure it does so every five seconds.
+//
+// This is specifically a hazard --reset introduced. A plain `init` as the
+// wrong user was harmless: it found every file already present and
+// regenerated nothing, so ownership never moved. Deleting first is what
+// turns the same mistake into a broken install, so the guard belongs
+// here rather than in cmdInit.
+//
+// The config and data dirs are checked alongside the targets because a
+// half-initialized install can have the right dirs and no files in them
+// yet, which is the same trap one step earlier.
+func checkResetOwnership(paths *config.Paths, targets []string) error {
+	me := currentUID()
+	checked := append([]string{paths.ConfigDir, paths.DataDir}, targets...)
+
+	path, owner, conflict := ownershipConflict(checked, me, statOwner)
+	if !conflict {
+		return nil
+	}
+	return fmt.Errorf("%s is owned by %s, but this is running as %s.\n"+
+		"A reset would delete that state and recreate it owned by %s, leaving a daemon\n"+
+		"running as %s unable to read its own config and keys. Rerun it as the owner:\n"+
+		"\n    sudo -u %s %s",
+		path, userLabel(owner), userLabel(me), userLabel(me),
+		userLabel(owner), userLabel(owner), strings.Join(os.Args, " "))
+}
+
+// ownershipConflict returns the first path in paths whose owner is
+// somebody other than me. ownerOf reports (uid, true) for a path it could
+// stat, and false for one that is absent or whose owner the platform
+// won't tell us; either way there is nothing to compare and the path is
+// skipped. Taking ownerOf as a parameter keeps this testable without
+// needing to actually own files as two different users.
+func ownershipConflict(paths []string, me int, ownerOf func(string) (int, bool)) (string, int, bool) {
+	if me < 0 {
+		return "", 0, false
+	}
+	for _, p := range paths {
+		owner, ok := ownerOf(p)
+		if !ok || owner == me {
+			continue
+		}
+		return p, owner, true
+	}
+	return "", 0, false
+}
+
+// statOwner is ownershipConflict's production ownerOf. It does not follow
+// symlinks: the question is who owns the thing reset would delete.
+func statOwner(path string) (int, bool) {
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return 0, false
+	}
+	return fileOwner(fi)
+}
+
+// userLabel renders a uid as a username when one can be resolved and as
+// "uid N" when it can't, so the error reads like the sudo line it is
+// asking for rather than like a stat dump.
+func userLabel(uid int) string {
+	if u, err := user.LookupId(strconv.Itoa(uid)); err == nil && u.Username != "" {
+		return u.Username
+	}
+	return "uid " + strconv.Itoa(uid)
 }
 
 // resetTargets lists every path `init --reset` deletes, in deletion

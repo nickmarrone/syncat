@@ -121,6 +121,20 @@ Stop the daemon first — `init --reset` refuses to run while anything is
 listening on the node's `api_addr`, because deleting `index.db` out from
 under a live daemon corrupts its state silently rather than loudly.
 
+On a system-wide install, run it as the service user, the same as every
+other CLI call (see [System-wide service](#system-wide-service)). A reset
+recreates the files as whoever runs it, so doing it as root would leave
+root-owned state that a daemon running as `syncat` can't read — it would
+fail to start, every five seconds. `init --reset` checks for that and
+refuses, naming the owner and the command to rerun, but the short version
+is:
+
+```bash
+sudo systemctl stop syncat.service
+sudo -u syncat /usr/local/bin/syncat --config /etc/syncat --data /var/lib/syncat init --reset
+sudo systemctl start syncat.service
+```
+
 Pass `--yes` to skip the prompt in a script. Without it the reset needs a
 terminal to ask on and fails rather than reading a redirect, so
 `init --reset < /dev/null` can't quietly destroy a node.

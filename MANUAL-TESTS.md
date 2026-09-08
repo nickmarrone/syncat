@@ -84,6 +84,13 @@ id first so you can tell the identity actually rotated.
       the new token works with no leftover state on either side.
 - [ ] Corrupt `config.json` (write garbage into it), then `init --reset`.
       It still works — the prompt just can't name the kept directories.
+- [ ] On a system-wide install (state owned by a `syncat` service user),
+      `sudo syncat ... init --reset` as **root** is refused before anything
+      is deleted, and the message names the owner and prints a `sudo -u`
+      command that actually works when pasted.
+- [ ] The same reset as `sudo -u syncat` goes through, and the recreated
+      `/etc/syncat` and `/var/lib/syncat` files are still `syncat`-owned —
+      `systemctl start syncat.service` comes up clean.
 
 ## 2. Pairing two nodes
 
