@@ -236,6 +236,7 @@ func Open(ctx context.Context, opts Options) (*Node, error) {
 	n.token = tok
 	n.tokenMu.Unlock()
 
+	n.startJournalSweeper()
 	n.startConfiguredWatches(in.cfg)
 	n.startConfiguredPeers(in.cfg)
 

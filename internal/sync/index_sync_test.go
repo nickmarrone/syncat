@@ -2,9 +2,11 @@ package sync
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"runtime"
 	"testing"
+	"time"
 
 	"github.com/nickmarrone/syncat/internal/index"
 	"github.com/nickmarrone/syncat/internal/protocol"
@@ -131,4 +133,62 @@ func TestBatchPlanningIsLinear(t *testing.T) {
 	if used := after.TotalAlloc - before.TotalAlloc; used > budget {
 		t.Fatalf("planning one batch of %d rows allocated %d bytes, over the %d byte budget: batch sizing has gone quadratic again", len(rows), used, budget)
 	}
+}
+
+func TestCanAnswerWithDeltas(t *testing.T) {
+	req := func(epoch string, applied uint64) protocol.IndexSyncRequest {
+		return protocol.IndexSyncRequest{ShareID: "s", Epoch: epoch, AppliedSeq: applied}
+	}
+	cases := []struct {
+		name         string
+		req          protocol.IndexSyncRequest
+		epoch        string
+		high, oldest uint64
+		want         bool
+	}{
+		{"in range", req("e", 5), "e", 9, 3, true},
+		{"exactly at the oldest surviving entry", req("e", 2), "e", 9, 3, true},
+		{"needed entry has been pruned", req("e", 1), "e", 9, 3, false},
+		{"journal fully pruned, peer behind", req("e", 4), "e", 9, 0, false},
+		{"journal fully pruned, peer current", req("e", 9), "e", 9, 0, true},
+		{"nothing ever journalled", req("e", 0), "e", 0, 0, true},
+		{"different epoch", req("old", 5), "e", 9, 3, false},
+		{"peer ahead of us", req("e", 12), "e", 9, 3, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := canAnswerWithDeltas(c.req, c.epoch, c.high, c.oldest); got != c.want {
+				t.Fatalf("canAnswerWithDeltas = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// TestPrunedJournalFallsBackToSnapshot is the property that makes the
+// change journal safe to prune at all: a peer whose cursor predates every
+// surviving entry must be re-anchored with a full snapshot, not answered
+// with silence. Answering an empty journal as if it meant "you are up to
+// date" leaves that peer permanently behind — its next delta is rejected
+// for a sequence gap, it asks again, and gets the same silence.
+func TestPrunedJournalFallsBackToSnapshot(t *testing.T) {
+	ctx := context.Background()
+	a := newTestNode(t, "aaaaaaaaaaaaaaaa")
+	b := newTestNode(t, "bbbbbbbbbbbbbbbb")
+	sa, _ := connectSessions(t, a, b, Direction{}, Direction{})
+
+	writeFile(t, a.root, "first.txt", "one")
+	indexFile(t, a.store, a.id, "first.txt", a.root)
+	mustSync(t, sa, testShareID)
+	waitForFile(t, 10*time.Second, b.store, testShareID, b.root, "first.txt", "one")
+
+	// A change B never hears about, whose journal entry is then aged out
+	// from under it.
+	writeFile(t, a.root, "second.txt", "two")
+	indexFile(t, a.store, a.id, "second.txt", a.root)
+	if err := a.store.PruneJournal(ctx, time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("prune journal: %v", err)
+	}
+
+	mustSync(t, sa, testShareID)
+	waitForFile(t, 10*time.Second, b.store, testShareID, b.root, "second.txt", "two")
 }

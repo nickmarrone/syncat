@@ -531,7 +531,7 @@ func (s *Session) answerSyncRequest(ctx context.Context, req protocol.IndexSyncR
 	// so this answers unfiltered exactly as it did before.
 	cfg, _ := s.getShare(req.ShareID)
 
-	if req.Epoch == epoch && (oldest == 0 || req.AppliedSeq+1 >= oldest) {
+	if canAnswerWithDeltas(req, epoch, high, oldest) {
 		rows, err := s.store.JournalSince(ctx, req.ShareID, epoch, req.AppliedSeq, 100000)
 		if err != nil {
 			return err
@@ -599,6 +599,35 @@ func (s *Session) answerSyncRequest(ctx context.Context, req protocol.IndexSyncR
 		rows = rows[n:]
 	}
 	return s.writer.WriteMessage(protocol.MsgIndexSnapshotEnd, protocol.IndexSnapshotEnd{ShareID: req.ShareID, SnapshotID: id, BatchCount: batch})
+}
+
+// canAnswerWithDeltas reports whether the journal can carry this peer from
+// its cursor to ours, given the share's current epoch, its highest
+// journalled sequence, and the oldest sequence still on hand (0 when the
+// journal holds nothing for this epoch).
+//
+// Every clause is a way of *not* being able to, and each one falls back to
+// a full snapshot, which re-anchors the peer's cursor unconditionally:
+//
+//   - A different epoch means the sequence numbers are not comparable.
+//   - A peer claiming a sequence past our own high-water mark is not a
+//     peer we can compute a delta for. (It happens: restore this node's
+//     database from a backup and every peer is ahead of it.)
+//   - An entry the peer needs may have aged out of the journal, which is
+//     pruned on a retention window (see core's journal sweep). Requiring
+//     oldest <= AppliedSeq+1 is what makes pruning safe; note that oldest
+//     == 0 — an empty journal — is only "nothing to send" when the peer is
+//     already at high, and otherwise means the entries it needs are gone.
+func canAnswerWithDeltas(req protocol.IndexSyncRequest, epoch string, high, oldest uint64) bool {
+	if req.Epoch != epoch || req.AppliedSeq > high {
+		return false
+	}
+	if req.AppliedSeq == high {
+		// Already current: the delta path sends nothing, which is both
+		// correct and cheaper than a snapshot the peer would discard.
+		return true
+	}
+	return oldest > 0 && oldest <= req.AppliedSeq+1
 }
 
 // journalHasIgnored reports whether any journal entry in rows names a path
