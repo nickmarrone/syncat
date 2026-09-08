@@ -135,10 +135,10 @@ func TestTokenRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate key: %v", err)
 	}
-	const connBlob = "tcSomeOpaqueBlobData123"
+	const tailcatAddr = "tcSomeOpaqueAddrData123"
 	const name = "alice's laptop"
 
-	tok, err := EncodeToken(connBlob, pub, name)
+	tok, err := EncodeToken(tailcatAddr, pub, name)
 	if err != nil {
 		t.Fatalf("EncodeToken: %v", err)
 	}
@@ -150,8 +150,8 @@ func TestTokenRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseToken: %v", err)
 	}
-	if got.ConnBlob != connBlob {
-		t.Errorf("ConnBlob = %q, want %q", got.ConnBlob, connBlob)
+	if got.TailcatAddr != tailcatAddr {
+		t.Errorf("TailcatAddr = %q, want %q", got.TailcatAddr, tailcatAddr)
 	}
 	if !got.ID.Equal(pub) {
 		t.Errorf("ID = %x, want %x", []byte(got.ID), []byte(pub))

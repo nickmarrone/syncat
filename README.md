@@ -521,7 +521,7 @@ text, and why:
   §9's dashboard requires an editable node name, and `core.Node` already
   exposed `RenameNode`. Wired up in `internal/api/server.go`/`handlers.go`.
 - **The test transport uses `net.Pipe`.** Its address registry still stands
-  in for tailcat ConnBlobs. The v2 handshake assigns dialer/acceptor roles
+  in for tailcat addresses. The v2 handshake assigns dialer/acceptor roles
   and alternates Hello, HelloAuth, Auth, and Finished, so every synchronous
   pipe write has a waiting reader. This also makes invalid ordering visible
   in tests instead of hiding it behind a TCP send buffer.
@@ -591,7 +591,7 @@ item, in the order it is worth doing.
 
 2. **Bind the handshake to the tunnel it runs over.** The Ed25519 handshake
    is not defence in depth over tailcat's — it is the *only* peer
-   authentication we have. tailcat accepts any client holding the ConnBlob
+   authentication we have. tailcat accepts any client holding the address
    ("until a key is allowed, all clients are allowed"), and `AddAllowedClient`
    is unavailable to us because client keys must be ephemeral for DERP
    routing (see `TailcatTransport.clientFor`). The signed transcript is
@@ -599,8 +599,8 @@ item, in the order it is worth doing.
    tailcat identity, so an attacker who alters the `tc` field of a token in
    transit — tokens are pasted over chat and email — can relay both
    handshakes between two honest nodes over two separate tunnels and sit in
-   the middle of everything that follows. Fix: fold the dialed ConnBlob and
-   our own `Server.ConnBlob()` into `authTranscript`, length-prefixed. That
+   the middle of everything that follows. Fix: fold the dialed address and
+   our own `Server.TailcatAddr()` into `authTranscript`, length-prefixed. That
    is a wire break, so it wants `proto_version: 2` or a transitional
    signature v1 peers still accept.
 

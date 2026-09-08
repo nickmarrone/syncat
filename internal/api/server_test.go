@@ -88,9 +88,9 @@ func doRequest(t *testing.T, srv *Server, method, path, token string, body any) 
 
 // fakePeerToken builds a syntactically valid sc1 token (SPEC.md §2) for a
 // peer key that isn't backed by any running node — it's not reachable at
-// its "tc" connBlob. That's deliberate: tests exercising peer CRUD via the
-// API only care that AddPeer accepts/parses a token and persists a peer,
-// not that a connection can actually be established, so this avoids
+// its "tc" tailcat address. That's deliberate: tests exercising peer CRUD
+// via the API only care that AddPeer accepts/parses a token and persists a
+// peer, not that a connection can actually be established, so this avoids
 // spinning up a second live node (and the dial/handshake/backoff
 // goroutines that would come with it — unrelated background activity a
 // peer-CRUD test has no reason to trigger).

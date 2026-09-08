@@ -1644,7 +1644,7 @@ func TestPeerRedialDropsStaleSession(t *testing.T) {
 	// restart: the peer's dial simply lost. It must be left alone.
 	redial()
 	pc.mu.Lock()
-	original, connBlob := pc.session, pc.connBlob
+	original, addr := pc.session, pc.addr
 	pc.mu.Unlock()
 	if original == nil {
 		t.Fatal("a redial inside the grace window tore down a healthy new connection")
@@ -1662,7 +1662,7 @@ func TestPeerRedialDropsStaleSession(t *testing.T) {
 		defer pc.mu.Unlock()
 		return pc.session != original
 	})
-	if !spy.sawDiscard(connBlob) {
+	if !spy.sawDiscard(addr) {
 		t.Error("the transport's cached state for the peer was not discarded; a redial would reuse a stale client")
 	}
 	if got := logs.String(); !strings.Contains(got, "so that connection is dead") {

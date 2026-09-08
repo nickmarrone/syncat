@@ -402,8 +402,8 @@ func cmdToken(paths *config.Paths, args []string) error {
 		return err
 	}
 
-	connBlob := tcKey.Public.Addr()
-	tok, err := config.EncodeToken(string(connBlob), idKey.Public(), cfg.NodeName)
+	tailcatAddr := tcKey.Public.Addr()
+	tok, err := config.EncodeToken(string(tailcatAddr), idKey.Public(), cfg.NodeName)
 	if err != nil {
 		return err
 	}

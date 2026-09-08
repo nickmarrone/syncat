@@ -50,7 +50,7 @@ type Transport interface {
 	// for, and safe to call concurrently with Dial.
 	DiscardPeer(addr string)
 
-	// LocalAddress returns this node's address blob, suitable for
+	// LocalAddress returns this node's own address, suitable for
 	// embedding as the "tc" field of our own sc1 token. It is only valid
 	// after Start has returned successfully.
 	LocalAddress() (string, error)

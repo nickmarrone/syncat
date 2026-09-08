@@ -155,7 +155,7 @@ type peerConn struct {
 
 	peerKeyHex string // full Ed25519 public key, hex — canonical id
 	peerShort  string // first 8 bytes, hex — matches config.IdentityKey.ShortID
-	connBlob   string // transport address to dial (the token's "tc" field)
+	addr       string // transport address to dial (the token's "tc" field)
 	peerPub    ed25519.PublicKey
 
 	ctx    context.Context
@@ -191,7 +191,7 @@ func newPeerConn(n *Node, p config.Peer) (*peerConn, error) {
 		node:       n,
 		peerKeyHex: hex.EncodeToString(tok.ID),
 		peerShort:  hex.EncodeToString(tok.ID[:8]),
-		connBlob:   tok.ConnBlob,
+		addr:       tok.TailcatAddr,
 		peerPub:    tok.ID,
 		ctx:        ctx,
 		cancel:     cancel,
@@ -242,7 +242,7 @@ func (pc *peerConn) dialAttempt(ctx context.Context) error {
 		}
 		return nil
 	}
-	connBlob, peerPub := pc.connBlob, pc.peerPub
+	addr, peerPub := pc.addr, pc.peerPub
 	pc.mu.Unlock()
 
 	pc.setState(ConnStateConnecting)
@@ -254,7 +254,7 @@ func (pc *peerConn) dialAttempt(ctx context.Context) error {
 	// slowly enough to reach it (PipeTransport fails an unroutable address
 	// immediately), so nothing here waits on wall-clock time.
 	dialCtx, cancel := context.WithTimeout(ctx, dialTimeout)
-	conn, err := pc.node.transport.Dial(dialCtx, connBlob)
+	conn, err := pc.node.transport.Dial(dialCtx, addr)
 	cancel()
 	if err != nil {
 		if pc.supersededByAdoptedConn() {
@@ -501,7 +501,7 @@ func (pc *peerConn) runConnection(sessCtx context.Context, cancel context.Cancel
 	// it announces itself to the peer's server exactly once, so a
 	// Client reused across the peer's restart dials into a tunnel the
 	// far side has forgotten, and hangs there.
-	pc.node.transport.DiscardPeer(pc.connBlob)
+	pc.node.transport.DiscardPeer(pc.addr)
 
 	pc.mu.Lock()
 	pc.sessCancel = nil

@@ -79,7 +79,7 @@ the next change from the offerer (after a trash copy is taken).
   is minted once and written back.
 
 ### Syncat node token
-The user-visible token wraps the tailcat connection blob plus app identity:
+The user-visible token wraps the tailcat address plus app identity:
 
 ```
 sc1<base64url(CBOR{
