@@ -337,7 +337,7 @@ func (n *Node) SetSharePermission(shareRef, permission string) error {
 		active := pc.activeShares != nil && pc.activeShares[shareID]
 		pc.mu.Unlock()
 		if sess != nil && active {
-			sess.AddShare(syncsvc.ShareConfig{ShareID: shareID, Root: root, Direction: direction})
+			sess.AddShare(syncsvc.ShareConfig{ShareID: shareID, Root: root, Direction: direction, Ignore: n.shareIgnoreFunc(shareID)})
 		}
 	}
 	n.broadcastShareList()
@@ -425,7 +425,7 @@ func (n *Node) SetShareAccess(shareRef, peerRef, access string) error {
 		n.logger.Printf("core: send access update for %s to %s: %v", shareID, peerKeyHex, err)
 	}
 	if access == protocol.AccessGranted {
-		sess.AddShare(syncsvc.ShareConfig{ShareID: shareID, Root: share.Path, Direction: syncsvc.DirectionFor(share.Permission, "")})
+		sess.AddShare(syncsvc.ShareConfig{ShareID: shareID, Root: share.Path, Direction: syncsvc.DirectionFor(share.Permission, ""), Ignore: n.shareIgnoreFunc(shareID)})
 		pc.markShareActive(shareID)
 		if err := sess.SyncShare(n.ctx, shareID); err != nil {
 			n.logger.Printf("core: sync share %s to %s: %v", shareID, peerKeyHex, err)

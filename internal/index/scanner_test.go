@@ -6,7 +6,10 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
+	"slices"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -486,5 +489,184 @@ func TestMatcherAlwaysIncludesBuiltinsAlongsideGlobal(t *testing.T) {
 	}
 	if !m.Match("foo.custom") {
 		t.Error("global ignore pattern should also apply")
+	}
+}
+
+// scanWithRules scans root with globalIgnores plus the .syncatignore
+// content given (empty content means no ignore file at all), diffing
+// against existing.
+func scanWithRules(t *testing.T, root, ignoreContent string, existing map[string]FileRow) *ScanResult {
+	t.Helper()
+	var rules *IgnoreRules
+	if ignoreContent != "" {
+		var warnings []string
+		var err error
+		rules, warnings, err = ParseIgnore(strings.NewReader(ignoreContent))
+		if err != nil {
+			t.Fatalf("ParseIgnore: %v", err)
+		}
+		if len(warnings) != 0 {
+			t.Fatalf("ParseIgnore warnings: %v", warnings)
+		}
+	}
+	sc := NewScanner(os.DirFS(root), NewMatcherWithRules(nil, rules))
+	result, err := sc.Scan(context.Background(), "share1", existing)
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	return result
+}
+
+// rowsPaths lists the relpaths in rows, for readable assertions.
+func rowsPaths(rows []FileRow) []string {
+	out := make([]string, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, r.RelPath)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// TestScanNewlyIgnoredRowIsNotTombstoned is the regression that protects
+// every peer's data. A file that is already indexed and then starts
+// matching a .syncatignore pattern must leave our index via the Ignored
+// bucket — never as a tombstone, which would propagate as a delete.
+func TestScanNewlyIgnoredRowIsNotTombstoned(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "notes.txt", []byte("keep"), time.Now())
+	writeFile(t, root, "debug.log", []byte("noisy"), time.Now())
+
+	// First scan: no ignore file, so both files are indexed.
+	first := scanWithRules(t, root, "", nil)
+	existing := make(map[string]FileRow, len(first.Added))
+	for _, r := range first.Added {
+		existing[r.RelPath] = r
+	}
+	if _, ok := existing["debug.log"]; !ok {
+		t.Fatal("debug.log was not indexed by the first scan")
+	}
+
+	// Second scan, now ignoring *.log. Both files are still on disk.
+	second := scanWithRules(t, root, "*.log\n", existing)
+
+	if len(second.Deleted) != 0 {
+		t.Errorf("newly-ignored path was tombstoned: %v — this would delete it on every peer", rowsPaths(second.Deleted))
+	}
+	if got := rowsPaths(second.Ignored); len(got) != 1 || got[0] != "debug.log" {
+		t.Errorf("Ignored = %v, want [debug.log]", got)
+	}
+	for _, r := range second.Added {
+		if r.RelPath == "debug.log" {
+			t.Error("ignored path was re-added")
+		}
+	}
+}
+
+// TestScanPrunedDirCollectsIndexedChildren pins the subtlety in pruning:
+// when the walk skips an ignored directory, nothing else marks its
+// children seen, so they must be collected explicitly or the tail loop
+// tombstones every one of them.
+func TestScanPrunedDirCollectsIndexedChildren(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "keep.txt", []byte("a"), time.Now())
+	writeFile(t, root, "build/out.o", []byte("b"), time.Now())
+	writeFile(t, root, "build/deep/nested.o", []byte("c"), time.Now())
+
+	first := scanWithRules(t, root, "", nil)
+	existing := make(map[string]FileRow, len(first.Added))
+	for _, r := range first.Added {
+		existing[r.RelPath] = r
+	}
+	for _, want := range []string{"build", "build/out.o", "build/deep", "build/deep/nested.o"} {
+		if _, ok := existing[want]; !ok {
+			t.Fatalf("%s was not indexed by the first scan", want)
+		}
+	}
+
+	second := scanWithRules(t, root, "build/\n", existing)
+
+	if len(second.Deleted) != 0 {
+		t.Errorf("pruned subtree produced tombstones: %v", rowsPaths(second.Deleted))
+	}
+	got := rowsPaths(second.Ignored)
+	want := []string{"build", "build/deep", "build/deep/nested.o", "build/out.o"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("Ignored = %v, want %v", got, want)
+	}
+}
+
+// TestScanIgnoreFileItselfNeverIndexed: .syncatignore is per-node and must
+// never reach the wire, which is enforced by keeping it out of the index.
+func TestScanIgnoreFileItselfNeverIndexed(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, IgnoreFileName, []byte("*.log\n"), time.Now())
+	writeFile(t, root, "notes.txt", []byte("keep"), time.Now())
+
+	result := scanWithRules(t, root, "*.log\n", nil)
+	for _, r := range result.Added {
+		if r.RelPath == IgnoreFileName {
+			t.Fatalf("%s was indexed and would sync to peers", IgnoreFileName)
+		}
+	}
+	if findRow(t, result.Added, "notes.txt").RelPath != "notes.txt" {
+		t.Fatal("notes.txt missing")
+	}
+}
+
+// TestScanNegationReincludesUnderIgnoredDir pins that a '!' rule survives
+// an ignored parent directory — which only works because PruneDirs turns
+// pruning off when negations exist, so the walk actually descends.
+func TestScanNegationReincludesUnderIgnoredDir(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "build/out.o", []byte("a"), time.Now())
+	writeFile(t, root, "build/keep.txt", []byte("b"), time.Now())
+
+	result := scanWithRules(t, root, "build/\n!build/keep.txt\n", nil)
+
+	added := rowsPaths(result.Added)
+	if !slices.Contains(added, "build/keep.txt") {
+		t.Errorf("Added = %v, want it to contain build/keep.txt (re-included by '!')", added)
+	}
+	if slices.Contains(added, "build/out.o") {
+		t.Errorf("Added = %v, want it to exclude build/out.o", added)
+	}
+}
+
+// TestMatcherGlobExcludesDirectoryContents pins that a glob naming a
+// directory also excludes everything beneath it. The scanner gets this for
+// free by pruning the walk, but internal/sync's reconciler asks about one
+// path at a time and never walks — if the two disagreed, a peer's copy of
+// "build/out.o" would be pulled, indexed, pruned, and pulled again.
+func TestMatcherGlobExcludesDirectoryContents(t *testing.T) {
+	m := NewMatcher([]string{"build", "vendor/pkg"})
+	cases := []struct {
+		relpath string
+		want    bool
+	}{
+		{"build", true},
+		{"build/out.o", true},
+		{"build/deep/nested.o", true},
+		{"src/build/out.o", true}, // "build" is unanchored: any depth
+		{"vendor/pkg/lib.go", true},
+		{"vendor/other/lib.go", false},
+		{"src/main.go", false},
+		{"rebuild/out.o", false},
+	}
+	for _, c := range cases {
+		if got := m.MatchPath(c.relpath, false); got != c.want {
+			t.Errorf("MatchPath(%q) = %v, want %v", c.relpath, got, c.want)
+		}
+	}
+}
+
+// TestMatcherBuiltinsExcludeContents: the same rule for the built-ins, so
+// a directory named e.g. .syncat.tmp.foo never leaks its children either.
+func TestMatcherBuiltinsExcludeContents(t *testing.T) {
+	m := NewMatcher(nil)
+	if !m.MatchPath(".syncat.tmp.abc/inner.txt", false) {
+		t.Error("a file inside a .syncat.tmp.* directory was not excluded")
+	}
+	if !m.MatchPath(IgnoreFileName, false) {
+		t.Errorf("%s must always be ignored so it never syncs", IgnoreFileName)
 	}
 }

@@ -389,3 +389,137 @@ func TestConcurrentReadersAndWriter(t *testing.T) {
 		t.Error(err)
 	}
 }
+
+// TestApplyScanResultIgnoredParksWithoutJournal is the store half of the
+// no-tombstone rule. A newly-ignored row must disappear from every listing
+// that feeds the wire, and — the part that actually protects the peers —
+// must leave change_journal and share_state.next_seq untouched, so nothing
+// about it ever reaches a peer as a change.
+func TestApplyScanResultIgnoredParksWithoutJournal(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	seed := FileRow{ShareID: "s1", RelPath: "debug.log", Type: protocol.FileTypeFile, Size: 5, MTimeNS: 1, UpdatedAt: now}
+	if err := s.PutFile(ctx, seed); err != nil {
+		t.Fatalf("seed PutFile: %v", err)
+	}
+
+	countJournal := func() int {
+		t.Helper()
+		var n int
+		if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM change_journal WHERE share_id = ?`, "s1").Scan(&n); err != nil {
+			t.Fatalf("count change_journal: %v", err)
+		}
+		return n
+	}
+	_, seqBefore, err := s.ShareState(ctx, "s1")
+	if err != nil {
+		t.Fatalf("ShareState: %v", err)
+	}
+	journalBefore := countJournal()
+
+	if err := s.ApplyScanResult(ctx, &ScanResult{ShareID: "s1", Ignored: []FileRow{seed}}); err != nil {
+		t.Fatalf("ApplyScanResult: %v", err)
+	}
+
+	// The row is gone outright — not left behind as a tombstone.
+	all, err := s.ListShare(ctx, "s1", true)
+	if err != nil {
+		t.Fatalf("ListShare: %v", err)
+	}
+	if len(all) != 0 {
+		t.Errorf("rows = %+v, want none (an ignored row is parked, and never tombstoned)", all)
+	}
+
+	if got := countJournal(); got != journalBefore {
+		t.Errorf("change_journal grew from %d to %d: an ignored row was journalled and would propagate as a delete", journalBefore, got)
+	}
+	_, seqAfter, err := s.ShareState(ctx, "s1")
+	if err != nil {
+		t.Fatalf("ShareState after: %v", err)
+	}
+	if seqAfter != seqBefore {
+		t.Errorf("share_state.next_seq moved %d -> %d; the ignored delete must not advance the journal cursor", seqBefore, seqAfter)
+	}
+}
+
+// TestIgnoredRowIsParkedNotDeleted pins why an ignored row is kept at all.
+// Deleting it would restart the file's version vector if the rule were
+// ever removed, producing a version the peer already holds — the two sides
+// would compare equal while their contents differed, and would never
+// converge again. Parking keeps the vector; only the scanner can see it.
+func TestIgnoredRowIsParkedNotDeleted(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	seed := FileRow{
+		ShareID: "s1", RelPath: "shared.txt", Type: protocol.FileTypeFile,
+		Size: 5, MTimeNS: 1, Version: protocol.VersionVector{"alice": 7}, UpdatedAt: now,
+	}
+	if err := s.PutFile(ctx, seed); err != nil {
+		t.Fatalf("seed PutFile: %v", err)
+	}
+	if err := s.ApplyScanResult(ctx, &ScanResult{ShareID: "s1", Ignored: []FileRow{seed}}); err != nil {
+		t.Fatalf("ApplyScanResult: %v", err)
+	}
+
+	// Invisible to everything that feeds the wire.
+	rows, err := s.ListShare(ctx, "s1", true)
+	if err != nil {
+		t.Fatalf("ListShare: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("ListShare returned a parked row: %+v", rows)
+	}
+	if _, err := s.GetFile(ctx, "s1", "shared.txt"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("GetFile returned a parked row (err = %v); it could then be served to a peer", err)
+	}
+
+	// Visible to the scanner, with its version vector intact.
+	m, err := s.ListShareMap(ctx, "s1")
+	if err != nil {
+		t.Fatalf("ListShareMap: %v", err)
+	}
+	parked, ok := m["shared.txt"]
+	if !ok {
+		t.Fatal("ListShareMap lost the parked row; the version vector is gone and un-ignoring would silently diverge")
+	}
+	if !parked.Ignored {
+		t.Error("parked row not marked Ignored")
+	}
+	if parked.Version["alice"] != 7 {
+		t.Errorf("parked version = %v, want alice:7 preserved", parked.Version)
+	}
+}
+
+// TestUnparkOnNormalWrite: any ordinary upsert clears the parked flag, so
+// removing an ignore rule needs no special un-park path.
+func TestUnparkOnNormalWrite(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	seed := FileRow{ShareID: "s1", RelPath: "a.txt", Type: protocol.FileTypeFile, Size: 1, MTimeNS: 1, UpdatedAt: now}
+	if err := s.PutFile(ctx, seed); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if err := s.ApplyScanResult(ctx, &ScanResult{ShareID: "s1", Ignored: []FileRow{seed}}); err != nil {
+		t.Fatalf("park: %v", err)
+	}
+	revived := seed
+	revived.Size = 2
+	revived.Version = protocol.VersionVector{"alice": 8}
+	if err := s.PutFile(ctx, revived); err != nil {
+		t.Fatalf("revive: %v", err)
+	}
+
+	got, err := s.GetFile(ctx, "s1", "a.txt")
+	if err != nil {
+		t.Fatalf("GetFile after revive: %v", err)
+	}
+	if got.Size != 2 {
+		t.Errorf("Size = %d, want 2", got.Size)
+	}
+}

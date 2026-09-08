@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/nickmarrone/syncat/internal/index"
@@ -26,8 +28,17 @@ import (
 type shareWatch struct {
 	shareID string
 	root    string
-	scanner *index.Scanner
 	watcher *index.Watcher
+
+	// mu guards the ignore matcher and the scanner built from it. Both
+	// are replaced whenever the share's .syncatignore changes, which can
+	// happen at any time while sessions are reading the matcher through
+	// the predicate Node.shareIgnoreFunc hands to internal/sync.
+	mu         sync.RWMutex
+	scanner    *index.Scanner
+	ignore     *index.Matcher
+	ignoreSize int64 // .syncatignore's size and mtime at last load; both
+	ignoreMod  int64 // zero when the file is absent
 }
 
 // startShareWatch begins watching root for shareID: an initial fsnotify
@@ -37,16 +48,21 @@ type shareWatch struct {
 // rescanShare explicitly afterward.
 func (n *Node) startShareWatch(shareID, root string) (*shareWatch, error) {
 	n.cfgMu.RLock()
-	ignores := append([]string(nil), n.cfg.GlobalIgnores...)
 	rescanSeconds := n.cfg.RescanIntervalSeconds
 	n.cfgMu.RUnlock()
 
-	matcher := index.NewMatcher(ignores)
-	scanner := index.NewScanner(os.DirFS(root), matcher)
+	sw := &shareWatch{shareID: shareID, root: root}
+	n.refreshIgnore(sw)
 
 	watcher, err := index.NewWatcher(index.WatcherOptions{
-		Root:           root,
-		Clock:          asIndexClock(n.clock),
+		Root:  root,
+		Clock: asIndexClock(n.clock),
+		// Closed over sw directly, not via n.shareIgnoreFunc: the
+		// watcher builds its initial watch tree inside NewWatcher, which
+		// runs before sw is registered in n.shareWatches, so a map
+		// lookup would find nothing and silently skip the pruning on the
+		// one tree where it matters most.
+		Ignore:         sw.matches,
 		RescanInterval: time.Duration(rescanSeconds) * time.Second,
 		OnDirty:        func([]string) { n.rescanShareAsync(shareID) },
 		OnPeriodic:     func() { n.rescanShareAsync(shareID) },
@@ -58,7 +74,7 @@ func (n *Node) startShareWatch(shareID, root string) (*shareWatch, error) {
 		return nil, fmt.Errorf("core: start watcher for %s: %w", shareID, err)
 	}
 
-	sw := &shareWatch{shareID: shareID, root: root, scanner: scanner, watcher: watcher}
+	sw.watcher = watcher
 	n.sharesMu.Lock()
 	if old, ok := n.shareWatches[shareID]; ok {
 		// Replacing an existing watch (e.g. AddShare called again for a
@@ -71,6 +87,100 @@ func (n *Node) startShareWatch(shareID, root string) (*shareWatch, error) {
 	n.shareWatches[shareID] = sw
 	n.sharesMu.Unlock()
 	return sw, nil
+}
+
+// refreshIgnore (re)loads sw's share-root .syncatignore and rebuilds the
+// matcher and scanner from it, combined with the current global ignore
+// list. It is cheap and idempotent: when the file's size and mtime are
+// unchanged since the last load, and the global list has not been
+// swapped, nothing is rebuilt.
+//
+// Reloading here — from rescanShare — rather than from a dedicated watcher
+// hook is deliberate. rescanShare is the single funnel every trigger
+// already passes through (startup, the fsnotify debounce, and the periodic
+// scan that SPEC.md §5 calls the source of truth), and editing
+// .syncatignore is itself an event in the share root, so a change takes
+// effect one debounce window later with no new plumbing and no ordering
+// hazard against a scan already in flight.
+func (n *Node) refreshIgnore(sw *shareWatch) {
+	n.cfgMu.RLock()
+	ignores := append([]string(nil), n.cfg.GlobalIgnores...)
+	n.cfgMu.RUnlock()
+
+	path := filepath.Join(sw.root, index.IgnoreFileName)
+	var size, mod int64
+	if fi, err := os.Stat(path); err == nil && !fi.IsDir() {
+		size, mod = fi.Size(), fi.ModTime().UnixNano()
+	}
+
+	sw.mu.RLock()
+	unchanged := sw.ignore != nil && sw.ignoreSize == size && sw.ignoreMod == mod
+	sw.mu.RUnlock()
+	if unchanged {
+		return
+	}
+
+	var rules *index.IgnoreRules
+	if size != 0 || mod != 0 {
+		f, err := os.Open(path)
+		if err != nil {
+			// Keep whatever we last compiled rather than falling back to
+			// "ignore nothing": the safe direction for an unreadable
+			// ignore file is to keep excluding what the user excluded,
+			// not to silently start indexing and publishing all of it.
+			n.logger.Printf("core: share %s: read %s: %v (keeping previous ignore rules)", sw.shareID, index.IgnoreFileName, err)
+			return
+		}
+		parsed, warnings, err := index.ParseIgnore(f)
+		f.Close()
+		if err != nil {
+			n.logger.Printf("core: share %s: parse %s: %v (keeping previous ignore rules)", sw.shareID, index.IgnoreFileName, err)
+			return
+		}
+		for _, w := range warnings {
+			n.logger.Printf("core: share %s: %s %s", sw.shareID, index.IgnoreFileName, w)
+		}
+		rules = parsed
+	}
+
+	matcher := index.NewMatcherWithRules(ignores, rules)
+	sw.mu.Lock()
+	sw.ignore = matcher
+	sw.scanner = index.NewScanner(os.DirFS(sw.root), matcher)
+	sw.ignoreSize, sw.ignoreMod = size, mod
+	sw.mu.Unlock()
+}
+
+// shareIgnoreFunc returns the predicate internal/sync (and the watcher)
+// consult to decide whether a share-relative path is excluded. It resolves
+// the share's current matcher on every call, so an edit to .syncatignore
+// takes effect without re-adding the share or reconnecting a session.
+// Paths under a share with no local watch are never ignored.
+func (n *Node) shareIgnoreFunc(shareID string) func(relpath string, isDir bool) bool {
+	return func(relpath string, isDir bool) bool {
+		n.sharesMu.Lock()
+		sw, ok := n.shareWatches[shareID]
+		n.sharesMu.Unlock()
+		if !ok {
+			return false
+		}
+		return sw.matches(relpath, isDir)
+	}
+}
+
+// matches reports whether relpath is excluded by sw's current ignore rules.
+func (sw *shareWatch) matches(relpath string, isDir bool) bool {
+	sw.mu.RLock()
+	m := sw.ignore
+	sw.mu.RUnlock()
+	return m.MatchPath(relpath, isDir)
+}
+
+// currentScanner returns the scanner built from sw's latest ignore rules.
+func (sw *shareWatch) currentScanner() *index.Scanner {
+	sw.mu.RLock()
+	defer sw.mu.RUnlock()
+	return sw.scanner
 }
 
 // stopShareWatch stops and removes shareID's watcher, if any. Safe to call
@@ -116,11 +226,16 @@ func (n *Node) rescanShare(ctx context.Context, shareID string) error {
 		return fmt.Errorf("core: rescan: %s has no active watch", shareID)
 	}
 
+	// Pick up any edit to .syncatignore before this scan reads the tree,
+	// so a rule the user just saved takes effect on this pass rather than
+	// the next one.
+	n.refreshIgnore(sw)
+
 	existing, err := n.store.ListShareMap(ctx, shareID)
 	if err != nil {
 		return fmt.Errorf("core: rescan %s: list existing: %w", shareID, err)
 	}
-	result, err := sw.scanner.Scan(ctx, shareID, existing)
+	result, err := sw.currentScanner().Scan(ctx, shareID, existing)
 	if err != nil {
 		return fmt.Errorf("core: rescan %s: scan: %w", shareID, err)
 	}
@@ -137,6 +252,15 @@ func (n *Node) rescanShare(ctx context.Context, shareID string) error {
 
 	if err := n.store.ApplyScanResult(ctx, result); err != nil {
 		return fmt.Errorf("core: rescan %s: apply: %w", shareID, err)
+	}
+
+	if len(result.Ignored) > 0 {
+		// Not propagated as a change in its own right: the rows were
+		// dropped from the index without a tombstone precisely so that
+		// peers are not told to delete anything (see
+		// index.ScanResult.Ignored). Peers simply stop seeing these paths
+		// in our next snapshot and keep their copies.
+		n.logger.Printf("core: rescan %s: %d path(s) newly ignored, dropped from the index (no tombstones; peers keep their copies)", shareID, len(result.Ignored))
 	}
 
 	if len(result.Added) == 0 && len(result.ContentChanged) == 0 && len(result.Deleted) == 0 {

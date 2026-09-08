@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -416,4 +417,59 @@ func goroutineCountSettled() int {
 		time.Sleep(10 * time.Millisecond)
 	}
 	return n
+}
+
+// TestWatcherSkipsIgnoredSubtrees pins the inotify-budget optimization: a
+// directory the share's ignore rules exclude gets no watch, so changes
+// inside it are never even reported. It is only an optimization — the
+// scanner enforces the rules regardless — but a node_modules under an
+// ignore rule is exactly the case that would otherwise consume thousands
+// of watch descriptors to report changes that are then discarded.
+func TestWatcherSkipsIgnoredSubtrees(t *testing.T) {
+	root := t.TempDir()
+	for _, d := range []string{"vendored", "src"} {
+		if err := os.Mkdir(filepath.Join(root, d), 0755); err != nil {
+			t.Fatalf("Mkdir %s: %v", d, err)
+		}
+	}
+
+	clock := newFakeClock(time.Now())
+	dirty := make(chan []string, 10)
+	w, err := NewWatcher(WatcherOptions{
+		Root:           root,
+		Clock:          clock,
+		Debounce:       time.Second,
+		RescanInterval: time.Hour,
+		OnDirty:        func(paths []string) { dirty <- paths },
+		Ignore:         func(relpath string, _ bool) bool { return relpath == "vendored" },
+		OnWarn:         func(format string, args ...any) { t.Logf("watcher warning: "+format, args...) },
+	})
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	t.Cleanup(func() { _ = w.Close() })
+	if w.fsw == nil {
+		t.Skip("fsnotify watcher unavailable in this environment; skipping real-event test")
+	}
+	if !clock.waitForWaiters(1, 5*time.Second) {
+		t.Fatal("timed out waiting for the periodic-rescan loop to register its timer")
+	}
+	baseline := clock.waiterCount()
+
+	// A write inside the ignored directory must not be reported. Pairing
+	// it with a write inside a watched one makes the absence meaningful:
+	// the flush below proves the watcher is alive and delivering.
+	if err := os.WriteFile(filepath.Join(root, "vendored", "lib.js"), []byte("x"), 0644); err != nil {
+		t.Fatalf("write ignored file: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "src", "main.go"), []byte("y"), 0644); err != nil {
+		t.Fatalf("write watched file: %v", err)
+	}
+
+	paths := waitForDirtyFlush(t, clock, baseline, dirty, "src/main.go", 5*time.Second)
+	for _, p := range paths {
+		if strings.HasPrefix(p, "vendored") {
+			t.Errorf("watcher reported %q from an ignored subtree; it should hold no watch there", p)
+		}
+	}
 }

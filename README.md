@@ -308,6 +308,44 @@ When the daemon's stderr goes straight to the journal, it drops its own
 `journalctl` shows one date and one program name, not two. Run from a terminal
 it keeps them.
 
+## Excluding files with `.syncatignore`
+
+Put a `.syncatignore` at the root of a shared directory to keep matching
+files out of sync. The syntax is gitignore's:
+
+```gitignore
+# comments and blank lines are skipped
+*.log              # any depth
+/build             # anchored to the share root
+node_modules/      # directories only
+docs/**/*.tmp      # ** crosses directory boundaries
+!keep.log          # re-include; the last matching rule wins
+```
+
+Three things are worth knowing, because they are what people get wrong:
+
+**It applies in both directions.** An ignored path is never sent to a peer
+*and* never accepted from one. Both sides enforce their own rules, so a file
+you ignore stays off your disk even if a peer is happily sharing it.
+
+**The file itself is not synced.** Each node keeps its own `.syncatignore`,
+and the two sides may legitimately disagree about what is excluded. Only the
+share root's file is read — a `.syncatignore` in a subdirectory has no effect
+(but is not synced either).
+
+**Ignoring is not deleting.** Adding a rule for a file that has already synced
+leaves every peer's copy exactly where it is; the file just stops being
+tracked here. Remove the rule and it starts syncing again, with this node's
+copy taking precedence.
+
+Edits take effect on the next rescan — no restart. A malformed line is skipped
+and logged, and the rest of the file still applies; an unreadable
+`.syncatignore` keeps the rules last loaded rather than falling back to
+excluding nothing. Always ignored regardless of the file: `.syncatignore`
+itself, `.syncat.tmp.*` (in-flight downloads), and OS junk (`.DS_Store`,
+`Thumbs.db`, `desktop.ini`) — a `!` rule cannot re-include these. The
+`global_ignores` list in `config.json` applies to every share.
+
 ## How the three sync modes emerge
 
 There is no single "sync mode" setting. It falls out of the offerer's share
@@ -372,7 +410,7 @@ text, and why:
 
 - **`config.toml` → `config.json`.** SPEC.md §3 describes a TOML config file,
   but §10's dependency budget (tailcat, `modernc.org/sqlite`, `fsnotify`,
-  `fxamacker/cbor`, a gitignore matcher, `x/crypto`) lists no TOML library.
+  `fxamacker/cbor`, `x/crypto`) lists no TOML library.
   To stay inside that budget, config is encoded with the stdlib
   `encoding/json` instead and the file is named `config.json`. Field names,
   defaults, and validation are otherwise exactly as specified
@@ -409,11 +447,9 @@ don't work:
   share's `approval_required` flag (SPEC.md §6). The flag is still persisted
   in config for when the queue exists. `POST /api/peers/{id}/approve`,
   `GET/POST /api/approvals` return 501.
-- **`.syncatignore` gitignore-syntax matching.** Only a fixed set of
-  always-ignored patterns (`.syncat.tmp.*`, OS junk files, global config
-  ignores) is implemented; full gitignore syntax was deferred to avoid
-  pulling in a matcher library before it was load-bearing
-  (`internal/index/scanner.go`).
+- **Nested `.syncatignore` files.** Only the one at the share root is read
+  (as SPEC.md §5 specifies); a `.syncatignore` in a subdirectory is ignored
+  as a rules file, though it is never synced either.
 - **Symlink syncing.** Symlinks are detected during scanning and skipped
   entirely, with a warning — never entering the index or syncing to peers
   (`internal/index/scanner.go`). SPEC.md §5's "symlink entry itself syncs on
@@ -564,7 +600,7 @@ walks the main flows.
 | `internal/core/` | `node.go` (lifecycle, accept path, clock adapters) · `mutations.go` (the config-mutation API the REST layer calls) · `resolve.go` (names and id prefixes → ids) · `peer.go` (per-peer dial/dedup/keepalive state machine) · `access.go` (share-access negotiation: ShareList/SubscribeRequest/AccessUpdate) · `shares.go` (share dirs → scanner/watcher) · `status.go` (the read-only snapshot) — gomobile-safe, no UI/CLI deps |
 | `internal/transport/` | `transport.go` (`Transport` interface, backoff/supervisor, dedup tie-break) · `tailcat.go` (production carrier) · `pipe.go` (`net.Pipe` transport used by every package's tests) |
 | `internal/protocol/` | `message.go` (message types + frame codec) · `stream.go` (bounded, prioritized session writer) · `handshake.go` (mutual Ed25519 auth) · `keepalive.go` (Ping/Pong idle and dead timing) |
-| `internal/index/` | `store.go` (SQLite schema, `files`, `peer_files`) · `scanner.go` (tree walk, hashing, ignore matching) · `watcher.go` (`fsnotify` + debounce + periodic rescan) |
+| `internal/index/` | `store.go` (SQLite schema, `files`, `peer_files`) · `scanner.go` (tree walk, hashing, ignore matching) · `ignore.go` (the `.syncatignore` gitignore-syntax matcher) · `watcher.go` (`fsnotify` + debounce + periodic rescan) |
 | `internal/sync/` | `reconcile.go` (version vectors, actions, conflict naming, the reconciler — all pure, no I/O) · `session.go` (one peer connection: lifecycle, read loop, index exchange) · `transfer.go` (pulling and serving file bytes) · `apply.go` (writing results to disk) · `path.go` (the single validation gate for peer-supplied relpaths) · `trash.go` (trash can + janitor) |
 | `internal/config/` | `config.go` (schema, JSON encoding, load/save, re-share guard, share ids) · `keys.go` (identity key, tailcat key, `sc1` tokens, API token) · `paths.go` (XDG layout, atomic writes) |
 | `internal/api/` | `server.go` (routing, auth, `/ui-token`, HTTP helpers) · `handlers.go` (one handler per endpoint) · `dto.go` (the JSON shapes every response goes through) |

@@ -169,6 +169,32 @@ across two real machines.
 - [ ] A symlink in a shared directory is skipped with a warning, and does
       not break the scan. (Deferred feature, but must degrade cleanly.)
 
+## 6b. `.syncatignore`
+
+`scripts/net/09-syncatignore.sh` covers this on one machine — verify it
+across two real machines, and take the third item seriously: it is the one
+that destroys data if it regresses.
+
+- [ ] Put `*.log` and `build/` in a `.syncatignore` at the share root.
+      Matching files and directories never reach the peer; a non-ignored
+      sibling written at the same time does.
+- [ ] The `.syncatignore` itself does not sync. Give the two nodes different
+      ignore files and confirm each honours only its own.
+- [ ] **Ignoring is not deleting.** Let a file sync, then add a rule for it.
+      The peer's copy must still be there several minutes later — a tombstone
+      would arrive within a rescan interval, so wait longer than one.
+- [ ] Remove that rule again. The file resumes syncing, and the peer ends up
+      with this node's copy rather than staying on its stale one.
+- [ ] Ignore a path on the *receiving* side that the offerer is still
+      sharing. It never lands locally, and the offerer's own copy is not
+      deleted.
+- [ ] Edit `.syncatignore` while the daemon runs; the change takes effect on
+      the next rescan without a restart.
+- [ ] Put a malformed line in it (e.g. `[z-a]`). It is logged and skipped,
+      and the surrounding rules still work.
+- [ ] Ignore a large directory (`node_modules`) and confirm the daemon does
+      not hold watch descriptors for it.
+
 ## 7. Subscription lifecycle
 
 - [ ] `syncat subscription pause <peer> <share>` stops syncing; edits on
@@ -286,7 +312,7 @@ testers recognise them on sight:
 
 - Peer-approval queue and per-share `approval_required` enforcement (every
   subscribe auto-grants; approval endpoints return 501).
-- `.syncatignore` gitignore syntax — only a fixed ignore set exists.
+- Nested `.syncatignore` — only the share root's file is read as rules.
 - Symlink syncing — detected and skipped.
 - Transfer resume — interrupted transfers restart from zero.
 - Transfer progress — no per-transfer byte counters exist, so `/api/status`

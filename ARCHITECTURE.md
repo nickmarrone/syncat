@@ -99,9 +99,38 @@ targets the decoder.
 
 | File | Holds |
 |---|---|
-| `store.go` | `Store` over SQLite (`modernc.org/sqlite`, pure Go). Tables: `files` (our own view, keyed `(share_id, relpath)`), `peer_files` (each peer's last reported view), `pending_transfers` (schema only; resume is deferred). `FileRow` is the row shape; `ApplyScanResult` is the one write path a scan uses |
-| `scanner.go` | `Scanner.Scan`: walk a share root, compare to the existing rows, classify every entry as added / content-changed / metadata-only / deleted / unchanged, hashing only when size or mtime moved. `Matcher` is the fixed ignore list (full `.syncatignore` syntax is deferred) |
+| `store.go` | `Store` over SQLite (`modernc.org/sqlite`, pure Go). Tables: `files` (our own view, keyed `(share_id, relpath)`), `peer_files` (each peer's last reported view), `pending_transfers` (schema only; resume is deferred). `FileRow` is the row shape; `ApplyScanResult` is the one write path a scan uses. It is also the only place a row changes without a `change_journal` entry — see "Newly ignored files are parked, never tombstoned" below |
+| `scanner.go` | `Scanner.Scan`: walk a share root, compare to the existing rows, classify every entry as added / content-changed / metadata-only / deleted / unchanged, hashing only when size or mtime moved. `Matcher` layers the built-in ignore list, the config globals, and the share's `.syncatignore` |
+| `ignore.go` | The `.syncatignore` matcher: `ParseIgnore` compiles gitignore syntax (comments, `!` negation, `/` anchoring, trailing-`/` directory-only, `**`, classes, escapes) to regexps; `IgnoreRules.Match` evaluates a path's ancestors then the path itself, last match winning |
 | `watcher.go` | `Watcher`: `fsnotify` on the tree, a `debouncer` that collapses event bursts, and a periodic full rescan as the safety net for missed events |
+
+### Newly ignored files are parked, never tombstoned
+
+Adding a `.syncatignore` rule for a path that is already indexed is not a
+delete, and must never turn into one. A tombstone is journalled and
+propagated, so tombstoning here would move every peer's copy to the trash —
+the whole share, if the pattern were wide enough.
+
+So the scanner routes those rows into `ScanResult.Ignored` (never `Deleted`),
+and `ApplyScanResult` sets `files.ignored = 1` on them *without* calling
+`putFileAndJournal`. No journal entry, no `share_state.next_seq` bump, nothing
+on the wire. Peers simply stop seeing the path in our snapshots and keep what
+they hold, because a path a peer has and we do not advertise reconciles to
+"local-only, peer will pull from us" — which is `ActionNone`.
+
+The row is *parked* rather than deleted for one reason: its version vector.
+Delete it, and removing the rule later re-adds the file at a version the peer
+already holds; the two sides then compare equal while their contents differ
+and never converge again. Keeping the vector means an un-ignored file always
+dominates. A parked row is invisible to every reader that feeds the wire
+(`ListShare`, `GetFile` filter it in SQL); only `ListShareMap`, which exists
+for the scanner, returns it.
+
+One wrinkle survives all this: `change_journal` still holds the entries
+written while the path was *not* ignored. A delta batch cannot omit one,
+because the receiver requires contiguous sequence numbers, so
+`answerSyncRequest` detects an ignored path in the journal range and answers
+with a full snapshot instead — which re-anchors that peer's cursor past it.
 
 The scanner never touches the network or `internal/sync`; it only produces
 a `ScanResult`. That separation is load-bearing for the trash can (see

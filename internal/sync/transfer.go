@@ -228,6 +228,18 @@ func (s *Session) handleFileRequest(ctx context.Context, req protocol.FileReques
 		return
 	}
 
+	if cfg.ignored(req.RelPath, false) {
+		// Backstop. An ignored path has no index row, so the GetFile
+		// below would fail anyway — but a peer can only have learned the
+		// path from a journal entry we wrote before the rule existed, and
+		// this keeps the answer authoritative rather than incidental. The
+		// error is deliberately the same one a genuinely missing file
+		// gets: what this node chooses not to share is its own business,
+		// not a distinct condition to advertise.
+		s.sendFileError(req, protocol.ErrCodeFileNotFound, "file not found")
+		return
+	}
+
 	row, err := s.store.GetFile(ctx, req.ShareID, req.RelPath)
 	if err != nil || row.Deleted {
 		s.sendFileError(req, protocol.ErrCodeFileNotFound, "file not found")

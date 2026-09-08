@@ -50,11 +50,32 @@ type ScanResult struct {
 	MetadataOnly []FileRow
 
 	// Deleted holds tombstones for index entries that were live before
-	// this scan but were not found on disk (or now resolve to an ignored
-	// or symlink path). Directories are only tombstoned when they
-	// disappear entirely; SPEC.md §5's "keep non-empty locally-modified
-	// dirs" rule belongs to internal/sync's apply step, not here.
+	// this scan but were not found on disk (or now resolve to a symlink
+	// path). Directories are only tombstoned when they disappear
+	// entirely; SPEC.md §5's "keep non-empty locally-modified dirs" rule
+	// belongs to internal/sync's apply step, not here.
+	//
+	// A path that is merely newly *ignored* never lands here — see
+	// Ignored, and the comment there for why the distinction matters.
 	Deleted []FileRow
+
+	// Ignored holds entries that still have a live index row but now
+	// match an ignore rule: a pattern was added to .syncatignore, or the
+	// global ignore list grew.
+	//
+	// These are PARKED, never tombstoned. The distinction is the whole
+	// point: a tombstone is a delete, and it propagates, so tombstoning a
+	// newly-ignored file would move every peer's copy to the trash.
+	// Ignoring a file says what this node syncs; it is not a request to
+	// destroy it elsewhere. Store.ApplyScanResult is what makes that true:
+	// it sets files.ignored on these rows and writes no change_journal
+	// entry, so peers are told nothing and keep what they have.
+	//
+	// Parking keeps the row (and with it the version vector) rather than
+	// deleting it — see FileRow.Ignored for why discarding the vector
+	// would leave the two sides permanently diverged if the rule were
+	// ever removed.
+	Ignored []FileRow
 
 	// Warnings collects human-readable descriptions of entries the scan
 	// skipped rather than erroring out on: symlinks (not followed in the
@@ -130,6 +151,14 @@ func (sc *Scanner) Scan(ctx context.Context, shareID string, existing map[string
 		if old.Deleted || seen[relpath] {
 			continue
 		}
+		if old.Ignored {
+			// A parked row whose file is gone from disk. It is not on
+			// disk and not synced, so there is nothing to report — and
+			// emphatically nothing to tombstone, since a tombstone would
+			// propagate and delete the peer's copy of a file we merely
+			// stopped tracking.
+			continue
+		}
 		row := old
 		row.Deleted = true
 		row.Version = cloneVersion(old.Version)
@@ -177,8 +206,13 @@ func (sc *Scanner) visit(result *ScanResult, existing map[string]FileRow, seen m
 		return nil
 	}
 
-	if sc.ignore.Match(relpath) {
-		if d.IsDir() {
+	if sc.ignore.MatchPath(relpath, d.IsDir()) {
+		sc.noteIgnored(result, existing, seen, relpath)
+		if d.IsDir() && sc.ignore.PruneDirs() {
+			// Pruning means the children are never visited, so they
+			// would never be marked seen — and Scan's tail loop would
+			// tombstone every one of them. Account for them here.
+			sc.noteIgnoredSubtree(result, existing, seen, relpath)
 			return fs.SkipDir
 		}
 		return nil
@@ -206,7 +240,7 @@ func (sc *Scanner) visit(result *ScanResult, existing map[string]FileRow, seen m
 	old, existed := existing[relpath]
 
 	if d.IsDir() {
-		if !existed || old.Deleted || old.Type != protocol.FileTypeDir {
+		if !existed || old.Deleted || old.Ignored || old.Type != protocol.FileTypeDir {
 			result.Added = append(result.Added, FileRow{
 				ShareID: shareID, RelPath: relpath, Type: protocol.FileTypeDir,
 				MTimeNS: info.ModTime().UnixNano(), Mode: uint32(info.Mode().Perm()),
@@ -216,7 +250,13 @@ func (sc *Scanner) visit(result *ScanResult, existing map[string]FileRow, seen m
 		return nil
 	}
 
-	if !existed || old.Deleted || old.Type != protocol.FileTypeFile {
+	// A parked (previously ignored) row resurrects through Added rather
+	// than the classify path below, so that un-ignoring always produces a
+	// row the caller will version-bump — even when the file's bytes never
+	// changed while it was ignored, which classifyExisting would other-
+	// wise report as "unchanged" and leave parked forever. carriedVersion
+	// keeps the old vector, so the bump dominates the peer's copy.
+	if !existed || old.Deleted || old.Ignored || old.Type != protocol.FileTypeFile {
 		sha, err := sc.hashFile(relpath)
 		if err != nil {
 			result.warnf("index: scan %s: skip %s (read failed, likely vanished): %v", shareID, relpath, err)
@@ -250,6 +290,36 @@ func (sc *Scanner) visit(result *ScanResult, existing map[string]FileRow, seen m
 		result.ContentChanged = append(result.ContentChanged, row)
 	}
 	return nil
+}
+
+// noteIgnored records that relpath is ignored: it marks the path seen, so
+// Scan's tail loop does not mistake "ignored" for "deleted from disk", and
+// — if the index still holds a live row for it — queues that row for
+// removal in ScanResult.Ignored.
+//
+// Marking seen is the load-bearing half. Without it, adding one pattern to
+// a .syncatignore tombstones every path it matches, and those tombstones
+// propagate and delete the files on every peer.
+func (sc *Scanner) noteIgnored(result *ScanResult, existing map[string]FileRow, seen map[string]bool, relpath string) {
+	seen[relpath] = true
+	// Only rows that are live and not already parked: re-reporting an
+	// already-parked path every scan would make the "newly ignored" count
+	// meaningless and rewrite rows that have not changed.
+	if old, ok := existing[relpath]; ok && !old.Deleted && !old.Ignored {
+		result.Ignored = append(result.Ignored, old)
+	}
+}
+
+// noteIgnoredSubtree does the same for every indexed path beneath dir,
+// which is what a pruned directory's children need: the walk is about to
+// skip them, so nothing else will mark them seen.
+func (sc *Scanner) noteIgnoredSubtree(result *ScanResult, existing map[string]FileRow, seen map[string]bool, dir string) {
+	prefix := dir + "/"
+	for relpath := range existing {
+		if strings.HasPrefix(relpath, prefix) {
+			sc.noteIgnored(result, existing, seen, relpath)
+		}
+	}
 }
 
 // fileChange is classifyExisting's verdict on a file the index already
@@ -334,18 +404,24 @@ func (sc *Scanner) hashFile(relpath string) ([]byte, error) {
 // --- ignore matching (SPEC.md §5) --------------------------------------
 
 // Matcher decides whether a share-relative path should be excluded from
-// scanning, per SPEC.md §5's ignore-rules MVP subset. Full gitignore-style
-// `.syncatignore` matching (also described in SPEC.md §5) is explicitly
-// deferred — implementing it would pull in a gitignore-syntax library,
-// which is outside SPEC.md §10's dependency budget. Matcher covers only:
+// scanning (SPEC.md §5). It layers three sources, in this order:
 //
 //   - Built-in always-ignored names: our own temp-file prefix
-//     (.syncat.tmp.*) and common OS junk files (.DS_Store, Thumbs.db,
-//     desktop.ini).
+//     (.syncat.tmp.*), the ignore file itself (.syncatignore, which is
+//     per-node and never synced), and common OS junk files (.DS_Store,
+//     Thumbs.db, desktop.ini).
 //   - config.Config.GlobalIgnores: user-supplied glob patterns.
+//   - The share's own .syncatignore, as parsed IgnoreRules (see ignore.go).
 //
-// Matching semantics, stated precisely because the web UI and the README
-// both have to describe them exactly:
+// The layering is deliberately one-way: a '!' negation in a .syncatignore
+// can re-include a path the file's own patterns excluded, but it can never
+// re-include one of the built-ins. Keeping .syncat.tmp.* ignored is a
+// correctness invariant (those are our in-flight downloads), not a
+// preference a user should be able to override by accident.
+//
+// Glob semantics for the first two layers, stated precisely because the web
+// UI and the README both have to describe them exactly (the .syncatignore
+// layer has its own, richer syntax — see ParseIgnore):
 //
 //   - Every pattern is a path.Match pattern: '*' matches any sequence of
 //     non-'/' characters, '?' matches any single non-'/' character, and
@@ -360,18 +436,26 @@ func (sc *Scanner) hashFile(relpath string) ([]byte, error) {
 //     of that name at any depth, because it always matches the base-name
 //     comparison; a pattern containing '/' (e.g. "build/output") only
 //     matches when compared against the full relpath.
+//   - A pattern that matches a directory also excludes everything beneath
+//     it: every ancestor of a path is tested before the path itself. The
+//     scanner gets this for free by pruning the walk, but internal/sync's
+//     reconciler asks about one path at a time and never walks, so the
+//     rule has to live here for the two to agree.
 //   - relpath is always expected in forward-slash form (as produced by
 //     the scanner — see scanner.go), regardless of host OS.
 type Matcher struct {
 	patterns []string
+	rules    *IgnoreRules // the share's .syncatignore; nil when it has none
 }
 
 // builtinIgnorePatterns are always excluded, regardless of config
 // (SPEC.md §5). ".syncat.tmp.*" is our own in-flight-download naming
-// scheme (SPEC.md §5 "Applying remote changes"); the rest are common OS
-// metadata files that should never be synced.
+// scheme (SPEC.md §5 "Applying remote changes"), and IgnoreFileName is the
+// ignore file itself, which is per-node and deliberately not synced; the
+// rest are common OS metadata files that should never be synced.
 var builtinIgnorePatterns = []string{
 	".syncat.tmp.*",
+	IgnoreFileName,
 	".DS_Store",
 	"Thumbs.db",
 	"desktop.ini",
@@ -381,26 +465,74 @@ var builtinIgnorePatterns = []string{
 // config.Config.GlobalIgnores). The built-ins are always included in
 // addition to globalIgnores.
 func NewMatcher(globalIgnores []string) *Matcher {
+	return NewMatcherWithRules(globalIgnores, nil)
+}
+
+// NewMatcherWithRules is NewMatcher plus the share's own parsed
+// .syncatignore. rules may be nil, which is the common case of a share
+// that has no ignore file.
+func NewMatcherWithRules(globalIgnores []string, rules *IgnoreRules) *Matcher {
 	patterns := make([]string, 0, len(builtinIgnorePatterns)+len(globalIgnores))
 	patterns = append(patterns, builtinIgnorePatterns...)
 	patterns = append(patterns, globalIgnores...)
-	return &Matcher{patterns: patterns}
+	return &Matcher{patterns: patterns, rules: rules}
 }
 
 // Match reports whether relpath (forward-slash separated, share-relative,
-// no leading '/') should be excluded from scanning.
+// no leading '/') should be excluded from scanning, treating it as a
+// non-directory. Prefer MatchPath, which can honour directory-only
+// .syncatignore patterns; this exists for callers that have only a path.
 func (m *Matcher) Match(relpath string) bool {
+	return m.MatchPath(relpath, false)
+}
+
+// MatchPath reports whether relpath should be excluded from scanning.
+// isDir says whether relpath names a directory, which directory-only
+// patterns ("build/") need in order to match.
+func (m *Matcher) MatchPath(relpath string, isDir bool) bool {
 	if m == nil {
 		return false
 	}
-	base := path.Base(relpath)
+	// Ancestors first: a glob naming a directory excludes everything
+	// under it, the same way the scanner's fs.SkipDir does. Without this
+	// the two disagree — the scanner would prune "build/" while the
+	// reconciler happily pulled "build/out.o" back from a peer, indexed
+	// it, pruned it again, and pulled it again.
+	for i := 0; i < len(relpath); i++ {
+		if relpath[i] == '/' && m.matchGlobs(relpath[:i]) {
+			return true
+		}
+	}
+	if m.matchGlobs(relpath) {
+		return true
+	}
+	return m.rules.Match(relpath, isDir)
+}
+
+// matchGlobs tests p against the built-in and global patterns, by base
+// name and by full path independently (see the type comment).
+func (m *Matcher) matchGlobs(p string) bool {
+	base := path.Base(p)
 	for _, pat := range m.patterns {
 		if ok, _ := path.Match(pat, base); ok {
 			return true
 		}
-		if ok, _ := path.Match(pat, relpath); ok {
+		if ok, _ := path.Match(pat, p); ok {
 			return true
 		}
 	}
 	return false
+}
+
+// PruneDirs reports whether the scanner may skip an ignored directory
+// without descending into it. That is the cheap path — it is what keeps a
+// node_modules/ rule from costing a walk of node_modules — but it is only
+// sound when no rule can re-include something underneath. A '!' pattern
+// anywhere in the share's .syncatignore turns it off, and the scanner
+// tests every entry individually instead.
+func (m *Matcher) PruneDirs() bool {
+	if m == nil {
+		return true
+	}
+	return !m.rules.HasNegations()
 }

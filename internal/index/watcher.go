@@ -65,6 +65,22 @@ type WatcherOptions struct {
 	// hitting the OS watch-descriptor limit) that degrade the watcher to
 	// periodic-only operation rather than failing it.
 	OnWarn func(format string, args ...any)
+	// Ignore, if non-nil, reports whether a share-relative path is
+	// excluded by the share's ignore rules. It is used only to avoid
+	// placing filesystem watches inside ignored directories — a large
+	// node_modules under an ignore rule would otherwise consume thousands
+	// of watch descriptors to report changes that are then discarded.
+	//
+	// It is purely an optimization: OnDirty triggers a full rescan and
+	// discards its path list, and the scanner applies the ignore rules
+	// itself, so nothing here affects which files sync.
+	//
+	// The watch tree is built once, so a directory that stops being
+	// ignored gains no real-time watch until the share is restarted. Its
+	// changes are still picked up by the periodic rescan, which SPEC.md
+	// §5 makes the source of truth precisely so that missed fsnotify
+	// events cost latency and never correctness.
+	Ignore func(relpath string, isDir bool) bool
 }
 
 // Watcher provides best-effort real-time change notification for one
@@ -91,6 +107,7 @@ type Watcher struct {
 	debounce       time.Duration
 	rescanInterval time.Duration
 	onWarn         func(format string, args ...any)
+	ignore         func(relpath string, isDir bool) bool
 
 	fsw *fsnotify.Watcher // nil in degraded (periodic-only) mode
 
@@ -128,6 +145,7 @@ func NewWatcher(opts WatcherOptions) (*Watcher, error) {
 		debounce:       debounce,
 		rescanInterval: rescanInterval,
 		onWarn:         opts.OnWarn,
+		ignore:         opts.Ignore,
 		stop:           make(chan struct{}),
 	}
 
@@ -136,7 +154,7 @@ func NewWatcher(opts WatcherOptions) (*Watcher, error) {
 	fsw, err := fsnotify.NewWatcher()
 	if err != nil {
 		w.warnf("index: watcher: create fsnotify watcher: %v (degrading to periodic-only rescans)", err)
-	} else if err := addTreeWatches(fsw, root); err != nil {
+	} else if err := w.addTreeWatches(fsw, root); err != nil {
 		w.warnf("index: watcher: add watches under %s: %v (degrading to periodic-only rescans)", root, err)
 		fsw.Close()
 	} else {
@@ -212,7 +230,7 @@ func (w *Watcher) eventLoop() {
 					// kernel-level race (mkdir vs. our inotify_add_watch)
 					// with an entirely avoidable one: our own debounce/
 					// notification latency.
-					if err := addTreeWatches(w.fsw, ev.Name); err != nil {
+					if err := w.addTreeWatches(w.fsw, ev.Name); err != nil {
 						w.warnf("index: watcher: add watch for new directory %s: %v", ev.Name, err)
 					}
 				}
@@ -255,9 +273,24 @@ func (w *Watcher) relPath(absPath string) (rel string, ok bool) {
 	return filepath.ToSlash(r), true
 }
 
+// isIgnoredDir reports whether absPath is a directory the share's ignore
+// rules exclude, and therefore one not worth spending watch descriptors
+// on. A path outside the root, or a watcher with no ignore rules, is never
+// ignored.
+func (w *Watcher) isIgnoredDir(absPath string) bool {
+	if w.ignore == nil {
+		return false
+	}
+	rel, ok := w.relPath(absPath)
+	if !ok {
+		return false
+	}
+	return w.ignore(rel, true)
+}
+
 // addTreeWatches adds an fsnotify watch for dir and every non-symlink
 // subdirectory beneath it.
-func addTreeWatches(fsw *fsnotify.Watcher, dir string) error {
+func (w *Watcher) addTreeWatches(fsw *fsnotify.Watcher, dir string) error {
 	return filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			// A directory can vanish between being listed and being
@@ -272,6 +305,12 @@ func addTreeWatches(fsw *fsnotify.Watcher, dir string) error {
 			return nil
 		}
 		if d.Type()&fs.ModeSymlink != 0 {
+			return fs.SkipDir
+		}
+		if w.isIgnoredDir(p) {
+			// Nothing under an ignored directory can ever sync, so the
+			// whole subtree is not worth a watch descriptor. Purely an
+			// optimization — see WatcherOptions.Ignore.
 			return fs.SkipDir
 		}
 		if err := fsw.Add(p); err != nil {
