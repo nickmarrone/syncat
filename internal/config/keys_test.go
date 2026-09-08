@@ -355,3 +355,66 @@ func TestTailcatKeyCarriesPresharedKey(t *testing.T) {
 		t.Error("pre-shared key did not survive the round-trip through disk")
 	}
 }
+
+// TestLoadTailcatKeyMigratesLegacyKey pins that the migration happens on
+// plain LoadTailcatKey, not only on the load-or-create path.
+//
+// This is a regression test for a real break: `syncat token` reads the key
+// with LoadTailcatKey and never touches LoadOrCreateTailcatKey, so while
+// the migration lived only in the latter, `syncat token` on a node whose
+// daemon had not been restarted since the upgrade printed a legacy address
+// — no disco key, no pre-shared key. It looked like a perfectly normal
+// token, and a peer given it could never connect.
+func TestLoadTailcatKeyMigratesLegacyKey(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tailcat.key")
+
+	legacy := tailcat.NewPrivateKey()
+	legacy.Public.ServerDiscoPublic = tailcat.DiscoPublic{}
+	legacy.Public.PresharedKey = tailcat.PresharedKey{}
+	legacy.Public.RegionID = 1
+	data, err := json.MarshalIndent(legacy, "", "\t")
+	if err != nil {
+		t.Fatalf("marshal legacy key: %v", err)
+	}
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatalf("write legacy key: %v", err)
+	}
+
+	got, err := LoadTailcatKey(path)
+	if err != nil {
+		t.Fatalf("LoadTailcatKey: %v", err)
+	}
+	if got.Public.ServerDiscoPublic.IsZero() {
+		t.Error("LoadTailcatKey returned a key with no disco key")
+	}
+	if got.Public.PresharedKey.IsZero() {
+		t.Error("LoadTailcatKey returned a key with no pre-shared key")
+	}
+
+	// The address it yields is what `syncat token` prints, so assert on the
+	// property that actually matters: a current tailcat client accepts it.
+	// ParseAddr is the same decode Client.up runs, and it is what rejects a
+	// legacy address.
+	ci, err := tailcat.ParseAddr(got.Public.Addr())
+	if err != nil {
+		t.Fatalf("the migrated key produced an unparseable address: %v", err)
+	}
+	if ci.ServerDiscoPublic.IsZero() {
+		t.Error("the address `syncat token` would print still lacks a disco key; " +
+			"a current peer rejects it outright")
+	}
+	if ci.PresharedKey.IsZero() {
+		t.Error("the address `syncat token` would print carries no pre-shared key")
+	}
+
+	// And it must have been written back, so the daemon serves the same
+	// address this token names.
+	reloaded, err := LoadTailcatKey(path)
+	if err != nil {
+		t.Fatalf("LoadTailcatKey (second): %v", err)
+	}
+	if reloaded.Public.Addr() != got.Public.Addr() {
+		t.Errorf("the migration was not persisted; address changed on reload:\n  first:  %s\n  second: %s",
+			got.Public.Addr(), reloaded.Public.Addr())
+	}
+}

@@ -96,8 +96,17 @@ func saveIdentityKey(path string, key *IdentityKey) error {
 
 // --- the tailcat transport key -----------------------------------------
 
-// LoadTailcatKey reads an existing tailcat saved key from path. It returns
-// an error wrapping os.ErrNotExist if the file doesn't exist.
+// LoadTailcatKey reads an existing tailcat saved key from path, migrating
+// it in place if it predates fields tailcat has since added to the address
+// (see migrateTailcatKey). It returns an error wrapping os.ErrNotExist if
+// the file doesn't exist.
+//
+// The migration belongs here, at the one point where the key enters the
+// program, rather than in LoadOrCreateTailcatKey: `syncat token` reads the
+// key directly and never goes near the create path, so putting it there
+// left `syncat token` printing a legacy address — silently, and looking
+// perfectly normal — on any node whose daemon had not been restarted since
+// the upgrade. A peer handed that token can never connect.
 func LoadTailcatKey(path string) (*tailcat.PrivateKey, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -107,13 +116,16 @@ func LoadTailcatKey(path string) (*tailcat.PrivateKey, error) {
 	if err := json.Unmarshal(data, &priv); err != nil {
 		return nil, fmt.Errorf("config: parse tailcat key %s: %w", path, err)
 	}
+	if err := migrateTailcatKey(path, &priv); err != nil {
+		return nil, err
+	}
 	return &priv, nil
 }
 
 // LoadOrCreateTailcatKey loads the tailcat saved key at path, generating and
 // persisting a new one if none exists. created reports whether a new key
-// was generated. An existing key is migrated in place if it predates
-// fields tailcat has since added to the address (see migrateTailcatKey).
+// was generated. An existing key is migrated in place by LoadTailcatKey if
+// it predates fields tailcat has since added to the address.
 //
 // Generating a key requires resolving a concrete DERP relay region once
 // (network access) and baking it into PrivateKey.Public.RegionID. This
@@ -125,9 +137,6 @@ func LoadTailcatKey(path string) (*tailcat.PrivateKey, error) {
 // the life of the key, matching cmd/tailcat's `genkey --fixed-region`.
 func LoadOrCreateTailcatKey(ctx context.Context, path string) (key *tailcat.PrivateKey, created bool, err error) {
 	if key, err := LoadTailcatKey(path); err == nil {
-		if err := migrateTailcatKey(path, key); err != nil {
-			return nil, false, err
-		}
 		return key, false, nil
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, false, err

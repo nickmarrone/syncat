@@ -339,11 +339,14 @@ What the restart actually does, and what it can't undo:
   old tokens in `config.json` are dead, and a node that keeps dialing one just
   retries forever.
 
-  Your own key file migrates itself on first start: `LoadOrCreateTailcatKey`
-  backfills the disco key (derived from the node key you already have) and
-  mints the pre-shared key (it can only be minted, not recovered), then writes
-  both back to `keys/tailcat.key`. The node key — and so the node's identity —
-  is unchanged; only the address it is reachable at changes, once.
+  Your own key file migrates itself the first time anything reads it —
+  whichever of `syncat token`, `syncat init`, or the daemon runs first.
+  `LoadTailcatKey` backfills the disco key (derived from the node key you
+  already have) and mints the pre-shared key (it can only be minted, not
+  recovered), then writes both back to `keys/tailcat.key`. So the order you do
+  things in doesn't matter, and `syncat token` never prints an address the
+  daemon won't serve. The node key — and so the node's identity — is
+  unchanged; only the address it is reachable at changes, once.
 - **Restarting mid-sync is safe, just not free.** SIGTERM stops the API, then
   closes the node, which waits for its background goroutines. Peers see the
   session drop and reconnect with backoff. Transfers interrupted by the restart
