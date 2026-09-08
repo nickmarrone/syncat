@@ -122,10 +122,6 @@ func (s *Store) CommitSnapshot(ctx context.Context, peer, share, id, epoch strin
 	if err != nil {
 		return err
 	}
-	_, err = tx.ExecContext(ctx, `INSERT OR IGNORE INTO dirty_paths(peer_key,share_id,relpath,updated_at) SELECT ?,?,relpath,? FROM peer_files WHERE peer_key=? AND share_id=?`, peer, share, time.Now().UnixNano(), peer, share)
-	if err != nil {
-		return err
-	}
 	_, err = tx.ExecContext(ctx, `DELETE FROM snapshot_staging WHERE peer_key=? AND share_id=?`, peer, share)
 	if err != nil {
 		return err
@@ -158,10 +154,6 @@ func (s *Store) ApplyPeerDelta(ctx context.Context, peer, share, epoch string, f
 			return e
 		}
 		_, e = tx.ExecContext(ctx, putPeerFileSQL, peer, share, r.RelPath, string(r.Type), r.Size, r.MTimeNS, r.Mode, r.SHA256, vj, boolInt(r.Deleted), time.Now().UnixNano())
-		if e != nil {
-			return e
-		}
-		_, e = tx.ExecContext(ctx, `INSERT INTO dirty_paths(peer_key,share_id,relpath,updated_at) VALUES(?,?,?,?) ON CONFLICT(peer_key,share_id,relpath) DO UPDATE SET updated_at=excluded.updated_at`, peer, share, r.RelPath, time.Now().UnixNano())
 		if e != nil {
 			return e
 		}

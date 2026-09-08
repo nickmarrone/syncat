@@ -2,6 +2,7 @@ package index
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -45,12 +46,20 @@ func TestOpenCreatesFreshDatabase(t *testing.T) {
 		t.Errorf("user_version = %d, want %d", version, currentSchemaVersion)
 	}
 
-	for _, table := range []string{"files", "peer_files", "pending_transfers", "share_state", "change_journal", "peer_cursors", "snapshot_staging", "dirty_paths"} {
+	for _, table := range []string{"files", "peer_files", "pending_transfers", "share_state", "change_journal", "peer_cursors", "snapshot_staging"} {
 		var name string
 		err := s.db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&name)
 		if err != nil {
 			t.Errorf("table %s missing: %v", table, err)
 		}
+	}
+
+	// dirty_paths was created by migrateV2 and dropped again by migrateV3;
+	// a database freshly migrated to the current version must not have it.
+	var name string
+	err = s.db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='dirty_paths'`).Scan(&name)
+	if !errors.Is(err, sql.ErrNoRows) {
+		t.Errorf("dirty_paths present after migration: scan err = %v", err)
 	}
 }
 
@@ -521,5 +530,73 @@ func TestUnparkOnNormalWrite(t *testing.T) {
 	}
 	if got.Size != 2 {
 		t.Errorf("Size = %d, want 2", got.Size)
+	}
+}
+
+// TestMigrateV3DropsDirtyPaths covers the upgrade path for databases
+// already in the wild: a v2 database has dirty_paths, with rows in it, and
+// opening it with this binary must drop the table without disturbing
+// anything else.
+func TestMigrateV3DropsDirtyPaths(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "index.db")
+
+	// Build a database at exactly schema version 2.
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open raw db: %v", err)
+	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	for i, step := range []func(context.Context, *sql.Tx) error{migrateV1, migrateV2} {
+		if err := step(ctx, tx); err != nil {
+			t.Fatalf("migrateV%d: %v", i+1, err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `PRAGMA user_version = 2`); err != nil {
+		t.Fatalf("set user_version: %v", err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO dirty_paths(peer_key,share_id,relpath,updated_at) VALUES('peer','share','a.txt',1)`); err != nil {
+		t.Fatalf("seed dirty_paths: %v", err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO peer_files(peer_key,share_id,relpath,type,size,mtime_ns,mode,sha256,version_json,deleted,updated_at) VALUES('peer','share','a.txt','file',1,1,420,NULL,'{}',0,1)`); err != nil {
+		t.Fatalf("seed peer_files: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close raw db: %v", err)
+	}
+
+	s, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("Open (v2 -> current): %v", err)
+	}
+	defer s.Close()
+
+	var version int
+	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		t.Fatalf("read user_version: %v", err)
+	}
+	if version != currentSchemaVersion {
+		t.Errorf("user_version = %d, want %d", version, currentSchemaVersion)
+	}
+
+	var name string
+	err = s.db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='dirty_paths'`).Scan(&name)
+	if !errors.Is(err, sql.ErrNoRows) {
+		t.Errorf("dirty_paths survived the upgrade: scan err = %v", err)
+	}
+
+	// The rest of the v2 database is untouched.
+	rows, err := s.ListPeerFiles(ctx, "peer", "share")
+	if err != nil {
+		t.Fatalf("ListPeerFiles: %v", err)
+	}
+	if len(rows) != 1 || rows[0].RelPath != "a.txt" {
+		t.Errorf("peer_files = %+v, want one row for a.txt", rows)
 	}
 }
