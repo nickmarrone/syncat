@@ -911,6 +911,17 @@ function updateNavHighlight() {
   });
 }
 
+// The version comes from the daemon's own /api/status, not from anything
+// baked into these assets, so what the header shows is the build actually
+// serving the page — which is the point of showing it at all.
+function updateVersion() {
+  const slot = document.getElementById('version');
+  if (!slot) return;
+  const version = state.status && state.status.version;
+  slot.textContent = version ? 'v' + version : '';
+  slot.title = version ? 'daemon version ' + version : '';
+}
+
 function updateConnIndicator() {
   const indicator = document.getElementById('conn-indicator');
   indicator.classList.remove('error');
@@ -931,6 +942,7 @@ function renderFatal(message) {
 
 function render() {
   updateNavHighlight();
+  updateVersion();
   updateConnIndicator();
   const app = document.getElementById('app');
 

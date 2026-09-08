@@ -10,6 +10,7 @@ import (
 
 	"github.com/nickmarrone/syncat/internal/core"
 	syncsvc "github.com/nickmarrone/syncat/internal/sync"
+	"github.com/nickmarrone/syncat/internal/version"
 )
 
 // Below is the JSON marshaling internal/core deliberately doesn't do
@@ -30,6 +31,12 @@ import (
 // --- DTOs: the JSON shapes every response goes through -----------------
 
 type statusResponse struct {
+	// Version is this daemon's build, as version.String() renders it. It
+	// is read straight from the binary rather than from core.Status
+	// because it describes the build, not the node's state — nothing in
+	// core has, or should have, an opinion about it.
+	Version string `json:"version"`
+
 	NodeName  string `json:"node_name"`
 	NodeToken string `json:"node_token"`
 	ShortID   string `json:"short_id"`
@@ -191,6 +198,7 @@ func toStatusResponse(st core.Status) statusResponse {
 		rejected = append(rejected, toRejectedConnDTO(r))
 	}
 	return statusResponse{
+		Version:  version.String(),
 		NodeName: st.NodeName, NodeToken: st.NodeToken, ShortID: st.ShortID, PeerKey: st.PeerKey,
 		StartedAt: st.StartedAt, UptimeSeconds: st.UptimeSeconds,
 		Peers: peers, Shares: shares, RemoteShares: remoteShares, Subscriptions: subs,

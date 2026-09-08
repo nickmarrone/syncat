@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/nickmarrone/syncat/internal/config"
+	"github.com/nickmarrone/syncat/internal/version"
 )
 
 // command is one entry in the subcommand dispatch table (SPEC.md §8).
@@ -31,6 +32,7 @@ var commands = []command{
 	{name: "approvals", usage: "syncat approvals [grant|deny ID]", summary: "manage pending approvals (not implemented — SPEC.md §2.3 is deferred)", run: cmdApprovals},
 	{name: "trash", usage: "syncat trash ls SHARE | restore SHARE PATH", summary: "browse/restore trashed files (SHARE: name, id, or id prefix)", run: cmdTrash},
 	{name: "config", usage: "syncat config set FIELD VALUE", summary: "set a top-level config field (e.g. debug, api_addr)", run: cmdConfig},
+	{name: "version", usage: "syncat version", summary: "print the syncat version", run: cmdVersion},
 }
 
 func main() {
@@ -45,6 +47,7 @@ func run(args []string) error {
 	fs.SetOutput(os.Stderr)
 	configDir := fs.String("config", "", "config directory override (default: $XDG_CONFIG_HOME/syncat or ~/.config/syncat)")
 	dataDir := fs.String("data", "", "data directory override (default: $XDG_DATA_HOME/syncat or ~/.local/share/syncat)")
+	showVersion := fs.Bool("version", false, "print the syncat version and exit")
 	fs.Usage = func() { printUsage(os.Stderr) }
 
 	if err := fs.Parse(args); err != nil {
@@ -52,6 +55,11 @@ func run(args []string) error {
 			return nil
 		}
 		return err
+	}
+
+	if *showVersion {
+		fmt.Println(version.String())
+		return nil
 	}
 
 	rest := fs.Args()
@@ -83,7 +91,7 @@ func run(args []string) error {
 }
 
 func printUsage(w *os.File) {
-	fmt.Fprintln(w, "syncat — peer-to-peer directory sync over tailcat")
+	fmt.Fprintf(w, "syncat %s — peer-to-peer directory sync over tailcat\n", version.String())
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  syncat [--config DIR] [--data DIR] <command> [args...]")

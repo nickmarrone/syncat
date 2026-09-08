@@ -179,6 +179,14 @@ header.topbar .brand {
   white-space: nowrap;
 }
 
+header.topbar .brand .version {
+  margin-left: 0.45em;
+  font-weight: 400;
+  font-size: 0.78rem;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+
 nav.tabs {
   display: flex;
   gap: 0.25rem;

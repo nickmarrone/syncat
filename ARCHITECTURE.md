@@ -60,6 +60,7 @@ it hands back a raw `net.Conn` and knows nothing about what flows over it.
 |---|---|
 | `config.go` | `Config`/`Peer`/`Share`/`Subscription` schema, defaults, `Validate`, the JSON doc-types and `Load`/`Save`, the share/subscription overlap rule (`CheckSharePath`, `CheckSubscriptionPath`), `NewShareID` |
 | `keys.go` | `IdentityKey` (Ed25519), the tailcat key, `sc1…` node tokens (`EncodeToken`/`ParseToken`), the REST API token |
+| `internal/version` | The product version (`0.3`), plus the commit the toolchain stamped in. Read by `syncat version`, `GET /api/status`, and the web UI header |
 | `paths.go` | `Paths` (XDG layout, drawn as a tree in its doc comment) and `writeFileAtomic`, which every persisted file goes through |
 
 Key idea: `Config` is a plain in-memory struct; the on-disk JSON shape is a

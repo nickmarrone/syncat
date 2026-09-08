@@ -24,6 +24,7 @@ import (
 	"github.com/nickmarrone/syncat/internal/config"
 	"github.com/nickmarrone/syncat/internal/core"
 	"github.com/nickmarrone/syncat/internal/transport"
+	"github.com/nickmarrone/syncat/internal/version"
 )
 
 // cmdInit implements `syncat init [--name NAME] [--reset [--yes]]`.
@@ -409,6 +410,21 @@ func cmdToken(paths *config.Paths, args []string) error {
 	}
 
 	fmt.Println(tok)
+	return nil
+}
+
+// cmdVersion implements `syncat version`. Like `syncat token` it touches
+// no daemon and no network — the version is a property of this binary, so
+// it is answerable even on a node that has never been initialised.
+func cmdVersion(paths *config.Paths, args []string) error {
+	fs := flag.NewFlagSet("version", flag.ContinueOnError)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("version takes no arguments, got %q", fs.Arg(0))
+	}
+	fmt.Println(version.String())
 	return nil
 }
 

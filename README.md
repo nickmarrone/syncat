@@ -35,6 +35,23 @@ Run one node:
 Open `http://127.0.0.1:8347` for the web UI, or drive it from the CLI — see
 `./syncat -h` for the full subcommand list, one per REST endpoint.
 
+### Versions
+
+This is syncat **0.3**. `syncat version` (or `syncat --version`) prints it,
+`GET /api/status` returns it as `version`, and the web UI shows it beside the
+brand in the header. The commit is appended when the toolchain stamped one in,
+so a build from a git checkout reports something like `0.3+c64ce12`, with
+`.dirty` on the end if the tree had uncommitted changes. Nothing needs passing
+at build time; `go build` records it on its own.
+
+The UI's copy comes from the daemon's own `/api/status`, not from the bundled
+assets, so what the header shows is the build actually serving the page.
+
+This number is the *product* version and nothing else. syncat has three other
+version numbers, each independent of it and of each other: `proto_version` in
+the peer handshake, the `sc1` prefix on node tokens, and the index's
+`PRAGMA user_version`. Bumping 0.3 says nothing about any of them.
+
 ### Two-node walkthrough
 
 This is the flow `scripts/e2e.sh` automates end-to-end; here it is by hand,
@@ -338,6 +355,14 @@ What the restart actually does, and what it can't undo:
   `syncat token` and re-add the others from the freshly printed tokens — the
   old tokens in `config.json` are dead, and a node that keeps dialing one just
   retries forever.
+
+  Since the failure looks like a timeout rather than a version complaint,
+  confirm the builds by hand before hunting anything else: run `syncat version`
+  on each node, or read the `version` field of `GET /api/status`. A node still
+  reporting a pre-0.3 build (or no version at all, which is every build before
+  this one) is the un-upgraded one. The version is *not* exchanged between
+  peers, so a node cannot tell you what its peer is running — you have to ask
+  each node itself.
 
   Your own key file migrates itself the first time anything reads it —
   whichever of `syncat token`, `syncat init`, or the daemon runs first.
@@ -704,6 +729,7 @@ walks the main flows.
 | `internal/config/` | `config.go` (schema, JSON encoding, load/save, re-share guard, share ids) · `keys.go` (identity key, tailcat key, `sc1` tokens, API token) · `paths.go` (XDG layout, atomic writes) |
 | `internal/api/` | `server.go` (routing, auth, `/ui-token`, HTTP helpers) · `handlers.go` (one handler per endpoint) · `dto.go` (the JSON shapes every response goes through) |
 | `internal/webui/` | `embed.go` + `static/` — `go:embed`-ed single-page UI (vanilla HTML/CSS/JS, no build step) |
+| `internal/version/` | `version.go` — the product version, and the commit `go build` stamped in |
 
 Files long enough to need it open their sections with `// --- name ---`
 markers, so `grep '^// --- ' internal/sync/reconcile.go` prints that file's

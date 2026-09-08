@@ -20,6 +20,7 @@ import (
 	"github.com/nickmarrone/syncat/internal/core"
 	syncsvc "github.com/nickmarrone/syncat/internal/sync"
 	"github.com/nickmarrone/syncat/internal/transport"
+	"github.com/nickmarrone/syncat/internal/version"
 )
 
 const testToken = "test-token-0123456789abcdef"
@@ -265,6 +266,11 @@ func TestStatusMarshals(t *testing.T) {
 	}
 	if body.ShortID == "" {
 		t.Error("short_id is empty")
+	}
+	// The UI reads this to label the header, and a bug report reads it to
+	// say which build produced the behaviour, so it must never be blank.
+	if body.Version != version.String() {
+		t.Errorf("version = %q, want %q", body.Version, version.String())
 	}
 	if body.Peers == nil || body.Shares == nil || body.Subscriptions == nil {
 		t.Error("Peers/Shares/Subscriptions should be present (possibly empty) arrays, not omitted")
