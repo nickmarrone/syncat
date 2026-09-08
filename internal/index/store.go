@@ -234,6 +234,11 @@ func migrateV1(ctx context.Context, tx *sql.Tx) error {
 			version_json TEXT    NOT NULL,
 			deleted      INTEGER NOT NULL DEFAULT 0,
 			updated_at   INTEGER NOT NULL,
+			-- ignored marks a "parked" row: the path matches an ignore
+			-- rule, so it is excluded from syncing entirely. The row is
+			-- kept rather than deleted solely to preserve version_json --
+			-- see FileRow.Ignored.
+			ignored      INTEGER NOT NULL DEFAULT 0,
 			PRIMARY KEY (share_id, relpath)
 		)`,
 		`CREATE INDEX files_share_deleted ON files (share_id, deleted)`,
@@ -308,6 +313,17 @@ type FileRow struct {
 	Version   protocol.VersionVector
 	Deleted   bool
 	UpdatedAt time.Time
+
+	// Ignored marks a "parked" row: the path matches an ignore rule, so
+	// it is excluded from syncing entirely — not listed, not served, never
+	// on the wire. The row is kept rather than deleted solely to preserve
+	// Version, so that if the rule is later removed the file resurrects
+	// with a vector that still dominates the peer's copy instead of
+	// restarting from scratch and silently diverging.
+	//
+	// Only ListShareMap ever returns a row with this set; every other
+	// reader filters parked rows out in SQL.
+	Ignored bool
 }
 
 // Info converts the row to its wire shape.
@@ -357,9 +373,10 @@ func cloneVersion(v protocol.VersionVector) protocol.VersionVector {
 // --- the files table: this node's own view ---------------------------
 
 const putFileSQL = `
-	INSERT INTO files (share_id, relpath, type, size, mtime_ns, mode, sha256, version_json, deleted, updated_at)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	INSERT INTO files (share_id, relpath, type, size, mtime_ns, mode, sha256, version_json, deleted, updated_at, ignored)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
 	ON CONFLICT (share_id, relpath) DO UPDATE SET
+		ignored = 0,
 		type = excluded.type,
 		size = excluded.size,
 		mtime_ns = excluded.mtime_ns,
@@ -377,7 +394,7 @@ var ErrNotFound = errors.New("index: not found")
 func (s *Store) GetFile(ctx context.Context, shareID, relpath string) (FileRow, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT relpath, type, size, mtime_ns, mode, sha256, version_json, deleted, updated_at
-		FROM files WHERE share_id = ? AND relpath = ?`, shareID, relpath)
+		FROM files WHERE share_id = ? AND relpath = ? AND ignored = 0`, shareID, relpath)
 	fr, err := scanFileRow(row, shareID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return FileRow{}, fmt.Errorf("index: get %s/%s: %w", shareID, relpath, ErrNotFound)
@@ -433,8 +450,11 @@ func putFileAndJournal(ctx context.Context, tx *sql.Tx, row FileRow) error {
 // ListShare returns every row for a share, in relpath order.
 // includeDeleted controls whether tombstones are included.
 func (s *Store) ListShare(ctx context.Context, shareID string, includeDeleted bool) ([]FileRow, error) {
+	// ignored = 0 excludes parked rows: a path whose sync this node has
+	// opted out of must not appear in any listing that feeds the wire.
+	// Only the scanner sees them, via ListShareMap.
 	query := `SELECT relpath, type, size, mtime_ns, mode, sha256, version_json, deleted, updated_at
-		FROM files WHERE share_id = ?`
+		FROM files WHERE share_id = ? AND ignored = 0`
 	if !includeDeleted {
 		query += ` AND deleted = 0`
 	}
@@ -447,29 +467,65 @@ func (s *Store) ListShare(ctx context.Context, shareID string, includeDeleted bo
 	return collectFileRows(rows, shareID)
 }
 
-// ListShareMap is a convenience wrapper around ListShare for the common
-// case of diffing a scan against the index: a relpath -> FileRow lookup,
-// including tombstones (the scanner needs to see them, to distinguish a
-// brand-new file from one being resurrected — see scanner.go).
+// ListShareMap returns a relpath -> FileRow lookup for diffing a scan
+// against the index. Unlike ListShare it includes both tombstones and
+// parked (ignored) rows, because the scanner is the one reader that needs
+// them: tombstones let it tell a brand-new file from a resurrected one,
+// and parked rows carry the version vector an un-ignored file must
+// resurrect with (see FileRow.Ignored).
+//
+// This is deliberately the only way parked rows leave the store. Nothing
+// that feeds the wire uses it.
 func (s *Store) ListShareMap(ctx context.Context, shareID string) (map[string]FileRow, error) {
-	rows, err := s.ListShare(ctx, shareID, true)
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT relpath, type, size, mtime_ns, mode, sha256, version_json, deleted, updated_at, ignored
+		FROM files WHERE share_id = ? ORDER BY relpath`, shareID)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("index: list share map %s: %w", shareID, err)
 	}
-	out := make(map[string]FileRow, len(rows))
-	for _, r := range rows {
-		out[r.RelPath] = r
+	defer rows.Close()
+
+	out := map[string]FileRow{}
+	for rows.Next() {
+		var fr FileRow
+		var typ string
+		var versionJSON string
+		var deleted, ignored int
+		var mtimeNS, updatedAt int64
+		if err := rows.Scan(&fr.RelPath, &typ, &fr.Size, &mtimeNS, &fr.Mode, &fr.SHA256, &versionJSON, &deleted, &updatedAt, &ignored); err != nil {
+			return nil, fmt.Errorf("index: list share map %s: %w", shareID, err)
+		}
+		v, err := unmarshalVersion(versionJSON)
+		if err != nil {
+			return nil, fmt.Errorf("index: list share map %s: %w", shareID, err)
+		}
+		fr.ShareID = shareID
+		fr.Type = protocol.FileType(typ)
+		fr.MTimeNS = mtimeNS
+		fr.Version = v
+		fr.Deleted = deleted != 0
+		fr.Ignored = ignored != 0
+		fr.UpdatedAt = time.Unix(0, updatedAt).UTC()
+		out[fr.RelPath] = fr
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("index: list share map %s: %w", shareID, err)
 	}
 	return out, nil
 }
 
 // ApplyScanResult persists a Scanner diff in one transaction: every added,
-// content-changed, and metadata-only row is upserted, and every deleted
-// row is written back as a tombstone (Deleted=true, other columns
-// unchanged from what the scanner reported). Applying is a separate,
-// explicit step from scanning (see scanner.go's doc comment) so a caller
-// can inspect or filter a ScanResult — e.g. skip files ignored mid-flight,
-// or hand it to internal/sync's reconciler first — before it becomes durable.
+// content-changed, and metadata-only row is upserted, every deleted row is
+// written back as a tombstone (Deleted=true, other columns unchanged from
+// what the scanner reported), and every newly-ignored row is parked
+// (ignored=1). Applying is a separate, explicit step from scanning (see
+// scanner.go's doc comment) so a caller can inspect or filter a ScanResult
+// — e.g. skip files ignored mid-flight, or hand it to internal/sync's
+// reconciler first — before it becomes durable.
+//
+// The Ignored bucket is the one place in this package where a row changes
+// WITHOUT a change_journal entry, and that asymmetry is deliberate — see
+// the comment at the park itself.
 func (s *Store) ApplyScanResult(ctx context.Context, result *ScanResult) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -488,6 +544,29 @@ func (s *Store) ApplyScanResult(ctx context.Context, result *ScanResult) error {
 	for _, rows := range [][]FileRow{result.Added, result.ContentChanged, result.MetadataOnly, result.Deleted} {
 		if err := apply(rows); err != nil {
 			return fmt.Errorf("index: apply scan result: %w", err)
+		}
+	}
+
+	// Newly-ignored rows are PARKED, not tombstoned — and deliberately not
+	// journalled. Everything else here goes through putFileAndJournal,
+	// which appends to change_journal and bumps share_state.next_seq so
+	// that peers learn about the change; this is the one write that must
+	// not, because the "change" is only that we stopped tracking the file.
+	// A journalled tombstone would reach every peer as a delete and move
+	// their copies to the trash. Peers simply stop seeing the path in our
+	// index and keep what they already have (they take no action for a
+	// path they hold that we do not advertise — see internal/sync's
+	// reconcileOne, "local-only, peer will pull from us").
+	//
+	// Parking sets ignored = 1 rather than deleting the row, which hides
+	// it from every reader that feeds the wire while preserving its
+	// version vector. See FileRow.Ignored for why that vector matters.
+	for _, row := range result.Ignored {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE files SET ignored = 1 WHERE share_id = ? AND relpath = ?`,
+			row.ShareID, row.RelPath,
+		); err != nil {
+			return fmt.Errorf("index: apply scan result: park ignored %s/%s: %w", row.ShareID, row.RelPath, err)
 		}
 	}
 

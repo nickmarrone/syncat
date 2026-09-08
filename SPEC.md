@@ -172,9 +172,26 @@ sha256, version_json, deleted, updated_at)` plus `peer_files(...)` mirroring the
   debounced 1s). Code-directory friendly: batches of events collapse into one scan.
 - A file is "changed" when size or mtime differs from the index; then hash (sha256) to
   confirm. Hash-equal ⇒ metadata-only update, no transfer.
-- Ignore rules: `.syncatignore` at share root (gitignore syntax, via a Go gitignore
-  library); `.syncatignore` itself is synced. Always ignored: `.syncat.tmp.*`, OS junk
-  (`.DS_Store`, `Thumbs.db`, `desktop.ini`), and the global ignore list in config.
+- Ignore rules: `.syncatignore` at the share root, gitignore syntax, matched by an
+  in-tree matcher (`internal/index/ignore.go`) — no new dependency (§10). Supported:
+  comments, `!` negation (last match wins), `/` anchoring, trailing-`/` directory-only
+  patterns, `**`, `*`, `?`, `[…]`, and backslash escapes. Only the share root's file is
+  read; nested ones are not.
+- `.syncatignore` is **never synced** — it is always ignored, so each node keeps its
+  own and the two sides may legitimately disagree about what is excluded. Also always
+  ignored: `.syncat.tmp.*`, OS junk (`.DS_Store`, `Thumbs.db`, `desktop.ini`), and the
+  global ignore list in config. A `!` rule cannot re-include any of these.
+- Ignoring is enforced in **both** directions: an ignored path is never advertised or
+  served to a peer, and never pulled or written from one.
+- Ignoring is not deleting. Adding a rule for an already-indexed path *parks* its index
+  row (`files.ignored`) instead of tombstoning it: peers are told nothing and keep their
+  copies. The row is parked rather than deleted so its version vector survives — a
+  deleted row would restart at a version the peer already holds, leaving the two sides
+  comparing equal with different contents and never converging. Removing the rule
+  resurrects the file with a bumped vector that dominates the peer's copy.
+- The file is re-read at the start of every scan, so an edit takes effect on the next
+  rescan with no restart. An unreadable or malformed one keeps the previously compiled
+  rules (never "ignore nothing"); individual bad lines are skipped and logged.
 - Symlinks are **not followed**; the symlink entry itself (target string) syncs on
   Unix and is skipped with a warning on Windows.
 
@@ -290,6 +307,7 @@ internal/core/        # engine wiring: node lifecycle, peer manager  ← gomobil
 internal/transport/   # tailcat server+client wrapper, dial/backoff/dedup, Transport interface
 internal/protocol/    # frame codec, message types, handshake
 internal/index/       # SQLite index, scanner, fsnotify watcher, ignore matching
+                      #   (ignore.go: the .syncatignore gitignore-syntax matcher)
 internal/sync/        # version vectors, reconciler, whole-file transfer, atomic apply, trash
 internal/config/      # config load/save, keys, node tokens
 internal/api/         # REST handlers, auth, DTOs
@@ -304,8 +322,11 @@ contents. See the README's project-layout table for the file-level map.
 `net.Conn`s) with the tailcat implementation behind it — tests use a loopback-TCP
 implementation, and the future mobile apps reuse everything above the interface.
 
-Dependency budget: tailcat, modernc.org/sqlite, fsnotify, fxamacker/cbor, a
-gitignore matcher, x/crypto. Nothing else without cause.
+Dependency budget: tailcat, modernc.org/sqlite, fsnotify, fxamacker/cbor,
+x/crypto. Nothing else without cause. (The budget originally allowed a
+gitignore matcher; none of the Go ones carry a tagged release, so
+`.syncatignore` matching is implemented in-tree instead and the budget spends
+nothing on it.)
 
 ## 11. Block-level delta transfer (v2 — design now, build later)
 

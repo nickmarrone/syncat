@@ -44,7 +44,7 @@ func findAction(t *testing.T, actions []Action, relpath string) Action {
 
 func TestReconcile_OnlyLocal(t *testing.T) {
 	local := []protocol.FileInfo{fi("a.txt", 100, "x", vv("local", 1), false)}
-	actions := Reconcile(local, nil, nodeLocal, mirrorDir(), fixedClock)
+	actions := Reconcile(local, nil, nodeLocal, mirrorDir(), fixedClock, nil)
 	a := findAction(t, actions, "a.txt")
 	if a.Kind != ActionNone {
 		t.Errorf("Kind = %v, want ActionNone", a.Kind)
@@ -53,7 +53,7 @@ func TestReconcile_OnlyLocal(t *testing.T) {
 
 func TestReconcile_OnlyLocal_ReceiveOnlyFlagged(t *testing.T) {
 	local := []protocol.FileInfo{fi("a.txt", 100, "x", vv("local", 1), false)}
-	actions := Reconcile(local, nil, nodeLocal, receiveOnlyDir(), fixedClock)
+	actions := Reconcile(local, nil, nodeLocal, receiveOnlyDir(), fixedClock, nil)
 	a := findAction(t, actions, "a.txt")
 	if a.Kind != ActionLocallyModified || !a.LocallyModified {
 		t.Errorf("got %+v, want ActionLocallyModified", a)
@@ -62,7 +62,7 @@ func TestReconcile_OnlyLocal_ReceiveOnlyFlagged(t *testing.T) {
 
 func TestReconcile_OnlyRemote_Pull(t *testing.T) {
 	remote := []protocol.FileInfo{fi("a.txt", 100, "x", vv("remote", 1), false)}
-	actions := Reconcile(nil, remote, nodeLocal, mirrorDir(), fixedClock)
+	actions := Reconcile(nil, remote, nodeLocal, mirrorDir(), fixedClock, nil)
 	a := findAction(t, actions, "a.txt")
 	if a.Kind != ActionPull || a.Source != SourceRemote {
 		t.Errorf("got %+v, want ActionPull/SourceRemote", a)
@@ -74,7 +74,7 @@ func TestReconcile_OnlyRemote_Pull(t *testing.T) {
 
 func TestReconcile_OnlyRemote_Tombstone(t *testing.T) {
 	remote := []protocol.FileInfo{fi("a.txt", 100, "x", vv("remote", 1), true)}
-	actions := Reconcile(nil, remote, nodeLocal, mirrorDir(), fixedClock)
+	actions := Reconcile(nil, remote, nodeLocal, mirrorDir(), fixedClock, nil)
 	a := findAction(t, actions, "a.txt")
 	if a.Kind != ActionDelete || a.Source != SourceNone {
 		t.Errorf("got %+v, want ActionDelete/SourceNone", a)
@@ -84,7 +84,7 @@ func TestReconcile_OnlyRemote_Tombstone(t *testing.T) {
 func TestReconcile_RemoteDominates_Pull(t *testing.T) {
 	local := []protocol.FileInfo{fi("a.txt", 100, "x", vv("local", 1), false)}
 	remote := []protocol.FileInfo{fi("a.txt", 200, "y", vv("local", 1, "remote", 1), false)}
-	actions := Reconcile(local, remote, nodeLocal, mirrorDir(), fixedClock)
+	actions := Reconcile(local, remote, nodeLocal, mirrorDir(), fixedClock, nil)
 	a := findAction(t, actions, "a.txt")
 	if a.Kind != ActionPull || a.Source != SourceRemote {
 		t.Errorf("got %+v, want ActionPull/SourceRemote", a)
@@ -94,7 +94,7 @@ func TestReconcile_RemoteDominates_Pull(t *testing.T) {
 func TestReconcile_RemoteDominates_Delete(t *testing.T) {
 	local := []protocol.FileInfo{fi("a.txt", 100, "x", vv("local", 1), false)}
 	remote := []protocol.FileInfo{fi("a.txt", 200, "y", vv("local", 1, "remote", 1), true)}
-	actions := Reconcile(local, remote, nodeLocal, mirrorDir(), fixedClock)
+	actions := Reconcile(local, remote, nodeLocal, mirrorDir(), fixedClock, nil)
 	a := findAction(t, actions, "a.txt")
 	if a.Kind != ActionDelete || a.Source != SourceNone {
 		t.Errorf("got %+v, want ActionDelete/SourceNone", a)
@@ -107,7 +107,7 @@ func TestReconcile_RemoteDominates_Delete(t *testing.T) {
 func TestReconcile_LocalDominates_Skip(t *testing.T) {
 	local := []protocol.FileInfo{fi("a.txt", 200, "y", vv("local", 1, "remote", 1), false)}
 	remote := []protocol.FileInfo{fi("a.txt", 100, "x", vv("remote", 1), false)}
-	actions := Reconcile(local, remote, nodeLocal, mirrorDir(), fixedClock)
+	actions := Reconcile(local, remote, nodeLocal, mirrorDir(), fixedClock, nil)
 	a := findAction(t, actions, "a.txt")
 	if a.Kind != ActionNone {
 		t.Errorf("got %+v, want ActionNone (peer will pull from us)", a)
@@ -117,7 +117,7 @@ func TestReconcile_LocalDominates_Skip(t *testing.T) {
 func TestReconcile_LocalDominates_ReceiveOnlyFlagged(t *testing.T) {
 	local := []protocol.FileInfo{fi("a.txt", 200, "y", vv("local", 1, "remote", 1), false)}
 	remote := []protocol.FileInfo{fi("a.txt", 100, "x", vv("remote", 1), false)}
-	actions := Reconcile(local, remote, nodeLocal, receiveOnlyDir(), fixedClock)
+	actions := Reconcile(local, remote, nodeLocal, receiveOnlyDir(), fixedClock, nil)
 	a := findAction(t, actions, "a.txt")
 	if a.Kind != ActionLocallyModified {
 		t.Errorf("got %+v, want ActionLocallyModified", a)
@@ -128,7 +128,7 @@ func TestReconcile_EqualVersions_None(t *testing.T) {
 	v := vv("local", 1, "remote", 1)
 	local := []protocol.FileInfo{fi("a.txt", 100, "x", v, false)}
 	remote := []protocol.FileInfo{fi("a.txt", 100, "x", v, false)}
-	actions := Reconcile(local, remote, nodeLocal, mirrorDir(), fixedClock)
+	actions := Reconcile(local, remote, nodeLocal, mirrorDir(), fixedClock, nil)
 	a := findAction(t, actions, "a.txt")
 	if a.Kind != ActionNone {
 		t.Errorf("got %+v, want ActionNone", a)
@@ -138,7 +138,7 @@ func TestReconcile_EqualVersions_None(t *testing.T) {
 func TestReconcile_InboundBlocked_ReadOnlyShare(t *testing.T) {
 	local := []protocol.FileInfo{fi("a.txt", 100, "x", vv("local", 1), false)}
 	remote := []protocol.FileInfo{fi("a.txt", 999, "z", vv("local", 1, "remote", 5), false)}
-	actions := Reconcile(local, remote, nodeLocal, readOnlyDir(), fixedClock)
+	actions := Reconcile(local, remote, nodeLocal, readOnlyDir(), fixedClock, nil)
 	a := findAction(t, actions, "a.txt")
 	if a.Kind != ActionNone {
 		t.Errorf("got %+v, want ActionNone: inbound must be ignored entirely on a read-only share", a)
@@ -148,7 +148,7 @@ func TestReconcile_InboundBlocked_ReadOnlyShare(t *testing.T) {
 func TestReconcile_Concurrent_ConflictCopy_RemoteWinsByMtime(t *testing.T) {
 	local := []protocol.FileInfo{fi("a.txt", 100, "local-content", vv("local", 1), false)}
 	remote := []protocol.FileInfo{fi("a.txt", 200, "remote-content", vv("remote", 1), false)}
-	actions := Reconcile(local, remote, nodeLocal, mirrorDir(), fixedClock)
+	actions := Reconcile(local, remote, nodeLocal, mirrorDir(), fixedClock, nil)
 	a := findAction(t, actions, "a.txt")
 
 	if a.Kind != ActionConflictCopy {
@@ -179,7 +179,7 @@ func TestReconcile_Concurrent_ConflictCopy_RemoteWinsByMtime(t *testing.T) {
 func TestReconcile_Concurrent_ConflictCopy_LocalWinsByMtime(t *testing.T) {
 	local := []protocol.FileInfo{fi("a.txt", 500, "local-content", vv("local", 1), false)}
 	remote := []protocol.FileInfo{fi("a.txt", 200, "remote-content", vv("remote", 1), false)}
-	actions := Reconcile(local, remote, nodeLocal, mirrorDir(), fixedClock)
+	actions := Reconcile(local, remote, nodeLocal, mirrorDir(), fixedClock, nil)
 	a := findAction(t, actions, "a.txt")
 
 	if a.Kind != ActionConflictCopy {
@@ -205,7 +205,7 @@ func TestReconcile_Concurrent_MtimeTie_SHA256TieBreak(t *testing.T) {
 	// the tie-break were ignored and mtime-equal defaulted to local).
 	local := []protocol.FileInfo{fi("a.txt", 100, "local-lo", vv("local", 1), false)}
 	remote := []protocol.FileInfo{fi("a.txt", 100, "remote-hi", vv("remote", 1), false)}
-	actions := Reconcile(local, remote, nodeLocal, mirrorDir(), fixedClock)
+	actions := Reconcile(local, remote, nodeLocal, mirrorDir(), fixedClock, nil)
 	a := findAction(t, actions, "a.txt")
 
 	if a.Kind != ActionConflictCopy {
@@ -219,7 +219,7 @@ func TestReconcile_Concurrent_MtimeTie_SHA256TieBreak(t *testing.T) {
 func TestReconcile_DeleteVsModify_LocalDeletedRemoteModified_Resurrect(t *testing.T) {
 	local := []protocol.FileInfo{fi("a.txt", 100, "old", vv("local", 1), true)}
 	remote := []protocol.FileInfo{fi("a.txt", 200, "new", vv("remote", 1), false)}
-	actions := Reconcile(local, remote, nodeLocal, mirrorDir(), fixedClock)
+	actions := Reconcile(local, remote, nodeLocal, mirrorDir(), fixedClock, nil)
 	a := findAction(t, actions, "a.txt")
 
 	if a.Kind != ActionResurrect {
@@ -238,7 +238,7 @@ func TestReconcile_DeleteVsModify_RemoteDeletedLocalModified_Resurrect(t *testin
 	// the mtime/sha256 tie-break entirely: modify always wins.
 	local := []protocol.FileInfo{fi("a.txt", 100, "new", vv("local", 1), false)}
 	remote := []protocol.FileInfo{fi("a.txt", 99999, "gone", vv("remote", 1), true)}
-	actions := Reconcile(local, remote, nodeLocal, mirrorDir(), fixedClock)
+	actions := Reconcile(local, remote, nodeLocal, mirrorDir(), fixedClock, nil)
 	a := findAction(t, actions, "a.txt")
 
 	if a.Kind != ActionResurrect {
@@ -255,7 +255,7 @@ func TestReconcile_DeleteVsModify_RemoteDeletedLocalModified_Resurrect(t *testin
 func TestReconcile_TombstoneVsTombstone_ConcurrentVersions(t *testing.T) {
 	local := []protocol.FileInfo{fi("a.txt", 100, "old", vv("local", 1), true)}
 	remote := []protocol.FileInfo{fi("a.txt", 200, "old2", vv("remote", 1), true)}
-	actions := Reconcile(local, remote, nodeLocal, mirrorDir(), fixedClock)
+	actions := Reconcile(local, remote, nodeLocal, mirrorDir(), fixedClock, nil)
 	a := findAction(t, actions, "a.txt")
 
 	if a.Kind != ActionDelete {
@@ -276,7 +276,7 @@ func TestReconcile_TombstoneVsTombstone_ConcurrentVersions(t *testing.T) {
 func TestReconcile_ReceiveOnly_ConcurrentContentConflict_FlaggedNotCopied(t *testing.T) {
 	local := []protocol.FileInfo{fi("a.txt", 500, "local-content", vv("local", 1), false)}
 	remote := []protocol.FileInfo{fi("a.txt", 200, "remote-content", vv("remote", 1), false)}
-	actions := Reconcile(local, remote, nodeLocal, receiveOnlyDir(), fixedClock)
+	actions := Reconcile(local, remote, nodeLocal, receiveOnlyDir(), fixedClock, nil)
 	a := findAction(t, actions, "a.txt")
 
 	if a.Kind != ActionLocallyModified {
@@ -293,7 +293,7 @@ func TestReconcile_ReceiveOnly_DeleteVsModify_StillResurrects(t *testing.T) {
 	// must proceed as ActionResurrect even under receive-only.
 	local := []protocol.FileInfo{fi("a.txt", 100, "old", vv("local", 1), true)}
 	remote := []protocol.FileInfo{fi("a.txt", 200, "new", vv("remote", 1), false)}
-	actions := Reconcile(local, remote, nodeLocal, receiveOnlyDir(), fixedClock)
+	actions := Reconcile(local, remote, nodeLocal, receiveOnlyDir(), fixedClock, nil)
 	a := findAction(t, actions, "a.txt")
 
 	if a.Kind != ActionResurrect {
@@ -303,7 +303,7 @@ func TestReconcile_ReceiveOnly_DeleteVsModify_StillResurrects(t *testing.T) {
 
 func TestReconcile_InvalidRemoteRelPath_Rejected(t *testing.T) {
 	remote := []protocol.FileInfo{fi("../../etc/passwd", 100, "x", vv("remote", 1), false)}
-	actions := Reconcile(nil, remote, nodeLocal, mirrorDir(), fixedClock)
+	actions := Reconcile(nil, remote, nodeLocal, mirrorDir(), fixedClock, nil)
 	a := findAction(t, actions, "../../etc/passwd")
 	if a.Kind != ActionNone {
 		t.Errorf("Kind = %v, want ActionNone: a hostile remote relpath must never produce a real action", a.Kind)
@@ -316,7 +316,7 @@ func TestReconcile_DeterministicOrdering(t *testing.T) {
 		fi("a.txt", 1, "a", vv("local", 1), false),
 		fi("m.txt", 1, "m", vv("local", 1), false),
 	}
-	actions := Reconcile(local, nil, nodeLocal, mirrorDir(), fixedClock)
+	actions := Reconcile(local, nil, nodeLocal, mirrorDir(), fixedClock, nil)
 	if len(actions) != 3 {
 		t.Fatalf("got %d actions, want 3", len(actions))
 	}
@@ -646,5 +646,119 @@ func TestConflictRelPathUsesUTC(t *testing.T) {
 	want := ConflictRelPath("f.txt", "abc", utc)
 	if got != want {
 		t.Errorf("timezone-dependent output: local=%q utc=%q", got, want)
+	}
+}
+
+// ignoreOnly returns an ignore predicate matching exactly the given paths.
+func ignoreOnly(paths ...string) func(string, bool) bool {
+	set := make(map[string]bool, len(paths))
+	for _, p := range paths {
+		set[p] = true
+	}
+	return func(relpath string, _ bool) bool { return set[relpath] }
+}
+
+// TestReconcile_IgnoredRemoteOnlyFile_NotPulled closes the flap loop. An
+// ignored path has no local index row, so without the filter it looks like
+// a brand-new remote file: we would pull it, index it, ignore it on the
+// next scan, and then propagate the resulting tombstone back — deleting
+// the peer's copy.
+func TestReconcile_IgnoredRemoteOnlyFile_NotPulled(t *testing.T) {
+	remote := []protocol.FileInfo{fi("build/out.o", 100, "x", vv("remote", 1), false)}
+	actions := Reconcile(nil, remote, nodeLocal, mirrorDir(), fixedClock, ignoreOnly("build/out.o"))
+	a := findAction(t, actions, "build/out.o")
+	if a.Kind != ActionNone {
+		t.Errorf("Kind = %v (%s), want ActionNone — pulling an ignored file starts a sync flap loop", a.Kind, a.Reason)
+	}
+}
+
+// TestReconcile_IgnoredRemoteTombstone_NoLocalDelete is the data-loss case.
+// Once a path is ignored it has no local row, so a peer deleting *their*
+// copy reaches reconcileOne as a remote-only tombstone — which would
+// execute a delete against our still-present local file.
+func TestReconcile_IgnoredRemoteTombstone_NoLocalDelete(t *testing.T) {
+	remote := []protocol.FileInfo{fi("secret.txt", 100, "x", vv("remote", 2), true)}
+	actions := Reconcile(nil, remote, nodeLocal, mirrorDir(), fixedClock, ignoreOnly("secret.txt"))
+	a := findAction(t, actions, "secret.txt")
+	if a.Kind != ActionNone {
+		t.Errorf("Kind = %v (%s), want ActionNone — a peer's tombstone must not delete our ignored file", a.Kind, a.Reason)
+	}
+}
+
+// TestReconcile_IgnoredLocalOnly_NoLocallyModifiedWarning: a receive-only
+// subscription flags local-only files, but an ignored one is expected to
+// be local-only and must not generate a warning.
+func TestReconcile_IgnoredLocalOnly_NoLocallyModifiedWarning(t *testing.T) {
+	local := []protocol.FileInfo{fi("notes.local", 100, "x", vv("local", 1), false)}
+	actions := Reconcile(local, nil, nodeLocal, receiveOnlyDir(), fixedClock, ignoreOnly("notes.local"))
+	a := findAction(t, actions, "notes.local")
+	if a.Kind != ActionNone || a.LocallyModified {
+		t.Errorf("got %+v, want a plain ActionNone", a)
+	}
+}
+
+// TestReconcile_IgnoredConcurrentVersions_NoConflictCopy: ignoring wins
+// over the version algebra outright, so a path that would otherwise
+// produce a conflict copy produces nothing.
+func TestReconcile_IgnoredConcurrentVersions_NoConflictCopy(t *testing.T) {
+	local := []protocol.FileInfo{fi("both.txt", 100, "x", vv("local", 1), false)}
+	remote := []protocol.FileInfo{fi("both.txt", 200, "y", vv("remote", 1), false)}
+	actions := Reconcile(local, remote, nodeLocal, mirrorDir(), fixedClock, ignoreOnly("both.txt"))
+	a := findAction(t, actions, "both.txt")
+	if a.Kind != ActionNone {
+		t.Errorf("Kind = %v (%s), want ActionNone", a.Kind, a.Reason)
+	}
+}
+
+// TestReconcile_IgnoreSeesDirectoryFlag pins that the predicate is told
+// whether the entry is a directory, which directory-only patterns
+// ("build/") need in order to match.
+func TestReconcile_IgnoreSeesDirectoryFlag(t *testing.T) {
+	dir := protocol.FileInfo{RelPath: "build", Type: protocol.FileTypeDir, Version: vv("remote", 1)}
+	file := fi("build.txt", 100, "x", vv("remote", 1), false)
+
+	var sawDir, sawFile bool
+	ignore := func(relpath string, isDir bool) bool {
+		switch relpath {
+		case "build":
+			sawDir = isDir
+		case "build.txt":
+			sawFile = !isDir
+		}
+		return false
+	}
+	Reconcile(nil, []protocol.FileInfo{dir, file}, nodeLocal, mirrorDir(), fixedClock, ignore)
+	if !sawDir {
+		t.Error("directory entry was not reported as isDir=true")
+	}
+	if !sawFile {
+		t.Error("file entry was not reported as isDir=false")
+	}
+}
+
+// TestReconcile_NilIgnore_UnchangedBehaviour: every existing call site
+// passes nil, and must behave exactly as it did before the filter existed.
+func TestReconcile_NilIgnore_UnchangedBehaviour(t *testing.T) {
+	remote := []protocol.FileInfo{fi("a.txt", 100, "x", vv("remote", 1), false)}
+	a := findAction(t, Reconcile(nil, remote, nodeLocal, mirrorDir(), fixedClock, nil), "a.txt")
+	if a.Kind != ActionPull {
+		t.Errorf("Kind = %v, want ActionPull", a.Kind)
+	}
+}
+
+// TestReconcile_IgnoreDoesNotMaskInvalidRelPath: a hostile peer must not be
+// able to hide a traversal attempt behind an ignore rule. The path is
+// refused either way, but it has to be refused *as* an invalid path so the
+// reason is visible to whoever reads the log.
+func TestReconcile_IgnoreDoesNotMaskInvalidRelPath(t *testing.T) {
+	remote := []protocol.FileInfo{fi("../escape.txt", 100, "x", vv("remote", 1), false)}
+	actions := Reconcile(nil, remote, nodeLocal, mirrorDir(), fixedClock,
+		func(string, bool) bool { return true })
+	a := findAction(t, actions, "../escape.txt")
+	if a.Kind != ActionNone {
+		t.Fatalf("Kind = %v, want ActionNone", a.Kind)
+	}
+	if !strings.Contains(a.Reason, "invalid remote relpath") {
+		t.Errorf("Reason = %q, want the invalid-relpath rejection rather than an ignore", a.Reason)
 	}
 }

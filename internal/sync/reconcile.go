@@ -406,7 +406,14 @@ type Clock func() time.Time
 // IndexUpdate can never smuggle a traversal attempt into an Action for a
 // caller to (mis)trust. Local rows come from this node's own index and are
 // not re-validated here.
-func Reconcile(local, remote []protocol.FileInfo, nodeID string, dir Direction, clock Clock) []Action {
+//
+// ignore, when non-nil, reports whether a share-relative path is excluded
+// by the share's ignore rules (SPEC.md §5). Ignored paths are decided
+// before any version algebra runs and always yield ActionNone, which is
+// what makes ignoring bidirectional: we neither pull the peer's copy nor
+// delete our own on their tombstone. It is a required parameter rather
+// than a second entry point so that no caller can quietly skip it.
+func Reconcile(local, remote []protocol.FileInfo, nodeID string, dir Direction, clock Clock, ignore func(relpath string, isDir bool) bool) []Action {
 	if clock == nil {
 		clock = time.Now
 	}
@@ -431,9 +438,38 @@ func Reconcile(local, remote []protocol.FileInfo, nodeID string, dir Direction, 
 	for _, p := range sorted {
 		l, hasLocal := localByPath[p]
 		r, hasRemote := remoteByPath[p]
+		// A malformed remote path is reported as such by reconcileOne,
+		// whose ValidateRelPath check runs first. Never mask that signal
+		// with "ignored" just because the path also matched a rule: a
+		// traversal attempt should be visible as a traversal attempt.
+		malformed := hasRemote && ValidateRelPath(r.RelPath) != nil
+		if !malformed && ignore != nil && ignore(p, isDirEntry(l, hasLocal, r, hasRemote)) {
+			// Decided here rather than inside reconcileOne so that a
+			// single branch covers every outcome the algebra could have
+			// reached: no pull of a remote-only file (which would flap,
+			// since the next scan re-ignores it), no delete of our copy
+			// on the peer's tombstone, no conflict copy, and no
+			// locally-modified warning.
+			actions = append(actions, Action{Kind: ActionNone, RelPath: p, Reason: "ignored: .syncatignore"})
+			continue
+		}
 		actions = append(actions, reconcileOne(p, l, hasLocal, r, hasRemote, nodeID, dir, clock))
 	}
 	return actions
+}
+
+// isDirEntry reports whether a reconciled path names a directory,
+// preferring our own view of it and falling back to the peer's. Ignore
+// rules need it because a directory-only pattern ("build/") must not match
+// a file of the same name.
+func isDirEntry(l protocol.FileInfo, hasLocal bool, r protocol.FileInfo, hasRemote bool) bool {
+	if hasLocal {
+		return l.Type == protocol.FileTypeDir
+	}
+	if hasRemote {
+		return r.Type == protocol.FileTypeDir
+	}
+	return false
 }
 
 // indexByPath keys files by RelPath. If the input slice has duplicate

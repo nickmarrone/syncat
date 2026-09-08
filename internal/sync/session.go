@@ -42,6 +42,25 @@ type ShareConfig struct {
 	ShareID   string
 	Root      string // absolute local directory this share's files live under
 	Direction Direction
+
+	// Ignore reports whether a share-relative path is excluded from
+	// syncing by this share's ignore rules — the built-ins, the global
+	// ignore list, and the share's own .syncatignore (SPEC.md §5). nil
+	// means nothing is ignored, which keeps the zero value usable.
+	//
+	// It is a closure rather than an *index.Matcher (which would compile
+	// fine — internal/sync already imports internal/index) because
+	// .syncatignore is re-read on every rescan: a snapshotted matcher
+	// would go stale the moment the user edited the file, and nothing
+	// re-adds a share when that happens. internal/core resolves this
+	// against the share's current matcher on every call.
+	Ignore func(relpath string, isDir bool) bool
+}
+
+// ignored is Ignore with the nil check folded in, since almost every call
+// site is on a path where no ignore rules are configured at all.
+func (c ShareConfig) ignored(relpath string, isDir bool) bool {
+	return c.Ignore != nil && c.Ignore(relpath, isDir)
 }
 
 // Session drives sync for one already-authenticated peer connection:
@@ -508,32 +527,57 @@ func (s *Session) answerSyncRequest(ctx context.Context, req protocol.IndexSyncR
 	if err != nil {
 		return err
 	}
+	// An unknown share yields the zero ShareConfig, whose Ignore is nil,
+	// so this answers unfiltered exactly as it did before.
+	cfg, _ := s.getShare(req.ShareID)
+
 	if req.Epoch == epoch && (oldest == 0 || req.AppliedSeq+1 >= oldest) {
 		rows, err := s.store.JournalSince(ctx, req.ShareID, epoch, req.AppliedSeq, 100000)
 		if err != nil {
 			return err
 		}
-		for len(rows) > 0 {
-			n := deltaBatchLen(req.ShareID, epoch, rows)
-			if n == 0 {
-				return fmt.Errorf("sync: journal entry %s cannot fit in a frame", rows[0].Row.RelPath)
+		if journalHasIgnored(cfg, rows) {
+			// A delta batch cannot simply omit an entry: the receiver
+			// requires the entries to be contiguous from FromSeq (see
+			// readLoop) and Store.ApplyPeerDelta additionally requires
+			// FromSeq == cursor+1 and len(rows) == ToSeq-FromSeq+1. Drop
+			// one and the peer rejects the batch and resyncs, forever.
+			//
+			// So fall through to a full snapshot, which carries no
+			// per-entry sequence contract and re-anchors the peer's
+			// cursor at HighSeq. This is reachable only for a path that
+			// was journalled while still syncing and has since become
+			// ignored, with a peer whose cursor predates that entry —
+			// and the snapshot moves that peer past it for good.
+			s.debugf("share %s: journal range holds a now-ignored path; answering with a full snapshot", req.ShareID)
+		} else {
+			for len(rows) > 0 {
+				n := deltaBatchLen(req.ShareID, epoch, rows)
+				if n == 0 {
+					return fmt.Errorf("sync: journal entry %s cannot fit in a frame", rows[0].Row.RelPath)
+				}
+				entries := make([]protocol.IndexDeltaEntry, n)
+				for i := range entries {
+					entries[i] = protocol.IndexDeltaEntry{Seq: rows[i].Seq, File: rows[i].Row.Info()}
+				}
+				m := protocol.IndexDeltaBatch{ShareID: req.ShareID, Epoch: epoch, FromSeq: entries[0].Seq, ToSeq: entries[n-1].Seq, Entries: entries}
+				if err = s.writer.WriteMessage(protocol.MsgIndexDeltaBatch, m); err != nil {
+					return err
+				}
+				rows = rows[n:]
 			}
-			entries := make([]protocol.IndexDeltaEntry, n)
-			for i := range entries {
-				entries[i] = protocol.IndexDeltaEntry{Seq: rows[i].Seq, File: rows[i].Row.Info()}
-			}
-			m := protocol.IndexDeltaBatch{ShareID: req.ShareID, Epoch: epoch, FromSeq: entries[0].Seq, ToSeq: entries[n-1].Seq, Entries: entries}
-			if err = s.writer.WriteMessage(protocol.MsgIndexDeltaBatch, m); err != nil {
-				return err
-			}
-			rows = rows[n:]
+			return nil
 		}
-		return nil
 	}
 	rows, err := s.store.ListShare(ctx, req.ShareID, true)
 	if err != nil {
 		return err
 	}
+	// Ignored rows are parked, and ListShare already excludes those, so
+	// this is normally a no-op — but a rule added since the last rescan
+	// has not been applied to the index yet, and a snapshot must never
+	// advertise a path this node will refuse to serve.
+	rows = filterIgnoredRows(cfg, rows)
 	id := newSnapshotID()
 	if err = s.writer.WriteMessage(protocol.MsgIndexSnapshotBegin, protocol.IndexSnapshotBegin{ShareID: req.ShareID, SnapshotID: id, Epoch: epoch, HighSeq: high}); err != nil {
 		return err
@@ -556,6 +600,41 @@ func (s *Session) answerSyncRequest(ctx context.Context, req protocol.IndexSyncR
 	}
 	return s.writer.WriteMessage(protocol.MsgIndexSnapshotEnd, protocol.IndexSnapshotEnd{ShareID: req.ShareID, SnapshotID: id, BatchCount: batch})
 }
+
+// journalHasIgnored reports whether any journal entry in rows names a path
+// this share now ignores. Such entries are historical: they were written
+// while the path was still syncing, and survive in change_journal after
+// the file row itself was dropped, because dropping an ignored row is
+// deliberately not journalled (see index.Store.ApplyScanResult).
+func journalHasIgnored(cfg ShareConfig, rows []index.JournalRow) bool {
+	if cfg.Ignore == nil {
+		return false
+	}
+	for _, r := range rows {
+		if cfg.ignored(r.Row.RelPath, r.Row.Type == protocol.FileTypeDir) {
+			return true
+		}
+	}
+	return false
+}
+
+// filterIgnoredRows drops rows for paths this share ignores. It returns
+// rows unchanged when the share has no ignore rules, which is the common
+// case and the one worth not allocating for.
+func filterIgnoredRows(cfg ShareConfig, rows []index.FileRow) []index.FileRow {
+	if cfg.Ignore == nil {
+		return rows
+	}
+	out := make([]index.FileRow, 0, len(rows))
+	for _, r := range rows {
+		if cfg.ignored(r.RelPath, r.Type == protocol.FileTypeDir) {
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
 func snapshotBatchLen(share, id string, b uint64, rows []index.FileRow) int {
 	files := make([]protocol.FileInfo, 0)
 	for i, r := range rows {
@@ -580,6 +659,12 @@ func deltaBatchLen(share, epoch string, rows []index.JournalRow) int {
 }
 
 func (s *Session) sendIndexUpdate(shareID string, rows []index.FileRow, full bool) error {
+	// This is the single funnel for MsgIndexUpdate, so the "never
+	// advertise an ignored path" guarantee belongs here even though the
+	// rows reaching it are already filtered upstream.
+	cfg, _ := s.getShare(shareID)
+	rows = filterIgnoredRows(cfg, rows)
+
 	files := make([]protocol.FileInfo, len(rows))
 	for i, r := range rows {
 		files[i] = r.Info()
@@ -796,7 +881,7 @@ func (s *Session) reconcilePeerShare(ctx context.Context, shareID string) {
 	if err != nil {
 		return
 	}
-	actions := Reconcile(rowsToInfos(local), rowsToInfos(rows), s.nodeID, cfg.Direction, s.clock)
+	actions := Reconcile(rowsToInfos(local), rowsToInfos(rows), s.nodeID, cfg.Direction, s.clock, cfg.Ignore)
 	sem := make(chan struct{}, maxConcurrentPulls)
 	var wg sync.WaitGroup
 	var changed atomic.Bool
@@ -910,7 +995,7 @@ func (s *Session) reconcileLocked(ctx context.Context, cfg ShareConfig, why stri
 		return
 	}
 
-	actions := Reconcile(rowsToInfos(localRows), rowsToInfos(remoteRows), s.nodeID, cfg.Direction, s.clock)
+	actions := Reconcile(rowsToInfos(localRows), rowsToInfos(remoteRows), s.nodeID, cfg.Direction, s.clock, cfg.Ignore)
 
 	var mu sync.Mutex
 	var changed []index.FileRow

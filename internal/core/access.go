@@ -56,7 +56,7 @@ func (n *Node) provisionShareForRequest(pc *peerConn, sess *syncsvc.Session, sha
 	// need to reconcile with this function's "must run synchronously"
 	// requirement above, since an approval decision can't be synchronous
 	// with an inbound frame that arrived before a human ever acts on it.
-	sess.AddShare(syncsvc.ShareConfig{ShareID: shareID, Root: share.Path, Direction: syncsvc.DirectionFor(share.Permission, "")})
+	sess.AddShare(syncsvc.ShareConfig{ShareID: shareID, Root: share.Path, Direction: syncsvc.DirectionFor(share.Permission, ""), Ignore: n.shareIgnoreFunc(shareID)})
 	pc.markShareActive(shareID)
 	return share, true
 }
@@ -107,7 +107,7 @@ func (n *Node) provisionAccessUpdate(pc *peerConn, sess *syncsvc.Session, msg pr
 			return false
 		}
 		direction := syncsvc.DirectionFor("", subCopy.Mode)
-		sess.AddShare(syncsvc.ShareConfig{ShareID: msg.ShareID, Root: subCopy.LocalPath, Direction: direction})
+		sess.AddShare(syncsvc.ShareConfig{ShareID: msg.ShareID, Root: subCopy.LocalPath, Direction: direction, Ignore: n.shareIgnoreFunc(msg.ShareID)})
 		pc.markShareActive(msg.ShareID)
 		return true
 

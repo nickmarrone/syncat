@@ -153,6 +153,14 @@ var pipeAddrCounter int64
 // both Sessions' read loops. Both are closed via t.Cleanup.
 func connectSessions(t *testing.T, a, b *testNode, dirA, dirB Direction) (sa, sb *Session) {
 	t.Helper()
+	return connectSessionsWithIgnore(t, a, b, dirA, dirB, nil, nil)
+}
+
+// connectSessionsWithIgnore is connectSessions plus a per-side ignore
+// predicate, standing in for each node's own .syncatignore (which is never
+// synced, so the two sides genuinely can differ).
+func connectSessionsWithIgnore(t *testing.T, a, b *testNode, dirA, dirB Direction, ignoreA, ignoreB func(string, bool) bool) (sa, sb *Session) {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
@@ -166,7 +174,7 @@ func connectSessions(t *testing.T, a, b *testNode, dirA, dirB Direction) (sa, sb
 	ready := make(chan struct{})
 	if err := tr.Start(ctx, func(conn net.Conn) {
 		sess1 = NewSession(conn, a.store, a.id, b.id, nil, logger)
-		sess1.AddShare(ShareConfig{ShareID: testShareID, Root: a.root, Direction: dirA})
+		sess1.AddShare(ShareConfig{ShareID: testShareID, Root: a.root, Direction: dirA, Ignore: ignoreA})
 		sess1.Start(ctx)
 		close(ready)
 	}); err != nil {
@@ -178,7 +186,7 @@ func connectSessions(t *testing.T, a, b *testNode, dirA, dirB Direction) (sa, sb
 		t.Fatalf("dial: %v", err)
 	}
 	sess2 := NewSession(conn, b.store, b.id, a.id, nil, logger)
-	sess2.AddShare(ShareConfig{ShareID: testShareID, Root: b.root, Direction: dirB})
+	sess2.AddShare(ShareConfig{ShareID: testShareID, Root: b.root, Direction: dirB, Ignore: ignoreB})
 	sess2.Start(ctx)
 
 	<-ready
@@ -936,4 +944,235 @@ func TestReconcileShareRecoversAfterAFailedPull(t *testing.T) {
 	}
 
 	waitForFile(t, 10*time.Second, b.store, testShareID, b.root, "big.bin", "the payload")
+}
+
+// --- .syncatignore (SPEC.md §5) ---------------------------------------
+
+// ignoreMatching builds an ignore predicate matching exactly the given
+// share-relative paths, standing in for a compiled .syncatignore.
+func ignoreMatching(paths ...string) func(string, bool) bool {
+	set := make(map[string]bool, len(paths))
+	for _, p := range paths {
+		set[p] = true
+	}
+	return func(relpath string, _ bool) bool { return set[relpath] }
+}
+
+// TestIntegration_IgnoredFileIsNeitherSentNorRequested is the headline
+// bidirectional case: a file A ignores never reaches B, while a
+// non-ignored sibling does — the sibling being what stops this test from
+// passing trivially if sync were broken outright.
+func TestIntegration_IgnoredFileIsNeitherSentNorRequested(t *testing.T) {
+	a := newTestNode(t, "aaaaaaaaaaaaaaaa")
+	b := newTestNode(t, "bbbbbbbbbbbbbbbb")
+
+	// A has both files indexed — the ignore rule arrived after they were
+	// scanned, which is exactly when the wire-level filters have to work.
+	writeFile(t, a.root, "secret.log", "do not share")
+	indexFile(t, a.store, a.id, "secret.log", a.root)
+	writeFile(t, a.root, "notes.txt", "please share")
+	indexFile(t, a.store, a.id, "notes.txt", a.root)
+
+	sa, sb := connectSessionsWithIgnore(t, a, b, Direction{}, Direction{},
+		ignoreMatching("secret.log"), nil)
+	mustSync(t, sa, testShareID)
+	mustSync(t, sb, testShareID)
+
+	// The positive control: the sibling must actually replicate.
+	waitForFile(t, integrationWaitTimeout, b.store, testShareID, b.root, "notes.txt", "please share")
+
+	if _, err := os.Stat(filepath.Join(b.root, "secret.log")); !os.IsNotExist(err) {
+		t.Errorf("ignored file reached the peer's disk (stat err = %v)", err)
+	}
+	if _, err := b.store.GetFile(context.Background(), testShareID, "secret.log"); err == nil {
+		t.Error("ignored file was advertised into the peer's index")
+	}
+}
+
+// TestIntegration_IgnoredRemoteFileIsNotPulled is the receive side, and
+// the flap loop: B ignores a path that A is legitimately sharing, so B
+// must never fetch it — not on the first sync, and not on a second one.
+func TestIntegration_IgnoredRemoteFileIsNotPulled(t *testing.T) {
+	a := newTestNode(t, "aaaaaaaaaaaaaaaa")
+	b := newTestNode(t, "bbbbbbbbbbbbbbbb")
+
+	writeFile(t, a.root, "build/out.o", "artifact")
+	indexFile(t, a.store, a.id, "build/out.o", a.root)
+	writeFile(t, a.root, "notes.txt", "real content")
+	indexFile(t, a.store, a.id, "notes.txt", a.root)
+
+	sa, sb := connectSessionsWithIgnore(t, a, b, Direction{}, Direction{},
+		nil, ignoreMatching("build/out.o"))
+	mustSync(t, sa, testShareID)
+	mustSync(t, sb, testShareID)
+
+	waitForFile(t, integrationWaitTimeout, b.store, testShareID, b.root, "notes.txt", "real content")
+
+	// A second sync is the flap check: if the first pass had pulled and
+	// indexed the ignored path, the second would keep churning on it.
+	mustSync(t, sb, testShareID)
+	waitFor(t, time.Second, func() bool { return true })
+
+	if _, err := os.Stat(filepath.Join(b.root, "build/out.o")); !os.IsNotExist(err) {
+		t.Errorf("ignored remote file was pulled to disk (stat err = %v)", err)
+	}
+	// A's copy must be untouched — the flap loop's final act was to
+	// propagate a tombstone back and delete it here.
+	if data, err := os.ReadFile(filepath.Join(a.root, "build/out.o")); err != nil || string(data) != "artifact" {
+		t.Errorf("the sharing node's own copy was disturbed: data=%q err=%v", data, err)
+	}
+}
+
+// TestIntegration_IgnoredPathIsNotServedToPeer pins the handleFileRequest
+// backstop: even a peer that already knows the path (it learned it before
+// the rule existed) cannot fetch its bytes.
+func TestIntegration_IgnoredPathIsNotServedToPeer(t *testing.T) {
+	a := newTestNode(t, "aaaaaaaaaaaaaaaa")
+	b := newTestNode(t, "bbbbbbbbbbbbbbbb")
+
+	writeFile(t, a.root, "secret.txt", "classified")
+	row := indexFile(t, a.store, a.id, "secret.txt", a.root)
+
+	// Plant the row in B's view of A, as a pre-rule sync would have.
+	if err := b.store.UpsertPeerFiles(context.Background(), a.id, []index.FileRow{row}); err != nil {
+		t.Fatalf("seed peer_files: %v", err)
+	}
+
+	_, sb := connectSessionsWithIgnore(t, a, b, Direction{}, Direction{},
+		ignoreMatching("secret.txt"), nil)
+	mustSync(t, sb, testShareID)
+
+	// B believes the file exists and will request it; A must refuse. Hold
+	// the assertion long enough for a successful transfer to have landed.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(filepath.Join(b.root, "secret.txt")); !os.IsNotExist(err) {
+			t.Fatalf("an ignored file was served to a peer that asked for it (stat err = %v)", err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// TestIntegration_NewlyIgnoredFileSurvivesOnPeer is the regression that
+// protects user data: once a file has synced, adding an ignore rule for it
+// on A must leave B's copy exactly where it is. Ignoring is not deleting.
+func TestIntegration_NewlyIgnoredFileSurvivesOnPeer(t *testing.T) {
+	a := newTestNode(t, "aaaaaaaaaaaaaaaa")
+	b := newTestNode(t, "bbbbbbbbbbbbbbbb")
+
+	writeFile(t, a.root, "shared.txt", "both have this")
+	indexFile(t, a.store, a.id, "shared.txt", a.root)
+
+	sa, sb := connectSessions(t, a, b, Direction{}, Direction{})
+	mustSync(t, sa, testShareID)
+	waitForFile(t, integrationWaitTimeout, b.store, testShareID, b.root, "shared.txt", "both have this")
+
+	// A now ignores it. The index row goes away WITHOUT a tombstone,
+	// which is what index.Store.ApplyScanResult's Ignored bucket does.
+	if err := a.store.ApplyScanResult(context.Background(), &index.ScanResult{
+		ShareID: testShareID,
+		Ignored: []index.FileRow{{ShareID: testShareID, RelPath: "shared.txt"}},
+	}); err != nil {
+		t.Fatalf("apply ignored: %v", err)
+	}
+
+	sa.AddShare(ShareConfig{ShareID: testShareID, Root: a.root, Direction: Direction{},
+		Ignore: ignoreMatching("shared.txt")})
+	mustSync(t, sa, testShareID)
+	mustSync(t, sb, testShareID)
+
+	// Hold: assert the file is still there after sync has had time to act.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(filepath.Join(b.root, "shared.txt")); err != nil {
+			t.Fatalf("peer's copy of a newly-ignored file was deleted: %v", err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// TestIntegration_DeltaFallsBackToSnapshotWhenJournalHoldsIgnoredPath pins
+// the one place ignoring interacts with the journal. change_journal keeps
+// the entry written while a path was still syncing, and a delta batch
+// cannot omit it (the receiver enforces contiguous sequence numbers, and
+// Store.ApplyPeerDelta re-checks the range), so answerSyncRequest must
+// answer with a full snapshot instead. Getting this wrong leaves the peer
+// rejecting every batch and resyncing forever.
+//
+// Reaching the delta path at all takes a first completed exchange: A only
+// sends deltas once its *outgoing* cursor for this peer holds the current
+// epoch, which happens when B acks a snapshot.
+func TestIntegration_DeltaFallsBackToSnapshotWhenJournalHoldsIgnoredPath(t *testing.T) {
+	a := newTestNode(t, "aaaaaaaaaaaaaaaa")
+	b := newTestNode(t, "bbbbbbbbbbbbbbbb")
+	ctx := context.Background()
+
+	writeFile(t, a.root, "notes.txt", "keep me")
+	indexFile(t, a.store, a.id, "notes.txt", a.root)
+
+	sa, _ := connectSessions(t, a, b, Direction{}, Direction{})
+	mustSync(t, sa, testShareID)
+	waitForFile(t, integrationWaitTimeout, b.store, testShareID, b.root, "notes.txt", "keep me")
+
+	// Wait for B's ack to advance A's outgoing cursor onto the current
+	// epoch; until it does, the next SyncShare would send a snapshot and
+	// this test would prove nothing.
+	epoch, _, err := a.store.ShareState(ctx, testShareID)
+	if err != nil {
+		t.Fatalf("share state: %v", err)
+	}
+	waitFor(t, integrationWaitTimeout, func() bool {
+		c, err := a.store.Cursor(ctx, b.id, testShareID, "outgoing")
+		return err == nil && c.Epoch == epoch
+	})
+
+	// Journal a new path while it is still syncing normally...
+	writeFile(t, a.root, "stale.log", "journalled before the rule existed")
+	indexFile(t, a.store, a.id, "stale.log", a.root)
+
+	// ...then start ignoring it, leaving its journal entry ahead of B's
+	// cursor. This is the exact state the fallback exists for.
+	sa.AddShare(ShareConfig{ShareID: testShareID, Root: a.root, Direction: Direction{},
+		Ignore: ignoreMatching("stale.log")})
+
+	writeFile(t, a.root, "second.txt", "after the rule")
+	indexFile(t, a.store, a.id, "second.txt", a.root)
+
+	mustSync(t, sa, testShareID)
+
+	// Convergence on a file journalled *after* the rule proves the
+	// exchange completed rather than dead-ending in a resync loop.
+	waitForFile(t, integrationWaitTimeout, b.store, testShareID, b.root, "second.txt", "after the rule")
+
+	// The assertion that matters is on what the wire actually carried:
+	// B's view of A's index. Checking only B's own files table would pass
+	// even when the delta leaked the path, because the FileRequest
+	// backstop would separately stop the download.
+	peerRows, err := b.store.ListPeerFiles(ctx, a.id, testShareID)
+	if err != nil {
+		t.Fatalf("list peer files: %v", err)
+	}
+	for _, r := range peerRows {
+		if r.RelPath == "stale.log" {
+			t.Error("a now-ignored journal entry was advertised to the peer")
+		}
+	}
+	if _, err := b.store.GetFile(ctx, testShareID, "stale.log"); err == nil {
+		t.Error("a now-ignored path was indexed by the peer")
+	}
+	if _, err := os.Stat(filepath.Join(b.root, "stale.log")); !os.IsNotExist(err) {
+		t.Errorf("a now-ignored path reached the peer's disk (stat err = %v)", err)
+	}
+
+	// The fallback must fire once, not on every sync forever. The snapshot
+	// re-anchors this peer's cursor at HighSeq, past the stale journal
+	// entry, so the next exchange is a delta again.
+	_, high, err := a.store.ShareState(ctx, testShareID)
+	if err != nil {
+		t.Fatalf("share state: %v", err)
+	}
+	waitFor(t, integrationWaitTimeout, func() bool {
+		c, err := a.store.Cursor(ctx, b.id, testShareID, "outgoing")
+		return err == nil && c.AppliedSeq == high
+	})
 }
