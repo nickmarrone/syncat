@@ -1,15 +1,18 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -22,14 +25,33 @@ import (
 	"github.com/nickmarrone/syncat/internal/transport"
 )
 
-// cmdInit implements `syncat init [--name NAME]`. It is idempotent: running
-// it again never regenerates existing keys, the api token, or an existing
-// config.json's node name.
+// cmdInit implements `syncat init [--name NAME] [--reset [--yes]]`.
+//
+// Without --reset it is idempotent: running it again never regenerates
+// existing keys, the api token, or an existing config.json's node name.
+// With --reset it first deletes every file this node owns (see
+// resetTargets) and then runs that same path over a clean slate, so the
+// node comes back with a new identity — and --name means something again,
+// since the config it would otherwise defer to is gone.
 func cmdInit(paths *config.Paths, args []string) error {
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
 	name := fs.String("name", "", "display name for this node (default: hostname)")
+	reset := fs.Bool("reset", false, "delete this node's config, keys, index and trash, then re-initialize from scratch")
+	yes := fs.Bool("yes", false, "skip the --reset confirmation prompt (for scripts)")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *yes && !*reset {
+		return errors.New("--yes only applies to `syncat init --reset`")
+	}
+
+	if *reset {
+		if !*yes && !stdinIsTerminal() {
+			return errors.New("`init --reset` needs a terminal to confirm on; pass --yes to skip the prompt")
+		}
+		if err := resetState(paths, os.Stdin, os.Stdout, *yes); err != nil {
+			return err
+		}
 	}
 
 	if err := paths.EnsureDirs(); err != nil {
@@ -90,6 +112,175 @@ func cmdInit(paths *config.Paths, args []string) error {
 	fmt.Println()
 	fmt.Println("run `syncat token` to print this node's connection token.")
 	return nil
+}
+
+// --- init --reset ------------------------------------------------------
+
+// resetConfirmWord is what the user has to type at the --reset prompt.
+// Case-sensitive and not a word anyone types by reflex, unlike "y".
+const resetConfirmWord = "RESET"
+
+// resetState performs `init --reset`'s destructive half: refuse if a
+// daemon is live, show what goes and what stays, take the confirmation,
+// then delete. cmdInit's ordinary path runs afterwards and rebuilds
+// everything from nothing.
+//
+// in and out are parameters rather than os.Stdin/os.Stdout so the prompt
+// is testable; cmdInit passes the real ones.
+func resetState(paths *config.Paths, in io.Reader, out io.Writer, assumeYes bool) error {
+	if addr, running := daemonRunning(paths); running {
+		return fmt.Errorf("something is listening on %s — stop the syncat daemon before running `init --reset`", addr)
+	}
+
+	// Best-effort: a reset has to work when config.json is corrupt or
+	// missing, which is one of the reasons to run it. A nil cfg just
+	// means we can't name the directories being left alone.
+	cfg, err := config.Load(paths.ConfigFile())
+	if err != nil {
+		cfg = nil
+	}
+
+	targets := resetTargets(paths)
+	kept := keptPaths(cfg)
+
+	if !assumeYes {
+		if err := confirmReset(in, out, targets, kept); err != nil {
+			return err
+		}
+	}
+
+	return removeState(targets)
+}
+
+// resetTargets lists every path `init --reset` deletes, in deletion
+// order. This is an explicit list rather than a RemoveAll of ConfigDir
+// and DataDir because --config/--data point wherever the user says, and
+// blowing away a directory we were merely handed is a different and much
+// worse operation than deleting the files we wrote into it.
+//
+// The three directories go whole: that is what takes index.db's -wal and
+// -shm sidecars and the per-share trash subtrees without enumerating
+// them. The .tmp-* glob covers writeFileAtomic's leftovers from a crashed
+// write, since the config dir is the one we don't remove outright.
+func resetTargets(p *config.Paths) []string {
+	targets := []string{
+		p.ConfigFile(),
+		p.APITokenFile(),
+		p.KeysDir(),
+		p.DBDir(),
+		p.TrashDir(),
+	}
+	// Glob errors only on a malformed pattern, and this one is a literal.
+	tmps, _ := filepath.Glob(filepath.Join(p.ConfigDir, ".tmp-*"))
+	sort.Strings(tmps)
+	return append(targets, tmps...)
+}
+
+// keptPaths lists the directories holding actual files — this node's
+// shares and its subscriptions' local copies — none of which a reset
+// touches. It exists so the prompt can name them instead of just
+// promising they are safe. Callers must build this before deleting
+// config.json, which is the only record of where they are.
+func keptPaths(cfg *config.Config) []string {
+	if cfg == nil {
+		return nil
+	}
+	var kept []string
+	for _, sh := range cfg.Shares {
+		kept = append(kept, sh.Path)
+	}
+	for _, sub := range cfg.Subscriptions {
+		kept = append(kept, sub.LocalPath)
+	}
+	sort.Strings(kept)
+	return kept
+}
+
+// confirmReset prints what is about to happen and requires the user to
+// type resetConfirmWord. Any other input — including EOF — is an error,
+// so a caller that ignores nothing deletes nothing.
+func confirmReset(in io.Reader, out io.Writer, targets, kept []string) error {
+	fmt.Fprintln(out, "This will PERMANENTLY delete:")
+	for _, t := range targets {
+		fmt.Fprintf(out, "  %s\n", t)
+	}
+	fmt.Fprintln(out)
+	if len(kept) > 0 {
+		fmt.Fprintln(out, "Your files are left in place:")
+		for _, k := range kept {
+			fmt.Fprintf(out, "  %s\n", k)
+		}
+	} else {
+		fmt.Fprintln(out, "No share or subscription directory is touched.")
+	}
+	fmt.Fprintln(out)
+	fmt.Fprintln(out, "This node gets a new identity key, so its token changes and every")
+	fmt.Fprintln(out, "peer will have to add it again. The old identity cannot be recovered.")
+	fmt.Fprintln(out)
+	fmt.Fprintf(out, "Type %s to confirm: ", resetConfirmWord)
+
+	line, err := bufio.NewReader(in).ReadString('\n')
+	// A final line with no newline is still an answer, so only treat EOF
+	// as fatal when it arrives with nothing before it.
+	if err != nil && !(errors.Is(err, io.EOF) && line != "") {
+		return errors.New("reset aborted, nothing was deleted")
+	}
+	if strings.TrimSpace(line) != resetConfirmWord {
+		return errors.New("reset aborted, nothing was deleted")
+	}
+	return nil
+}
+
+// removeState deletes every target. A path that is already gone is not an
+// error: reset's job is to end with them absent, not to have removed them.
+func removeState(targets []string) error {
+	for _, t := range targets {
+		if err := os.RemoveAll(t); err != nil {
+			return fmt.Errorf("reset: remove %s: %w", t, err)
+		}
+	}
+	return nil
+}
+
+// stdinIsTerminal reports whether stdin is a character device, i.e. that
+// there is a person on the other end to answer the prompt. Without this a
+// redirect (`init --reset < /dev/null`) would read EOF, and a reset that
+// nobody confirmed is exactly what the prompt exists to prevent — so a
+// non-interactive stdin has to say --yes and mean it.
+func stdinIsTerminal() bool {
+	info, err := os.Stdin.Stat()
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeCharDevice != 0
+}
+
+// daemonRunning reports whether anything answers on this node's API
+// address, which is the closest thing to a liveness check syncat has —
+// the daemon writes no pid file and takes no lock, so the bound port is
+// the only trace it leaves (README: "writes no PID file").
+//
+// It dials rather than calling GET /api/status through newAPIClient
+// because that needs both a parseable config.json and a valid api.token,
+// and repairing exactly those is a reason to reset. The cost is that an
+// unrelated process on the port reads as a live daemon; the error names
+// the address so that is at least diagnosable.
+//
+// The check matters because unlinking index.db under a running daemon
+// fails silently rather than loudly: POSIX lets the daemon keep writing
+// to the now-nameless inode while its config and keys are replaced
+// underneath it.
+func daemonRunning(paths *config.Paths) (string, bool) {
+	addr := config.DefaultAPIAddr
+	if cfg, err := config.Load(paths.ConfigFile()); err == nil && cfg.APIAddr != "" {
+		addr = cfg.APIAddr
+	}
+	conn, err := net.DialTimeout("tcp", addr, time.Second)
+	if err != nil {
+		return addr, false
+	}
+	conn.Close()
+	return addr, true
 }
 
 // cmdToken implements `syncat token`. It derives the tailcat ConnBlob from

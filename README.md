@@ -75,6 +75,56 @@ Write a file under `~/Documents` on alice's side and it appears under
 `~/docs-from-alice` on bob's — and, since the share is `read-write` and the
 subscription is `mirror`, changes flow the other way too.
 
+### Starting a node over
+
+`syncat init` is idempotent — run it twice and the second run regenerates
+nothing. When you actually want the opposite, `--reset` deletes this node's
+entire local state and re-initializes from scratch:
+
+```console
+$ syncat init --reset --name my-laptop
+This will PERMANENTLY delete:
+  /home/u/.config/syncat/config.json
+  /home/u/.config/syncat/api.token
+  /home/u/.local/share/syncat/keys
+  /home/u/.local/share/syncat/db
+  /home/u/.local/share/syncat/trash
+
+Your files are left in place:
+  /home/u/Documents
+
+This node gets a new identity key, so its token changes and every
+peer will have to add it again. The old identity cannot be recovered.
+
+Type RESET to confirm:
+```
+
+That is the whole list — the identity and tailcat keys, the API token,
+`config.json` (so peers, shares and subscriptions go with it), the SQLite
+index, and the trash can. Nothing outside those paths is touched: every
+share directory and every subscription's local copy is left exactly as it
+is, which is why the prompt names them back to you rather than just
+promising it.
+
+Two consequences worth being sure about before you type `RESET`:
+
+- **The node's identity changes.** `identity.key` is what a peer knows you
+  by, so a reset makes this a different node as far as every peer is
+  concerned. You need a fresh `syncat token` and each peer has to
+  `peer add` it again; removing the stale entry on their side is on them.
+- **The trash can goes with it.** `~/.local/share/syncat/trash/` holds the
+  bytes of files deleted from your shares, and those copies are the only
+  ones left. Restore anything you still want (`syncat trash restore`)
+  before resetting.
+
+Stop the daemon first — `init --reset` refuses to run while anything is
+listening on the node's `api_addr`, because deleting `index.db` out from
+under a live daemon corrupts its state silently rather than loudly.
+
+Pass `--yes` to skip the prompt in a script. Without it the reset needs a
+terminal to ask on and fails rather than reading a redirect, so
+`init --reset < /dev/null` can't quietly destroy a node.
+
 ## Running as a systemd service
 
 `syncat daemon` is a plain foreground process: it logs to stderr, never forks,

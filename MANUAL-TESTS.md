@@ -56,6 +56,35 @@ way to exercise the DERP relay path rather than a direct LAN hop.
       running fails with a clear "is the daemon running?" style message,
       not a raw connection-refused stack.
 
+## 1b. `syncat init --reset`
+
+Do this on a throwaway node (`--config`/`--data` overrides), with a share
+holding a file you can look for afterwards, and note `syncat token`'s short
+id first so you can tell the identity actually rotated.
+
+- [ ] `init --reset` with the daemon **running** refuses, and the message
+      names the address it found something on.
+- [ ] With the daemon stopped, the prompt lists all five paths it will
+      delete *and* names the share and subscription directories it will not.
+- [ ] Typing `reset`, `yes`, or just Enter aborts. Confirm afterwards that
+      `config.json` and the keys are still there — nothing partial.
+- [ ] Typing `RESET` goes through. `config.json`, `api.token`, `keys/`,
+      `db/`, and `trash/` are gone and immediately rebuilt; the three
+      directories are back at mode `0700` and empty of old state.
+- [ ] `syncat token` prints a **different** short id than the one you noted.
+- [ ] The share directory still has its files, byte for byte.
+- [ ] `--name` takes effect on a reset (it is ignored on a plain re-`init`),
+      and falls back to the hostname when omitted.
+- [ ] `echo | syncat init --reset` fails on the non-terminal stdin instead
+      of reading EOF and doing anything.
+- [ ] `init --reset --yes` runs unattended with no prompt.
+- [ ] `init --yes` without `--reset` is rejected.
+- [ ] Reset a node that a peer was connected to, then re-pair from scratch.
+      The peer's stale entry for the old identity is inert, and re-adding
+      the new token works with no leftover state on either side.
+- [ ] Corrupt `config.json` (write garbage into it), then `init --reset`.
+      It still works — the prompt just can't name the kept directories.
+
 ## 2. Pairing two nodes
 
 - [automated] Exchanging tokens on both sides reaches `state=connected` on

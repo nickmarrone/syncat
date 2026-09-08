@@ -20,7 +20,7 @@ type command struct {
 }
 
 var commands = []command{
-	{name: "init", usage: "syncat init [--name NAME]", summary: "generate keys and config for a new node", run: cmdInit},
+	{name: "init", usage: "syncat init [--name NAME] [--reset [--yes]]", summary: "generate keys and config for a new node", run: cmdInit},
 	{name: "daemon", usage: "syncat daemon [--api ADDR]", summary: "run the syncat daemon", run: cmdDaemon},
 	{name: "token", usage: "syncat token", summary: "print this node's connection token", run: cmdToken},
 	{name: "peer", usage: "syncat peer add TOKEN [--name N] | ls | rm ID | approve ID", summary: "manage peers (ID: name, key, or key prefix)", run: cmdPeer},
