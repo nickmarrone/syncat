@@ -635,25 +635,67 @@ func filterIgnoredRows(cfg ShareConfig, rows []index.FileRow) []index.FileRow {
 	return out
 }
 
+// batchArrayHeaderSlack covers the one part of a batch envelope that grows
+// with the number of entries in it: CBOR writes an array header of 1 byte
+// for up to 23 elements, 2 up to 255, 3 up to 65535 and 5 beyond, while
+// the envelope below is measured with an empty array (1 byte). Four bytes
+// is therefore the exact worst case; eight leaves room and costs at most
+// one entry at a frame boundary.
+const batchArrayHeaderSlack = 8
+
+// snapshotBatchLen reports how many of rows fit in one IndexSnapshotBatch
+// frame, and 0 if even the first one does not.
+//
+// It measures the fixed envelope once and then adds each row's own encoded
+// length, because CBOR array elements are self-delimiting values laid down
+// back to back: an entry contributes exactly its own encoding, wherever it
+// sits in the array. The obvious alternative — re-encode the whole growing
+// message after each candidate row and look at the total — is quadratic,
+// and not mildly so. Planning one snapshot of a 20k-file share that way
+// allocated 28 GB and took 77 seconds; the same plan here is one encode
+// per row. Anything that reintroduces a whole-message encode inside this
+// loop reintroduces that.
 func snapshotBatchLen(share, id string, b uint64, rows []index.FileRow) int {
-	files := make([]protocol.FileInfo, 0)
+	envelope, err := protocol.EncodedMessageSize(protocol.MsgIndexSnapshotBatch,
+		protocol.IndexSnapshotBatch{ShareID: share, SnapshotID: id, Batch: b, Files: []protocol.FileInfo{}})
+	if err != nil {
+		return 0
+	}
+	total := envelope + batchArrayHeaderSlack
 	for i, r := range rows {
-		files = append(files, r.Info())
-		n, e := protocol.EncodedMessageSize(protocol.MsgIndexSnapshotBatch, protocol.IndexSnapshotBatch{ShareID: share, SnapshotID: id, Batch: b, Files: files})
-		if e != nil || n > protocol.TargetIndexBatchSize {
+		n, e := protocol.EncodedEntrySize(r.Info())
+		if e != nil || total+n > protocol.TargetIndexBatchSize {
 			return i
 		}
+		total += n
 	}
 	return len(rows)
 }
+
+// deltaBatchLen is snapshotBatchLen for an IndexDeltaBatch. Its envelope is
+// measured with the *last* row's sequence number as ToSeq: sequence numbers
+// ascend, and CBOR's integer width grows with the value, so whatever ToSeq
+// the chosen batch ends on cannot encode wider than that.
 func deltaBatchLen(share, epoch string, rows []index.JournalRow) int {
-	entries := make([]protocol.IndexDeltaEntry, 0)
+	if len(rows) == 0 {
+		return 0
+	}
+	envelope, err := protocol.EncodedMessageSize(protocol.MsgIndexDeltaBatch,
+		protocol.IndexDeltaBatch{
+			ShareID: share, Epoch: epoch,
+			FromSeq: rows[0].Seq, ToSeq: rows[len(rows)-1].Seq,
+			Entries: []protocol.IndexDeltaEntry{},
+		})
+	if err != nil {
+		return 0
+	}
+	total := envelope + batchArrayHeaderSlack
 	for i, r := range rows {
-		entries = append(entries, protocol.IndexDeltaEntry{Seq: r.Seq, File: r.Row.Info()})
-		n, e := protocol.EncodedMessageSize(protocol.MsgIndexDeltaBatch, protocol.IndexDeltaBatch{ShareID: share, Epoch: epoch, FromSeq: entries[0].Seq, ToSeq: r.Seq, Entries: entries})
-		if e != nil || n > protocol.TargetIndexBatchSize {
+		n, e := protocol.EncodedEntrySize(protocol.IndexDeltaEntry{Seq: r.Seq, File: r.Row.Info()})
+		if e != nil || total+n > protocol.TargetIndexBatchSize {
 			return i
 		}
+		total += n
 	}
 	return len(rows)
 }
