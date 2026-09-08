@@ -65,6 +65,15 @@ const state = {
 
 const trashState = { shareId: null, entries: [], error: null };
 
+// Purely presentational state: which disclosures are open. It lives
+// outside `state` because nothing here comes from (or goes back to) the
+// daemon — it only has to survive the 2s poll re-render, which rebuilds
+// the whole view from scratch.
+const ui = {
+  tokenExpanded: false,
+  expandedPeers: new Set(),
+};
+
 // --- API client ------------------------------------------------------------
 
 async function apiFetch(path, opts) {
@@ -319,15 +328,44 @@ function renderNodeCard(status) {
     el('div', { class: 'row' }, [nameInput, saveBtn]),
   ]));
 
-  const copyBtn = el('button', {}, 'Copy');
-  copyBtn.addEventListener('click', () => copyToClipboard(status.node_token, copyBtn));
   card.append(el('div', { class: 'field' }, [
     el('label', {}, "Node token — paste this into a peer's \"Add a peer\" form to connect"),
-    el('div', { class: 'token-box' }, [el('code', {}, status.node_token), copyBtn]),
+    renderTokenBox(status.node_token),
   ]));
 
   card.append(el('p', { class: 'faint' }, 'Short ID ' + status.short_id + ' · uptime ' + formatDuration(status.uptime_seconds)));
   return card;
+}
+
+// The node token is ~90 chars of base32 — long enough that showing it in
+// full used to give the card its own horizontal scrollbar. Collapsed, we
+// show the head of it and an ellipsis; expanded, it wraps over as many
+// lines as it needs. Either way Copy copies the whole thing.
+const TOKEN_PREVIEW_CHARS = 24;
+
+function renderTokenBox(token) {
+  token = token || '';
+  const expanded = ui.tokenExpanded;
+  const truncatable = token.length > TOKEN_PREVIEW_CHARS;
+  const shown = expanded || !truncatable ? token : token.slice(0, TOKEN_PREVIEW_CHARS) + '…';
+
+  const code = el('code', { class: expanded ? 'wrap' : null }, shown);
+
+  const copyBtn = el('button', {}, 'Copy');
+  copyBtn.addEventListener('click', () => copyToClipboard(token, copyBtn));
+
+  const children = [code];
+  if (truncatable) {
+    const toggle = el('button', { class: 'link', 'data-focus-key': 'node-token', 'aria-expanded': expanded ? 'true' : 'false' }, expanded ? 'Hide' : 'Show full');
+    toggle.addEventListener('click', () => {
+      ui.tokenExpanded = !ui.tokenExpanded;
+      render();
+      refocus('button.link', 'node-token');
+    });
+    children.push(toggle);
+  }
+  children.push(copyBtn);
+  return el('div', { class: 'token-box' + (expanded ? ' expanded' : '') }, children);
 }
 
 async function copyToClipboard(value, btn) {
@@ -354,24 +392,175 @@ async function copyToClipboard(value, btn) {
   }, 1500);
 }
 
-function renderPeerCard(peer) {
+function renderAddPeerForm() {
   const card = el('div', { class: 'card' });
-  card.append(el('div', { class: 'row between' }, [
-    el('div', { class: 'stack' }, [
-      el('span', { class: 'title' }, peer.name || peer.remote_name || peer.short_id),
-      el('span', { class: 'faint mono' }, peer.short_id),
-    ]),
+  card.append(el('h2', {}, 'Add a peer'));
+  const tokenInput = el('input', { type: 'text', id: 'peer-token-input', placeholder: 'sc1:...', required: true });
+  const nameInput = el('input', { type: 'text', id: 'peer-name-input', placeholder: '(optional)' });
+  const submitBtn = el('button', { class: 'primary', type: 'submit' }, 'Add peer');
+  const form = el('form', { class: 'inline-form' }, [
+    el('div', { class: 'field grow' }, [el('label', { for: 'peer-token-input' }, "Peer's token"), tokenInput]),
+    el('div', { class: 'field' }, [el('label', { for: 'peer-name-input' }, 'Display name'), nameInput]),
+    submitBtn,
+  ]);
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const token = tokenInput.value.trim();
+    if (!token) return;
+    submitBtn.disabled = true;
+    try {
+      await apiPost('/api/peers', { token: token, name: nameInput.value.trim() });
+      showToast('Peer added');
+      tokenInput.value = '';
+      nameInput.value = '';
+      await pollStatus();
+    } catch (err) {
+      showToast('Failed to add peer: ' + err.message, true);
+    } finally {
+      submitBtn.disabled = false;
+    }
+  });
+  card.append(form);
+  return card;
+}
+
+/** The shares this peer offers us, and the shares of ours they hold
+ * access to — the two sides of the relationship, gathered once so the
+ * collapsed row can count them and the expanded body can list them. */
+function peerRelations(peer, status) {
+  const offered = (status.remote_shares || []).filter((rs) => rs.peer_key === peer.peer_key);
+  const subs = (status.subscriptions || []).filter((sub) => sub.peer_key === peer.peer_key);
+  const usingOurs = [];
+  for (const share of status.shares || []) {
+    for (const a of share.access || []) {
+      if (a.peer_key === peer.peer_key) usingOurs.push({ share: share, access: a.access });
+    }
+  }
+  return { offered: offered, subs: subs, usingOurs: usingOurs };
+}
+
+/** render() replaces the whole view, so a disclosure control that just
+ * got clicked loses focus with it. Re-find its replacement by a
+ * data-attribute we set ourselves (never interpolating peer data into a
+ * selector) and hand focus back, so keyboard use survives the rebuild. */
+function refocus(selector, key) {
+  const nodes = document.querySelectorAll(selector);
+  for (const node of nodes) {
+    if (node.dataset.focusKey === key) {
+      node.focus();
+      return;
+    }
+  }
+}
+
+function plural(n, word) {
+  return n + ' ' + word + (n === 1 ? '' : 's');
+}
+
+/** One peer as a single row that expands in place. Collapsed it is a
+ * name, a short id, a one-line summary and a connection badge; expanded
+ * it adds the full key, the shares in both directions, and Remove. */
+function renderPeerRow(peer, status) {
+  const rel = peerRelations(peer, status);
+  const expanded = ui.expandedPeers.has(peer.id);
+
+  const summaryBits = [];
+  if (rel.offered.length > 0) summaryBits.push(plural(rel.offered.length, 'share') + ' offered');
+  if (rel.subs.length > 0) summaryBits.push(plural(rel.subs.length, 'subscription'));
+  if (rel.usingOurs.length > 0) summaryBits.push(plural(rel.usingOurs.length, 'share') + ' of ours');
+
+  const summary = el('button', { class: 'peer-summary', type: 'button', 'data-focus-key': peer.id, 'aria-expanded': expanded ? 'true' : 'false' }, [
+    el('span', { class: 'chevron', 'aria-hidden': 'true' }, expanded ? '▾' : '▸'),
+    el('span', { class: 'peer-name' }, peer.name || peer.remote_name || peer.short_id),
+    el('span', { class: 'faint mono peer-id' }, peer.short_id),
+    el('span', { class: 'faint peer-meta' }, summaryBits.join(' · ')),
     stateBadge(peer.state),
-  ]));
+  ]);
+  summary.addEventListener('click', () => {
+    if (expanded) ui.expandedPeers.delete(peer.id);
+    else ui.expandedPeers.add(peer.id);
+    render();
+    refocus('.peer-summary', peer.id);
+  });
+
+  const row = el('div', { class: 'card peer-row' + (expanded ? ' expanded' : '') }, summary);
+  if (!expanded) {
+    if (peer.last_error) row.append(el('p', { class: 'faint peer-error' }, 'Last error: ' + peer.last_error));
+    return row;
+  }
+  row.append(renderPeerDetail(peer, rel));
+  return row;
+}
+
+/** The expanded half of a peer row: everything that would be noise in a
+ * list — the full key, connection history, both share directions, and
+ * the destructive Remove, kept at the bottom where it can't be hit by
+ * accident. */
+function renderPeerDetail(peer, rel) {
+  const body = el('div', { class: 'peer-detail' });
+
+  body.append(el('p', { class: 'faint mono key' }, peer.peer_key));
   if (peer.last_error) {
-    card.append(el('p', { class: 'faint' }, 'Last error: ' + peer.last_error));
+    body.append(el('p', { class: 'faint' }, 'Last error: ' + peer.last_error));
   }
   if (peer.state === 'connected' && !isZeroTime(peer.connected_since)) {
-    card.append(el('p', { class: 'faint' }, 'Connected since ' + formatTime(peer.connected_since)));
+    body.append(el('p', { class: 'faint' }, 'Connected since ' + formatTime(peer.connected_since)));
   } else if (!isZeroTime(peer.last_connected_at)) {
-    card.append(el('p', { class: 'faint' }, 'Last connected ' + formatTime(peer.last_connected_at)));
+    body.append(el('p', { class: 'faint' }, 'Last connected ' + formatTime(peer.last_connected_at)));
   }
-  return card;
+
+  body.append(el('h3', {}, 'Shares they offer'));
+  if (rel.offered.length === 0) {
+    body.append(el('p', { class: 'faint' }, 'None offered yet.'));
+  } else {
+    const list = el('ul', { class: 'plain' });
+    for (const rs of rel.offered) {
+      const sub = rel.subs.find((x) => x.share_id === rs.share_id);
+      const right = sub
+        ? el('span', { class: 'faint mono' }, sub.local_path)
+        : (() => {
+            const btn = el('button', {}, 'Subscribe');
+            btn.addEventListener('click', () => subscribeDialog(rs));
+            return btn;
+          })();
+      list.append(el('li', { class: 'list-item' }, [
+        el('div', { class: 'stack' }, [
+          el('span', {}, rs.name + ' (' + rs.permission + (rs.approval_required ? ', approval required' : '') + ')'),
+          el('div', { class: 'row tight' }, [accessBadge(rs.access), sub ? el('span', { class: 'faint' }, 'subscribed · ' + sub.mode + (sub.paused ? ' · paused' : '')) : null]),
+        ]),
+        right,
+      ]));
+    }
+    body.append(list);
+  }
+
+  body.append(el('h3', {}, 'Shares of ours they use'));
+  if (rel.usingOurs.length === 0) {
+    body.append(el('p', { class: 'faint' }, 'None.'));
+  } else {
+    const list = el('ul', { class: 'plain' });
+    for (const u of rel.usingOurs) {
+      list.append(el('li', { class: 'list-item' }, [el('span', {}, u.share.name), accessBadge(u.access)]));
+    }
+    body.append(list);
+  }
+
+  const removeBtn = el('button', { class: 'danger' }, 'Remove peer');
+  removeBtn.addEventListener('click', () => {
+    confirmThen('Remove peer "' + (peer.name || peer.short_id) + '"? This disconnects and forgets it.', async () => {
+      try {
+        await apiDelete('/api/peers/' + encodeURIComponent(peer.id));
+        ui.expandedPeers.delete(peer.id);
+        showToast('Peer removed');
+        await pollStatus();
+      } catch (err) {
+        showToast('Failed to remove peer: ' + err.message, true);
+      }
+    });
+  });
+  body.append(el('div', { class: 'peer-actions' }, removeBtn));
+
+  return body;
 }
 
 function renderRejectedCard(status) {
@@ -390,132 +579,20 @@ function renderRejectedCard(status) {
 function renderDashboard(status) {
   const wrap = el('div');
   wrap.append(renderNodeCard(status));
+  wrap.append(renderAddPeerForm());
 
   const peersSection = el('div', { class: 'section' });
-  peersSection.append(el('h2', {}, 'Peers'));
   const peers = status.peers || [];
+  peersSection.append(el('h2', {}, 'Peers' + (peers.length > 0 ? ' (' + peers.length + ')' : '')));
   if (peers.length === 0) {
-    peersSection.append(el('div', { class: 'empty-state' }, "No peers yet — go to the Peers tab and paste a peer's token to connect."));
+    peersSection.append(el('div', { class: 'empty-state' }, "No peers yet — paste a peer's token above to connect."));
   } else {
-    const grid = el('div', { class: 'grid' });
-    for (const peer of peers) grid.append(renderPeerCard(peer));
-    peersSection.append(grid);
+    for (const peer of peers) peersSection.append(renderPeerRow(peer, status));
   }
   wrap.append(peersSection);
+
   const rejected = renderRejectedCard(status);
   if (rejected) wrap.append(rejected);
-  return wrap;
-}
-
-// --- Peers view ----------------------------------------------------------
-
-function renderAddPeerForm() {
-  const card = el('div', { class: 'card' });
-  card.append(el('h2', {}, 'Add a peer'));
-  const tokenInput = el('input', { type: 'text', id: 'peer-token-input', placeholder: 'sc1:...', required: true });
-  const nameInput = el('input', { type: 'text', id: 'peer-name-input', placeholder: '(optional)' });
-  const submitBtn = el('button', { class: 'primary', type: 'submit' }, 'Add peer');
-  const form = el('form', { class: 'inline-form' }, [
-    el('div', { class: 'field' }, [el('label', { for: 'peer-token-input' }, "Peer's token"), tokenInput]),
-    el('div', { class: 'field' }, [el('label', { for: 'peer-name-input' }, 'Display name'), nameInput]),
-    submitBtn,
-  ]);
-  form.addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const token = tokenInput.value.trim();
-    if (!token) return;
-    submitBtn.disabled = true;
-    try {
-      await apiPost('/api/peers', { token: token, name: nameInput.value.trim() });
-      showToast('Peer added');
-      await pollStatus();
-    } catch (err) {
-      showToast('Failed to add peer: ' + err.message, true);
-    } finally {
-      submitBtn.disabled = false;
-    }
-  });
-  card.append(form);
-  return card;
-}
-
-function renderPeerDetail(peer, status) {
-  const card = el('div', { class: 'card' });
-  const removeBtn = el('button', { class: 'danger' }, 'Remove');
-  removeBtn.addEventListener('click', () => {
-    confirmThen('Remove peer "' + (peer.name || peer.short_id) + '"? This disconnects and forgets it.', async () => {
-      try {
-        await apiDelete('/api/peers/' + encodeURIComponent(peer.id));
-        showToast('Peer removed');
-        await pollStatus();
-      } catch (err) {
-        showToast('Failed to remove peer: ' + err.message, true);
-      }
-    });
-  });
-  card.append(el('div', { class: 'row between' }, [
-    el('div', { class: 'stack' }, [
-      el('span', { class: 'title' }, peer.name || peer.remote_name || peer.short_id),
-      el('span', { class: 'faint mono' }, peer.peer_key),
-    ]),
-    el('div', { class: 'row' }, [stateBadge(peer.state), removeBtn]),
-  ]));
-  if (peer.last_error) {
-    card.append(el('p', { class: 'faint' }, 'Last error: ' + peer.last_error));
-  }
-
-  const offered = (status.remote_shares || []).filter((rs) => rs.peer_key === peer.peer_key);
-  card.append(el('h3', {}, 'Shares they offer'));
-  if (offered.length === 0) {
-    card.append(el('p', { class: 'faint' }, 'None offered yet.'));
-  } else {
-    const list = el('ul', { class: 'plain' });
-    for (const rs of offered) {
-      const subscribeBtn = el('button', {}, 'Subscribe');
-      subscribeBtn.addEventListener('click', () => subscribeDialog(rs));
-      list.append(el('li', { class: 'list-item' }, [
-        el('div', { class: 'stack' }, [
-          el('span', {}, rs.name + ' (' + rs.permission + (rs.approval_required ? ', approval required' : '') + ')'),
-          accessBadge(rs.access),
-        ]),
-        subscribeBtn,
-      ]));
-    }
-    card.append(list);
-  }
-
-  const usingOurs = [];
-  for (const share of status.shares || []) {
-    for (const a of share.access || []) {
-      if (a.peer_key === peer.peer_key) usingOurs.push({ share: share, access: a.access });
-    }
-  }
-  card.append(el('h3', {}, 'Shares of ours they use'));
-  if (usingOurs.length === 0) {
-    card.append(el('p', { class: 'faint' }, 'None.'));
-  } else {
-    const list = el('ul', { class: 'plain' });
-    for (const u of usingOurs) {
-      list.append(el('li', { class: 'list-item' }, [el('span', {}, u.share.name), accessBadge(u.access)]));
-    }
-    card.append(list);
-  }
-
-  return card;
-}
-
-function renderPeers(status) {
-  const wrap = el('div');
-  wrap.append(renderAddPeerForm());
-  const section = el('div', { class: 'section' });
-  section.append(el('h2', {}, 'Peers'));
-  const peers = status.peers || [];
-  if (peers.length === 0) {
-    section.append(el('div', { class: 'empty-state' }, "No peers yet — paste a peer's token above to connect."));
-  } else {
-    for (const peer of peers) section.append(renderPeerDetail(peer, status));
-  }
-  wrap.append(section);
   return wrap;
 }
 
@@ -806,7 +883,7 @@ function renderShares(status) {
   subsSection.append(el('h2', {}, 'Your subscriptions'));
   const subs = status.subscriptions || [];
   if (subs.length === 0) {
-    subsSection.append(el('div', { class: 'empty-state' }, 'You are not subscribed to any peer shares yet — visit Peers to subscribe.'));
+    subsSection.append(el('div', { class: 'empty-state' }, 'You are not subscribed to any peer shares yet — expand a peer on the dashboard to subscribe to what they offer.'));
   } else {
     const list = el('ul', { class: 'plain' });
     for (const sub of subs) list.append(renderSubscriptionItem(sub));
@@ -822,7 +899,9 @@ function renderShares(status) {
 
 function currentRoute() {
   const hash = location.hash.replace(/^#/, '');
-  return hash || '/';
+  // '/peers' folded into the dashboard; keep old bookmarks working.
+  if (!hash || hash === '/peers') return '/';
+  return hash;
 }
 
 function updateNavHighlight() {
@@ -876,8 +955,7 @@ function render() {
   if (state.statusError) {
     frag.append(el('div', { class: 'error-banner' }, [el('span', {}, 'Lost connection to the daemon: ' + state.statusError)]));
   }
-  if (route === '/peers') frag.append(renderPeers(state.status));
-  else if (route === '/shares') frag.append(renderShares(state.status));
+  if (route === '/shares') frag.append(renderShares(state.status));
   else frag.append(renderDashboard(state.status));
 
   app.replaceChildren(frag);

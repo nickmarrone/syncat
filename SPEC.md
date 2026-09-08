@@ -285,17 +285,22 @@ syncat status [--watch]             syncat approvals [grant|deny ID]
 
 Embedded via `go:embed` from `internal/webui/static/` — hand-written HTML/CSS/JS, no
 framework, no build step. One page app with hash routing and `fetch` + the SSE events
-stream for live updates. Four views:
+stream for live updates. Three views:
 
-1. **Dashboard** — node name (editable), node token (copy button), peer cards with
-   live connection state (connected / relay vs direct if tailcat exposes it /
-   reconnecting), active transfer progress bars.
-2. **Peers** — add-token form, pending-peer approvals, per-peer detail: their name,
-   key fingerprint, shares they offer (with Subscribe buttons), shares of ours they use.
-3. **Shares** — add/edit local shares (dir path, name, permission dropdown, approval
+1. **Dashboard** — everything about this node and who it talks to, in one place:
+   node name (editable), node token (truncated, expandable, copy button), the
+   add-token form, pending-peer approvals, active transfer progress bars, and
+   then the peer list. One row per peer — name, short id, a summary of the shares
+   flowing each way, and live connection state (connected / relay vs direct if
+   tailcat exposes it / reconnecting). A row expands in place for the detail that
+   would be noise in a list: their key fingerprint, connection history, shares
+   they offer (with Subscribe buttons), shares of ours they use, and Remove.
+   Peers were originally a second view of their own; with the peer list living
+   here there was nothing left for a dashboard to summarize.
+2. **Shares** — add/edit local shares (dir path, name, permission dropdown, approval
    toggle), per-share peer access list with revoke, subscriptions with mode + pause,
    trash browser, conflict list.
-4. **Settings** — rescan interval, trash retention, global ignores, API address.
+3. **Settings** — rescan interval, trash retention, global ignores, API address.
 
 Style: minimal, clean, dark-mode-aware via `prefers-color-scheme`. A cat 🐱 favicon.
 
@@ -377,7 +382,7 @@ function they mean.)
 5. **Sync core** — version vectors, reconciler, whole-file transfer with resume, atomic apply, conflict copies. Integration test: two nodes, bidirectional sync incl. a conflict, over `net.Pipe`.
 6. **Modes & safety** — permissions, approval flow, receive-only/read-only direction rules, trash + janitor.
 7. **API + CLI** — REST endpoints, SSE, all subcommands.
-8. **Web UI** — the four views against the live API.
+8. **Web UI** — the views against the live API.
 9. **Hardening** — path traversal rejection (no `..`/absolute relpaths — verify on every incoming path), frame size limits, fuzz the frame decoder, README.
 
 ## 14. Verification

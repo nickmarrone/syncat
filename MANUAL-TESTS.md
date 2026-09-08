@@ -286,6 +286,12 @@ that destroys data if it regresses.
 - [ ] Loads at the configured `api_addr`.
 - [ ] Peers, shares, and subscriptions all render and refresh. (There is no
       transfer view — see the known gaps below.)
+- [ ] The node token shows truncated by default and expands to the full
+      wrapped token; Copy copies the whole token either way, and the card
+      never grows a horizontal scrollbar.
+- [ ] Peer rows expand and collapse, and stay as you left them across the
+      2s poll refresh. Remove peer and the offered-share list are only
+      reachable from an expanded row.
 - [ ] Adding a peer, share, and subscription through the UI produces the
       same result as the CLI.
 - [ ] The subscribe dialog rejects bad input with a readable message rather
