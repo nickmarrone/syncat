@@ -10,8 +10,9 @@
 // access.go the ShareList/SubscribeRequest/AccessUpdate negotiation that
 // runs over an adopted connection (SPEC.md §6). shares.go wires local
 // share/subscription directories to internal/index's Scanner/Watcher and
-// drives internal/sync.Session on every local or remote change. status.go
-// defines the read-only snapshot the API and UI render.
+// drives internal/sync.Session on every local or remote change. journal.go
+// holds the retention sweep that bounds index.Store's change journal.
+// status.go defines the read-only snapshot the API and UI render.
 //
 // Known MVP gaps, called out where they bite rather than left implicit:
 //   - SPEC.md §2.3's pending-peer approval queue is deferred: an unknown

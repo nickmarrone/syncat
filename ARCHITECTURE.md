@@ -163,6 +163,7 @@ it is not in `session.go`, it is in one of the other two.
 | `peer.go` | `peerConn`: one per configured peer. `runSupervisor` → `dialAttempt` → `offer` (dedup + adopt) → `runConnection`/`runKeepalive`. Also `ConnState` and the per-peer snapshot helpers `currentSession`/`neuterShare` |
 | `access.go` | Share-access negotiation over an adopted connection (§6): the offerer side answers `SubscribeRequest`, the subscriber side reacts to `AccessUpdate`, and `ShareList` announcement. `neuterShareOnSessions` lives here |
 | `shares.go` | `shareWatch`: wiring one local directory to an `index.Scanner`/`Watcher`; `rescanShare` (scan → `Bump` → persist → `propagateShare`) |
+| `journal.go` | The daily retention sweep over `index.Store`'s `change_journal` — the one table with no natural ceiling. `journalRetention` is also what decides how long a peer can be away and still get an incremental resync rather than a full snapshot |
 | `mutations.go` | The config-mutation API the REST layer and CLI call: `AddPeer`, `RemovePeer`, `AddShare`, `SetShareAccess`, `AddSubscription`, `PauseSubscription`, `RenameNode`, `ListTrash`, `RestoreTrash`, … Each one clones the config, mutates, validates, saves, then applies the live effects |
 | `resolve.go` | Turning what a human typed (`alice`, `docs`, a 6-hex-char id prefix) into an exact peer key or share id, with a descriptive error when the reference is ambiguous or matches nothing |
 | `status.go` | `Status()` and the plain structs it returns. Deliberately no `encoding/json` here — marshaling is `internal/api`'s job |
