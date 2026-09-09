@@ -565,12 +565,12 @@ text, and why:
 These are real gaps, not accidents — called out so nobody is surprised they
 don't work:
 
-- **Pending-peer approval and per-share `approval_required` enforcement.**
-  An unrecognized inbound connection is rejected outright rather than queued
-  (SPEC.md §2.3); every `SubscribeRequest` auto-grants regardless of a
-  share's `approval_required` flag (SPEC.md §6). The flag is still persisted
-  in config for when the queue exists. `POST /api/peers/{id}/approve`,
-  `GET/POST /api/approvals` return 501.
+- **Standalone approval queues.** An unrecognized inbound connection is
+  rejected outright rather than queued (SPEC.md §2.3). Share requests with
+  `approval_required` do fail closed and are recorded as pending; they can be
+  granted or denied from the share's access controls in the UI/API. The
+  dedicated `POST /api/peers/{id}/approve` and `GET/POST /api/approvals`
+  endpoints still return 501.
 - **Nested `.syncatignore` files.** Only the one at the share root is read
   (as SPEC.md §5 specifies); a `.syncatignore` in a subdirectory is ignored
   as a rules file, though it is never synced either.

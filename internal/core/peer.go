@@ -591,11 +591,11 @@ func (pc *peerConn) handleControl(ctx context.Context, sess *syncsvc.Session, ty
 		// the read-loop goroutine, not inside the goTracked closure below
 		// — see its doc comment for why: it establishes the local
 		// happens-before ordering that the async work here relies on.
-		share, ok := node.provisionShareForRequest(pc, sess, msg.ShareID)
+		share, access, ok := node.provisionShareForRequest(pc, sess, msg.ShareID)
 		if !ok {
 			return
 		}
-		node.goTracked(func() { node.finishSubscribeRequest(pc, share) })
+		node.goTracked(func() { node.finishSubscribeRequest(pc, share, access) })
 
 	case protocol.MsgAccessUpdate:
 		var msg protocol.AccessUpdate

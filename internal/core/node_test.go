@@ -314,6 +314,58 @@ func TestEndToEndSync(t *testing.T) {
 	})
 }
 
+// TestApprovalRequiredFailsClosed verifies that requesting a protected share
+// records a pending decision without provisioning or syncing it, and that an
+// explicit grant activates the already-open connection.
+func TestApprovalRequiredFailsClosed(t *testing.T) {
+	nodeA := newTestNode(t, "approvalA")
+	nodeB := newTestNode(t, "approvalB")
+
+	shareDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(shareDir, "secret.txt"), []byte("classified"), 0o644); err != nil {
+		t.Fatalf("seed protected share: %v", err)
+	}
+	shareID, err := nodeA.AddShare(shareDir, "protected", config.PermissionReadOnly, true)
+	if err != nil {
+		t.Fatalf("AddShare: %v", err)
+	}
+	if _, err := nodeA.AddPeer("approvalB", peerToken(t, nodeB)); err != nil {
+		t.Fatalf("nodeA AddPeer: %v", err)
+	}
+	if _, err := nodeB.AddPeer("approvalA", peerToken(t, nodeA)); err != nil {
+		t.Fatalf("nodeB AddPeer: %v", err)
+	}
+	waitFor(t, 5*time.Second, func() bool { return peerConnected(nodeA) && peerConnected(nodeB) })
+
+	localDir := t.TempDir()
+	if err := nodeB.AddSubscription(nodeA.PeerKey(), shareID, localDir, config.ModeReceiveOnly); err != nil {
+		t.Fatalf("AddSubscription: %v", err)
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		for _, sub := range nodeB.Status().Subscriptions {
+			if sub.ShareID == shareID && sub.Access == protocol.AccessPending {
+				return true
+			}
+		}
+		return false
+	})
+	if _, err := os.Stat(filepath.Join(localDir, "secret.txt")); !os.IsNotExist(err) {
+		t.Fatalf("protected file was available before approval; stat error = %v", err)
+	}
+	shares := nodeA.Status().Shares
+	if len(shares) != 1 || len(shares[0].Access) != 1 || shares[0].Access[0].Access != protocol.AccessPending {
+		t.Fatalf("offerer access = %+v, want one pending request", shares)
+	}
+
+	if err := nodeA.SetShareAccess(shareID, nodeB.PeerKey(), protocol.AccessGranted); err != nil {
+		t.Fatalf("approve share: %v", err)
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		data, err := os.ReadFile(filepath.Join(localDir, "secret.txt"))
+		return err == nil && string(data) == "classified"
+	})
+}
+
 // TestDedupConvergence peers two nodes that both dial each other
 // simultaneously (each Node.AddPeer starts its own dial supervisor right
 // away) and asserts they converge on a single, stable connection on both

@@ -19,10 +19,9 @@
 //     inbound key is rejected outright (see onAccept/handleAccept), though
 //     the rejection is recorded (RejectedConnection) so the API and UI can
 //     surface it.
-//   - SPEC.md §6's share-access approval queue is deferred: every
-//     SubscribeRequest is auto-granted regardless of ApprovalRequired (see
-//     provisionShareForRequest's TODO in access.go) — ApprovalRequired is
-//     still persisted in config for when that queue exists.
+//   - SPEC.md §6's standalone approvals API/CLI queue is deferred. Protected
+//     share requests do fail closed and appear as pending in the share access
+//     list, where the existing share API/UI can grant or deny them.
 //   - Once granted, a share/subscription can only be "neutered" on an
 //     already-open connection (both Direction flags set, see
 //     peerConn.neuterShare in peer.go and its callers in mutations.go and

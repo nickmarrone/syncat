@@ -345,10 +345,8 @@ func (n *Node) SetSharePermission(shareRef, permission string) error {
 	return nil
 }
 
-// SetShareApprovalRequired toggles a share's approval_required flag.
-// SPEC.md §6's approval queue is deferred (see the package doc comment),
-// so this is persisted but has no live effect yet — every SubscribeRequest
-// is still auto-granted.
+// SetShareApprovalRequired toggles a share's approval_required flag. It
+// applies to subsequent requests; existing explicit decisions are retained.
 func (n *Node) SetShareApprovalRequired(shareRef string, required bool) error {
 	shareID, err := n.resolveLocalShareRef(shareRef)
 	if err != nil {
@@ -369,13 +367,13 @@ func (n *Node) SetShareApprovalRequired(shareRef string, required bool) error {
 	return nil
 }
 
-// SetShareAccess grants, denies, or revokes one peer's access to a share
+// SetShareAccess records pending access, or grants, denies, or revokes one peer's access to a share
 // (SPEC.md §6), persisting the decision and, if the peer is connected,
 // pushing AccessUpdate and adding/neutering the share on that session
 // immediately.
 func (n *Node) SetShareAccess(shareRef, peerRef, access string) error {
 	switch access {
-	case protocol.AccessGranted, protocol.AccessDenied, protocol.AccessRevoked:
+	case protocol.AccessPending, protocol.AccessGranted, protocol.AccessDenied, protocol.AccessRevoked:
 	default:
 		return fmt.Errorf("core: set share access: invalid access %q", access)
 	}
@@ -421,6 +419,15 @@ func (n *Node) SetShareAccess(shareRef, peerRef, access string) error {
 		return nil
 	}
 
+	// Apply authorization locally before reporting it remotely. In
+	// particular, a grant must make the share available before the peer can
+	// react to AccessUpdate, while every non-grant must fail closed first.
+	if access == protocol.AccessGranted {
+		sess.AddShare(syncsvc.ShareConfig{ShareID: shareID, Root: share.Path, Direction: syncsvc.DirectionFor(share.Permission, ""), Ignore: n.shareIgnoreFunc(shareID)})
+		pc.markShareActive(shareID)
+	} else {
+		pc.neuterShare(shareID)
+	}
 	if err := sess.Writer().WriteMessage(protocol.MsgAccessUpdate, protocol.AccessUpdate{ShareID: shareID, Access: access}); err != nil {
 		n.logger.Printf("core: send access update for %s to %s: %v", shareID, peerKeyHex, err)
 	}
@@ -434,8 +441,6 @@ func (n *Node) SetShareAccess(shareRef, peerRef, access string) error {
 	// with nothing at all — until the next reconnect.
 	n.sendShareList(sess, peerKeyHex)
 	if access == protocol.AccessGranted {
-		sess.AddShare(syncsvc.ShareConfig{ShareID: shareID, Root: share.Path, Direction: syncsvc.DirectionFor(share.Permission, ""), Ignore: n.shareIgnoreFunc(shareID)})
-		pc.markShareActive(shareID)
 		if err := sess.SyncShare(n.ctx, shareID); err != nil {
 			n.logger.Printf("core: sync share %s to %s: %v", shareID, peerKeyHex, err)
 		}
@@ -445,8 +450,6 @@ func (n *Node) SetShareAccess(shareRef, peerRef, access string) error {
 		if err := sess.ReconcileShare(n.ctx, shareID); err != nil {
 			n.logger.Printf("core: reconcile share %s for %s on connect: %v", shareID, peerKeyHex, err)
 		}
-	} else {
-		pc.neuterShare(shareID)
 	}
 	return nil
 }
