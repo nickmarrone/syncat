@@ -15,10 +15,28 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"path"
+	"strings"
 	"sync"
+	"unicode"
 
 	"github.com/fxamacker/cbor/v2"
 )
+
+var wireDecMode = func() cbor.DecMode {
+	m, err := (cbor.DecOptions{
+		DupMapKey:        cbor.DupMapKeyEnforcedAPF,
+		MaxNestedLevels:  32,
+		MaxArrayElements: 65536,
+		MaxMapPairs:      1024,
+		IndefLength:      cbor.IndefLengthForbidden,
+		TagsMd:           cbor.TagsForbidden,
+	}).DecMode()
+	if err != nil {
+		panic(err)
+	}
+	return m
+}()
 
 // --- message types (SPEC.md §4) ----------------------------------------
 
@@ -543,8 +561,21 @@ func (r *Reader) ReadFrame() (MsgType, []byte, error) {
 // (SPEC.md §11 forward compatibility) — this is fxamacker/cbor's default
 // decode behavior, not an option enabled here.
 func DecodeMessage(payload []byte, v any) error {
-	if err := cbor.Unmarshal(payload, v); err != nil {
+	if err := wireDecMode.Unmarshal(payload, v); err != nil {
 		return fmt.Errorf("protocol: frame: decode message: %w", err)
+	}
+	return nil
+}
+
+// DecodeAndValidateMessage decodes with the hardened CBOR mode and applies
+// semantic validation for every post-handshake wire type before callers use
+// it to allocate derived collections, spawn work, or touch persistent state.
+func DecodeAndValidateMessage(payload []byte, v any) error {
+	if err := DecodeMessage(payload, v); err != nil {
+		return err
+	}
+	if err := ValidateMessage(v); err != nil {
+		return fmt.Errorf("protocol: frame: invalid message: %w", err)
 	}
 	return nil
 }
@@ -555,7 +586,7 @@ func DecodeMessage(payload []byte, v any) error {
 // — the header is a self-delimiting CBOR value, so no separate length
 // prefix between header and data is needed on the wire.
 func DecodeFileChunk(payload []byte) (FileChunkHeader, []byte, error) {
-	dec := cbor.NewDecoder(bytes.NewReader(payload))
+	dec := wireDecMode.NewDecoder(bytes.NewReader(payload))
 	var hdr FileChunkHeader
 	if err := dec.Decode(&hdr); err != nil {
 		return FileChunkHeader{}, nil, fmt.Errorf("protocol: frame: decode file chunk header: %w", err)
@@ -564,5 +595,243 @@ func DecodeFileChunk(payload []byte) (FileChunkHeader, []byte, error) {
 	if n < 0 || n > len(payload) {
 		return FileChunkHeader{}, nil, fmt.Errorf("protocol: frame: file chunk header consumed an invalid length %d", n)
 	}
-	return hdr, payload[n:], nil
+	data := payload[n:]
+	if len(data) > MaxFileChunkData {
+		return FileChunkHeader{}, nil, fmt.Errorf("protocol: frame: file chunk data is %d bytes, exceeds max %d", len(data), MaxFileChunkData)
+	}
+	if err := validateFileChunkHeader(hdr); err != nil {
+		return FileChunkHeader{}, nil, fmt.Errorf("protocol: frame: invalid file chunk header: %w", err)
+	}
+	return hdr, data, nil
+}
+
+const (
+	maxWireIDLen      = 128
+	maxWireNameLen    = 256
+	maxVersionEntries = 64
+	maxWireRelPathLen = 4096
+	maxWireCollection = 65536
+)
+
+func validBoundedText(label, value string, max int, required bool) error {
+	if required && value == "" {
+		return fmt.Errorf("%s is empty", label)
+	}
+	if len(value) > max {
+		return fmt.Errorf("%s exceeds %d bytes", label, max)
+	}
+	for _, r := range value {
+		if unicode.IsControl(r) {
+			return fmt.Errorf("%s contains a control character", label)
+		}
+	}
+	return nil
+}
+
+func validateShareID(id string) error { return validBoundedText("share_id", id, maxWireIDLen, true) }
+
+func validateRelPath(p string) error {
+	if err := validBoundedText("relpath", p, maxWireRelPathLen, true); err != nil {
+		return err
+	}
+	if strings.ContainsAny(p, "\\:") || strings.HasPrefix(p, "/") || path.Clean(p) != p || p == "." || p == ".." {
+		return errors.New("relpath is not a normalized relative path")
+	}
+	for _, elem := range strings.Split(p, "/") {
+		if elem == "" || elem == ".." {
+			return errors.New("relpath contains an invalid element")
+		}
+	}
+	return nil
+}
+
+func validateVersion(v VersionVector) error {
+	if len(v) > maxVersionEntries {
+		return fmt.Errorf("version vector has %d entries, max %d", len(v), maxVersionEntries)
+	}
+	for node := range v {
+		if len(node) != 16 {
+			return fmt.Errorf("version node id %q is not 16 hexadecimal characters", node)
+		}
+		for _, c := range node {
+			if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+				return fmt.Errorf("version node id %q is not canonical lowercase hex", node)
+			}
+		}
+	}
+	return nil
+}
+
+func validateFileInfo(f FileInfo) error {
+	if err := validateRelPath(f.RelPath); err != nil {
+		return err
+	}
+	if f.Size < 0 {
+		return errors.New("file size is negative")
+	}
+	switch f.Type {
+	case FileTypeFile, FileTypeDir, FileTypeSymlink:
+	default:
+		return fmt.Errorf("invalid file type %q", f.Type)
+	}
+	if !f.Deleted && f.Type != FileTypeDir && len(f.SHA256) != 32 {
+		return fmt.Errorf("content hash is %d bytes, want 32", len(f.SHA256))
+	}
+	if f.Mode&^0o7777 != 0 {
+		return fmt.Errorf("file mode %#o contains unsupported bits", f.Mode)
+	}
+	return validateVersion(f.Version)
+}
+
+func validateFiles(files []FileInfo) error {
+	if len(files) > maxWireCollection {
+		return fmt.Errorf("file collection has %d entries", len(files))
+	}
+	for i := range files {
+		if err := validateFileInfo(files[i]); err != nil {
+			return fmt.Errorf("file %d: %w", i, err)
+		}
+	}
+	return nil
+}
+
+func validateFileChunkHeader(h FileChunkHeader) error {
+	if err := validateShareID(h.ShareID); err != nil {
+		return err
+	}
+	if err := validateRelPath(h.RelPath); err != nil {
+		return err
+	}
+	if h.Offset < 0 {
+		return errors.New("file chunk offset is negative")
+	}
+	return validateVersion(h.Version)
+}
+
+// ValidateMessage validates supported post-handshake message structs.
+func ValidateMessage(v any) error {
+	switch m := v.(type) {
+	case *ShareList:
+		if len(m.Shares) > maxWireCollection {
+			return errors.New("too many shares")
+		}
+		for _, s := range m.Shares {
+			if err := validateShareID(s.ShareID); err != nil {
+				return err
+			}
+			if err := validBoundedText("share name", s.Name, maxWireNameLen, true); err != nil {
+				return err
+			}
+			if s.Permission != "read-only" && s.Permission != "read-write" {
+				return fmt.Errorf("invalid permission %q", s.Permission)
+			}
+			if !validAccess(s.Access) {
+				return fmt.Errorf("invalid access %q", s.Access)
+			}
+		}
+	case *SubscribeRequest:
+		return validateShareID(m.ShareID)
+	case *AccessUpdate:
+		if err := validateShareID(m.ShareID); err != nil {
+			return err
+		}
+		if !validAccess(m.Access) {
+			return fmt.Errorf("invalid access %q", m.Access)
+		}
+	case *IndexUpdate:
+		if err := validateShareID(m.ShareID); err != nil {
+			return err
+		}
+		return validateFiles(m.Files)
+	case *IndexSyncRequest:
+		if err := validateShareID(m.ShareID); err != nil {
+			return err
+		}
+		if err := validBoundedText("epoch", m.Epoch, maxWireIDLen, false); err != nil {
+			return err
+		}
+		return validBoundedText("snapshot_id", m.SnapshotID, maxWireIDLen, false)
+	case *IndexSnapshotBegin:
+		if err := validateShareID(m.ShareID); err != nil {
+			return err
+		}
+		if err := validBoundedText("snapshot_id", m.SnapshotID, maxWireIDLen, true); err != nil {
+			return err
+		}
+		return validBoundedText("epoch", m.Epoch, maxWireIDLen, true)
+	case *IndexSnapshotBatch:
+		if err := validateShareID(m.ShareID); err != nil {
+			return err
+		}
+		if err := validBoundedText("snapshot_id", m.SnapshotID, maxWireIDLen, true); err != nil {
+			return err
+		}
+		return validateFiles(m.Files)
+	case *IndexSnapshotEnd:
+		if err := validateShareID(m.ShareID); err != nil {
+			return err
+		}
+		return validBoundedText("snapshot_id", m.SnapshotID, maxWireIDLen, true)
+	case *IndexDeltaBatch:
+		if err := validateShareID(m.ShareID); err != nil {
+			return err
+		}
+		if err := validBoundedText("epoch", m.Epoch, maxWireIDLen, true); err != nil {
+			return err
+		}
+		if len(m.Entries) == 0 || m.FromSeq == 0 || m.ToSeq < m.FromSeq || m.ToSeq-m.FromSeq == ^uint64(0) || m.ToSeq-m.FromSeq+1 != uint64(len(m.Entries)) {
+			return errors.New("invalid delta sequence range")
+		}
+		for i, e := range m.Entries {
+			if e.Seq != m.FromSeq+uint64(i) {
+				return errors.New("non-contiguous delta sequence")
+			}
+			if err := validateFileInfo(e.File); err != nil {
+				return err
+			}
+		}
+	case *IndexAck:
+		if err := validateShareID(m.ShareID); err != nil {
+			return err
+		}
+		if err := validBoundedText("epoch", m.Epoch, maxWireIDLen, true); err != nil {
+			return err
+		}
+		return validBoundedText("snapshot_id", m.SnapshotID, maxWireIDLen, false)
+	case *FileRequest:
+		if err := validateShareID(m.ShareID); err != nil {
+			return err
+		}
+		if err := validateRelPath(m.RelPath); err != nil {
+			return err
+		}
+		if m.Offset < 0 {
+			return errors.New("file request offset is negative")
+		}
+		return validateVersion(m.Version)
+	case *Error:
+		if err := validBoundedText("error code", m.Code, 128, true); err != nil {
+			return err
+		}
+		if len(m.Msg) > MaxDiagnosticRunes*4 {
+			return errors.New("error message is too long")
+		}
+		if m.ShareID != "" {
+			if err := validateShareID(m.ShareID); err != nil {
+				return err
+			}
+		}
+		if m.RelPath != "" {
+			return validateRelPath(m.RelPath)
+		}
+	}
+	return nil
+}
+
+func validAccess(a string) bool {
+	switch a {
+	case AccessNone, AccessPending, AccessGranted, AccessDenied, AccessRevoked:
+		return true
+	}
+	return false
 }
