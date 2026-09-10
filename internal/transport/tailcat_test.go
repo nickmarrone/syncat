@@ -2,14 +2,107 @@ package transport
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/tailscale/tailcat"
 )
+
+type fakeTailcatServer struct {
+	started   chan struct{}
+	release   chan struct{}
+	startOnce sync.Once
+	startErr  error
+	closed    atomic.Int32
+}
+
+func (s *fakeTailcatServer) Start() error {
+	s.startOnce.Do(func() { close(s.started) })
+	if s.release != nil {
+		<-s.release
+	}
+	return s.startErr
+}
+func (s *fakeTailcatServer) DrainTCP(context.Context) error { return nil }
+func (s *fakeTailcatServer) Close() error {
+	s.closed.Add(1)
+	return nil
+}
+func (s *fakeTailcatServer) TailcatAddr() tailcat.Addr { return "fake" }
+
+func transportWithFakeServer(s *fakeTailcatServer) *TailcatTransport {
+	t := NewTailcatTransport(tailcat.NewPrivateKey(), nil)
+	t.newServer = func(func(net.Conn)) tailcatServer { return s }
+	return t
+}
+
+func TestTailcatStartCancellationClosesLateServer(t *testing.T) {
+	srv := &fakeTailcatServer{started: make(chan struct{}), release: make(chan struct{})}
+	tr := transportWithFakeServer(srv)
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- tr.Start(ctx, func(net.Conn) {}) }()
+	<-srv.started
+	cancel()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Start error = %v, want context cancellation", err)
+	}
+	close(srv.release)
+	deadline := time.Now().Add(time.Second)
+	for srv.closed.Load() != 1 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := srv.closed.Load(); got != 1 {
+		t.Fatalf("late-started server closed %d times, want once", got)
+	}
+	if _, err := tr.LocalAddress(); err == nil {
+		t.Fatal("LocalAddress succeeded after canceled startup")
+	}
+}
+
+func TestTailcatCloseDuringStartCleansUpAfterStartReturns(t *testing.T) {
+	srv := &fakeTailcatServer{started: make(chan struct{}), release: make(chan struct{})}
+	tr := transportWithFakeServer(srv)
+	result := make(chan error, 1)
+	go func() { result <- tr.Start(context.Background(), func(net.Conn) {}) }()
+	<-srv.started
+	if err := tr.Close(); err != nil {
+		t.Fatalf("Close during Start: %v", err)
+	}
+	close(srv.release)
+	if err := <-result; err == nil {
+		t.Fatal("Start succeeded after Close won the lifecycle race")
+	}
+	if got := srv.closed.Load(); got != 1 {
+		t.Fatalf("server closed %d times, want once", got)
+	}
+}
+
+func TestTailcatStartFailureClosesPartialServerAndStaysFailed(t *testing.T) {
+	srv := &fakeTailcatServer{started: make(chan struct{}), startErr: errors.New("startup exploded")}
+	tr := transportWithFakeServer(srv)
+	if err := tr.Start(context.Background(), func(net.Conn) {}); err == nil {
+		t.Fatal("Start succeeded despite server failure")
+	}
+	if got := srv.closed.Load(); got != 1 {
+		t.Fatalf("partially started server closed %d times, want once", got)
+	}
+	if _, err := tr.LocalAddress(); err == nil {
+		t.Fatal("LocalAddress succeeded after failed startup")
+	}
+	if _, err := tr.Dial(context.Background(), "fake"); err == nil {
+		t.Fatal("Dial succeeded after failed startup")
+	}
+	if err := tr.Start(context.Background(), func(net.Conn) {}); err == nil {
+		t.Fatal("second Start succeeded after failed startup")
+	}
+}
 
 // dialWithRetry dials addr, retrying until it succeeds or ctx expires.
 //

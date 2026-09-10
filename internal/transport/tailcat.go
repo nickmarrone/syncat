@@ -32,14 +32,33 @@ type TailcatTransport struct {
 	key  *tailcat.PrivateKey // node identity; Public.RegionID is baked in (see config.LoadOrCreateTailcatKey)
 	logf func(string, ...any)
 
-	mu      sync.Mutex
-	server  *tailcat.Server
-	started bool
-	closed  bool
+	mu     sync.Mutex
+	server tailcatServer
+	state  tailcatTransportState
+	// newServer is replaceable in tests so startup can be paused at the
+	// exact lifecycle boundaries without contacting DERP.
+	newServer func(func(net.Conn)) tailcatServer
 
 	clientsMu sync.Mutex
 	clients   map[string]*tailcat.Client // keyed by peer addr (tailcat.Addr string); reused across dials
 }
+
+type tailcatServer interface {
+	Start() error
+	DrainTCP(context.Context) error
+	Close() error
+	TailcatAddr() tailcat.Addr
+}
+
+type tailcatTransportState uint8
+
+const (
+	tailcatStateNew tailcatTransportState = iota
+	tailcatStateStarting
+	tailcatStateStarted
+	tailcatStateFailed
+	tailcatStateClosed
+)
 
 // NewTailcatTransport returns a transport using key as this node's tailcat
 // identity (see config.LoadOrCreateTailcatKey, which bakes in a concrete
@@ -49,7 +68,26 @@ func NewTailcatTransport(key *tailcat.PrivateKey, logf func(string, ...any)) *Ta
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
-	return &TailcatTransport{key: key, logf: logf}
+	t := &TailcatTransport{key: key, logf: logf}
+	t.newServer = func(onConn func(net.Conn)) tailcatServer {
+		srv := &tailcat.Server{
+			Key:      t.key.Private,
+			RegionID: t.key.Public.RegionID,
+			Logf:     t.logf,
+			// A zero value makes tailcat generate a new PSK, changing this
+			// node's address and invalidating persisted pairing tokens.
+			PresharedKey: t.key.Public.PresharedKey,
+		}
+		srv.OnTCP = func(port uint16) func(net.Conn) {
+			if port != SyncatPort {
+				return nil
+			}
+			return onConn
+		}
+		srv.ServedTCPPorts = []filter.PortRange{{First: SyncatPort, Last: SyncatPort}}
+		return srv
+	}
+	return t
 }
 
 func (t *TailcatTransport) Start(ctx context.Context, onConn func(net.Conn)) error {
@@ -58,57 +96,71 @@ func (t *TailcatTransport) Start(ctx context.Context, onConn func(net.Conn)) err
 	}
 
 	t.mu.Lock()
-	if t.closed {
+	if t.state != tailcatStateNew {
+		state := t.state
 		t.mu.Unlock()
-		return errors.New("transport: tailcat: Start called after Close")
-	}
-	if t.started {
-		t.mu.Unlock()
-		return errors.New("transport: tailcat: Start called twice")
-	}
-
-	srv := &tailcat.Server{
-		Key:      t.key.Private,
-		RegionID: t.key.Public.RegionID,
-		Logf:     t.logf,
-		// The pre-shared key is part of our address, so it has to be
-		// restored from disk alongside Key: tailcat generates a fresh
-		// random one whenever Server.PresharedKey is zero, which would
-		// mint a different address on every daemon start and silently
-		// invalidate every `sc1` token we have ever handed out. See
-		// config.LoadOrCreateTailcatKey, which is what guarantees the
-		// field is non-zero by the time we get here.
-		PresharedKey: t.key.Public.PresharedKey,
-	}
-	srv.OnTCP = func(port uint16) func(net.Conn) {
-		if port != SyncatPort {
-			return nil // RST
+		if state == tailcatStateClosed {
+			return errors.New("transport: tailcat: Start called after Close")
 		}
-		return onConn
+		return errors.New("transport: tailcat: Start called more than once")
 	}
-	srv.ServedTCPPorts = []filter.PortRange{{First: SyncatPort, Last: SyncatPort}}
+	srv := t.newServer(onConn)
 	t.server = srv
+	t.state = tailcatStateStarting
 	t.mu.Unlock()
 
 	// Server.Start does its own DERP-map fetch/region resolution using
 	// context.Background() internally (it takes no context), so it isn't
 	// directly cancelable. Run it in a goroutine and race it against ctx:
-	// on ctx expiry we return promptly, but a Start that later succeeds in
-	// the background is still reachable via t.server (already assigned
-	// above) — a subsequent Close will shut it down rather than leaking it.
+	// on ctx expiry we return promptly. The startup goroutine observes the
+	// abandoned lifecycle state when it eventually returns and closes every
+	// resource that late startup created.
 	errCh := make(chan error, 1)
-	go func() { errCh <- srv.Start() }()
+	go func() {
+		err := srv.Start()
+		t.mu.Lock()
+		abandoned := t.state != tailcatStateStarting
+		if !abandoned {
+			if err == nil {
+				t.state = tailcatStateStarted
+			} else {
+				t.state = tailcatStateFailed
+			}
+		}
+		t.mu.Unlock()
+
+		// Start may allocate resources before returning an error, and a
+		// canceled/closed transport may finish successfully much later. The
+		// startup goroutine is the only code that knows Start has returned,
+		// so it owns cleanup in both cases.
+		if err != nil || abandoned {
+			_ = srv.Close()
+		}
+		if err == nil && abandoned {
+			err = errors.New("transport closed during startup")
+		}
+		errCh <- err
+	}()
 
 	select {
 	case err := <-errCh:
 		if err != nil {
 			return fmt.Errorf("transport: tailcat: start: %w", err)
 		}
-		t.mu.Lock()
-		t.started = true
-		t.mu.Unlock()
 		return nil
 	case <-ctx.Done():
+		t.mu.Lock()
+		state := t.state
+		if state == tailcatStateStarting || state == tailcatStateStarted {
+			t.state = tailcatStateClosed
+		}
+		t.mu.Unlock()
+		// If startup won the mutex race and fully completed just before this
+		// select chose cancellation, its goroutine no longer considers itself
+		// abandoned, so this path owns the close.
+		if state == tailcatStateStarted {
+			_ = srv.Close()
+		}
 		return fmt.Errorf("transport: tailcat: start: %w", ctx.Err())
 	}
 }
@@ -144,8 +196,15 @@ func (t *TailcatTransport) clientFor(addr string) (*tailcat.Client, error) {
 
 	t.clientsMu.Lock()
 	defer t.clientsMu.Unlock()
+	return t.clientForLocked(addr), nil
+}
+
+// clientForLocked is clientFor with clientsMu already held. Dial uses it
+// while transitioning from the lifecycle lock to the client-cache lock so
+// Close cannot miss a newly created client.
+func (t *TailcatTransport) clientForLocked(addr string) *tailcat.Client {
 	if c, ok := t.clients[addr]; ok {
-		return c, nil
+		return c
 	}
 	c := &tailcat.Client{
 		Server: tailcat.Addr(addr),
@@ -155,14 +214,25 @@ func (t *TailcatTransport) clientFor(addr string) (*tailcat.Client, error) {
 		t.clients = make(map[string]*tailcat.Client)
 	}
 	t.clients[addr] = c
-	return c, nil
+	return c
 }
 
 func (t *TailcatTransport) Dial(ctx context.Context, addr string) (net.Conn, error) {
-	c, err := t.clientFor(addr)
-	if err != nil {
-		return nil, err
+	t.mu.Lock()
+	if t.state != tailcatStateStarted {
+		t.mu.Unlock()
+		return nil, errors.New("transport: tailcat: Dial called while transport is not started")
 	}
+	t.clientsMu.Lock()
+	t.mu.Unlock()
+	// Holding clientsMu across lookup/create closes the race where Close
+	// snapshots the cache immediately before a dial adds a new client.
+	if addr == "" {
+		t.clientsMu.Unlock()
+		return nil, errors.New("transport: tailcat: dial: address must not be empty")
+	}
+	c := t.clientForLocked(addr)
+	t.clientsMu.Unlock()
 	// No sleep is needed before dialing: DialTCPPort blocks internally
 	// (via Client.up) until the server has acked us as a peer.
 	conn, err := c.DialTCPPort(ctx, SyncatPort)
@@ -237,9 +307,9 @@ func (t *TailcatTransport) DiscardPeer(addr string) {
 
 func (t *TailcatTransport) LocalAddress() (string, error) {
 	t.mu.Lock()
-	srv, started := t.server, t.started
+	srv, state := t.server, t.state
 	t.mu.Unlock()
-	if !started || srv == nil {
+	if state != tailcatStateStarted || srv == nil {
 		return "", errors.New("transport: tailcat: LocalAddress called before Start completed")
 	}
 	return string(srv.TailcatAddr()), nil
@@ -247,11 +317,12 @@ func (t *TailcatTransport) LocalAddress() (string, error) {
 
 func (t *TailcatTransport) Close() error {
 	t.mu.Lock()
-	if t.closed {
+	if t.state == tailcatStateClosed {
 		t.mu.Unlock()
 		return nil
 	}
-	t.closed = true
+	state := t.state
+	t.state = tailcatStateClosed
 	srv := t.server
 	t.mu.Unlock()
 
@@ -267,7 +338,7 @@ func (t *TailcatTransport) Close() error {
 		}
 	}
 
-	if srv != nil {
+	if srv != nil && state == tailcatStateStarted {
 		// tailcat's TCP stack is userspace: exiting right after closing a
 		// net.Conn can lose its final FIN before it's ever transmitted, so
 		// drain first (bounded — the peer may simply be gone).
