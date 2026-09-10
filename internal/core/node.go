@@ -137,11 +137,18 @@ type Node struct {
 
 	rejectedMu sync.Mutex
 	rejected   []RejectedConnection
+
+	// inboundHandshakes bounds unauthenticated connections that may sit in
+	// the handshake timeout simultaneously. Admission is non-blocking so the
+	// transport callback never accumulates its own queue of waiting clients.
+	inboundHandshakes chan struct{}
 }
 
 // maxRejectedConnections bounds RejectedConnections' memory: only the most
 // recent attempts are kept.
 const maxRejectedConnections = 50
+
+const maxInboundHandshakes = 32
 
 // Open loads (or accepts, via Options) config and identity, opens the
 // index store, starts the transport, share watchers, trash janitor, and
@@ -176,19 +183,20 @@ func Open(ctx context.Context, opts Options) (*Node, error) {
 	nodeCtx, cancel := context.WithCancel(context.Background())
 
 	n := &Node{
-		paths:        opts.Paths,
-		identity:     in.identity,
-		transport:    opts.Transport,
-		store:        store,
-		logger:       in.logger,
-		clock:        in.clock,
-		rand:         in.rand,
-		cfg:          in.cfg,
-		peers:        map[string]*peerConn{},
-		shareWatches: map[string]*shareWatch{},
-		ctx:          nodeCtx,
-		cancel:       cancel,
-		startTime:    in.clock.Now(),
+		paths:             opts.Paths,
+		identity:          in.identity,
+		transport:         opts.Transport,
+		store:             store,
+		logger:            in.logger,
+		clock:             in.clock,
+		rand:              in.rand,
+		cfg:               in.cfg,
+		peers:             map[string]*peerConn{},
+		shareWatches:      map[string]*shareWatch{},
+		ctx:               nodeCtx,
+		cancel:            cancel,
+		startTime:         in.clock.Now(),
+		inboundHandshakes: make(chan struct{}, maxInboundHandshakes),
 	}
 	n.trash = syncsvc.NewTrash(opts.Paths.TrashDir(), asSyncClock(in.clock))
 	n.janitor = syncsvc.NewJanitor(n.trash, time.Duration(in.cfg.TrashRetentionDays)*24*time.Hour, asJanitorClock(in.clock), 0, n.onTrashSweep)
@@ -538,9 +546,23 @@ func (n *Node) onAccept(conn net.Conn) {
 		conn.Close()
 		return
 	}
+	select {
+	case n.inboundHandshakes <- struct{}{}:
+	case <-n.ctx.Done():
+		conn.Close()
+		return
+	default:
+		n.logger.Printf("core: rejecting inbound connection: %d handshakes already active", maxInboundHandshakes)
+		conn.Close()
+		return
+	}
 	// Unlike the other callers, this one owns a conn, so a refused
 	// goTracked has to close it rather than drop it on the floor.
-	if !n.goTracked(func() { n.handleAccept(conn) }) {
+	if !n.goTracked(func() {
+		defer func() { <-n.inboundHandshakes }()
+		n.handleAccept(conn)
+	}) {
+		<-n.inboundHandshakes
 		conn.Close()
 	}
 }
