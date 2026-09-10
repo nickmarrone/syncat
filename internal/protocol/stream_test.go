@@ -1,12 +1,25 @@
 package protocol
 
 import (
+	"context"
 	"errors"
 	"net"
 	"os"
+	"sync"
 	"testing"
 	"time"
 )
+
+type firstWriteGate struct {
+	once    sync.Once
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (w *firstWriteGate) Write(p []byte) (int, error) {
+	w.once.Do(func() { close(w.entered); <-w.release })
+	return len(p), nil
+}
 
 // --- StreamWriter -------------------------------------------------------
 
@@ -52,8 +65,8 @@ func TestStreamWriterPrioritizesControlFrames(t *testing.T) {
 	sw, far := startedWriter(t, time.Minute)
 	blockWriter(t, sw)
 
-	if err := sw.WriteMessage(MsgPing, Ping{}); err != nil {
-		t.Fatalf("queue ping: %v", err)
+	if err := sw.WriteMessage(MsgPong, Pong{}); err != nil {
+		t.Fatalf("queue pong: %v", err)
 	}
 
 	if err := far.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
@@ -67,7 +80,7 @@ func TestStreamWriterPrioritizesControlFrames(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read frame: %v (saw %d data frames, never the ping)", err, before)
 		}
-		if typ == MsgPing {
+		if typ == MsgPong {
 			break
 		}
 		if typ != MsgFileChunk {
@@ -80,31 +93,87 @@ func TestStreamWriterPrioritizesControlFrames(t *testing.T) {
 	}
 }
 
-// TestStreamWriterControlOverflowClosesConnection covers the deliberate
-// asymmetry between the lanes. Blocking on a full control lane would
-// reintroduce the very stall StreamWriter exists to prevent, because
-// internal/sync's read loop queues its Pong inline — so an overflowing
-// control lane is treated as a dead connection instead.
-func TestStreamWriterControlOverflowClosesConnection(t *testing.T) {
+func TestStreamWriterControlBackpressureIsCancelable(t *testing.T) {
 	sw, _ := startedWriter(t, time.Minute)
 	blockWriter(t, sw)
 
-	var err error
-	for i := 0; i < ctrlQueueDepth*4; i++ {
-		if err = sw.WriteMessage(MsgPing, Ping{}); err != nil {
-			break
+	for i := 0; i < ctrlQueueDepth; i++ {
+		if err := sw.WriteMessage(MsgPing, Ping{}); err != nil {
+			t.Fatalf("control %d: %v", i, err)
 		}
 	}
-	if err == nil {
-		t.Fatalf("queued %d control frames onto a stalled connection without an error", ctrlQueueDepth*4)
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	if err := sw.WriteMessageContext(ctx, MsgPing, Ping{}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("full control queue error = %v, want context deadline", err)
 	}
-	if sw.Err() == nil {
-		t.Error("Err() is nil after the control lane overflowed; the failure should be terminal for the session")
+	if sw.Err() != nil {
+		t.Fatalf("ordinary queue pressure poisoned connection: %v", sw.Err())
 	}
-	// The connection must be closed, so internal/sync's read loop EOFs and
-	// the session unwinds through its normal disconnect path.
-	if _, writeErr := sw.conn.Write([]byte{0}); writeErr == nil {
-		t.Error("connection is still writable; the overflow should have closed it")
+}
+
+func TestStreamWriterObserverFiresAfterWriteNotEnqueue(t *testing.T) {
+	sw, far := startedWriter(t, time.Minute)
+	written := make(chan MsgType, 1)
+	sw.SetWriteObserver(func(typ MsgType) { written <- typ })
+	if err := sw.WriteMessage(MsgPing, Ping{}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case typ := <-written:
+		t.Fatalf("observer fired before socket write: %s", typ)
+	case <-time.After(25 * time.Millisecond):
+	}
+	if _, _, err := NewReader(far).ReadFrame(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case typ := <-written:
+		if typ != MsgPing {
+			t.Fatalf("observer type = %s", typ)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("observer did not fire after write")
+	}
+}
+
+func TestStreamWriterBoundsControlBurstSoBulkProgresses(t *testing.T) {
+	gate := &firstWriteGate{entered: make(chan struct{}), release: make(chan struct{})}
+	sw := NewStreamWriterTo(gate)
+	order := make(chan MsgType, ctrlQueueDepth+4)
+	sw.SetWriteObserver(func(typ MsgType) { order <- typ })
+	sw.Start()
+	t.Cleanup(func() { _ = sw.Close() })
+	if err := sw.WriteFrame(MsgFileChunk, []byte{0}); err != nil {
+		t.Fatal(err)
+	}
+	<-gate.entered
+	if err := sw.WriteFrame(MsgFileChunk, []byte{1}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < ctrlQueueDepth; i++ {
+		if err := sw.WriteMessage(MsgPing, Ping{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	close(gate.release)
+	if typ := <-order; typ != MsgFileChunk {
+		t.Fatalf("first type = %s", typ)
+	}
+	controls := 0
+	for {
+		select {
+		case typ := <-order:
+			if typ == MsgFileChunk {
+				if controls > maxControlBurst {
+					t.Fatalf("bulk waited behind %d controls", controls)
+				}
+				return
+			}
+			controls++
+		case <-time.After(time.Second):
+			t.Fatal("bulk frame was starved")
+		}
 	}
 }
 
