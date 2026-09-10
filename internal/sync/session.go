@@ -283,7 +283,7 @@ func (s *Session) Stats() SessionStats {
 func (s *Session) protocolViolation() { s.stats.protocolViolations.Add(1) }
 
 // RecordProtocolViolation lets the core control-message dispatcher account
-// for invalid post-handshake frames handled outside Session's index switch.
+// for invalid post-handshake frames handled outside Session's data-plane table.
 func (s *Session) RecordProtocolViolation() { s.protocolViolation() }
 
 func (s *Session) rejectShareOperation() {
@@ -1094,20 +1094,15 @@ func (s *Session) sendIndexUpdate(shareID string, rows []index.FileRow, full boo
 }
 
 // readLoop is the single reader of the connection (protocol.Reader is not
-// safe for concurrent use). It only decodes and dispatches; anything that
-// might block on the network (serving a FileRequest) or that needs to
-// itself receive FileChunks/Errors via this very loop (handling an
-// IndexUpdate, which may pull files) is handed off to its own goroutine
-// so the read loop is never the thing a background operation is waiting
-// on — that would deadlock a pull against the loop that delivers its
-// chunks.
+// safe for concurrent use). It observes each frame and routes it through the
+// data-plane handler table or the core control callback. Individual handlers
+// hand network-blocking or receive-dependent work to bounded workers, so this
+// loop is never the thing a background operation is waiting on — that would
+// deadlock a pull against the loop that delivers its chunks.
 //
-// The one thing dispatched inline is the control handler, which writes
-// (a Pong, in reply to a Ping). That is only safe because every frame it
-// writes takes protocol.StreamWriter's priority lane, so it cannot queue
-// behind a FileChunk: an inline write that could block on the network
-// would stop this loop draining the socket, which is precisely what makes
-// the peer's own writes stall, and two peers in that state deadlock.
+// The control handler may enqueue a Pong inline. That is safe because urgent
+// liveness writes cannot queue behind FileChunks; no inline handler writes the
+// socket directly.
 //
 // On exit — for any reason, including a clean io.EOF — it closes s.done,
 // which is how the owner learns the connection is over ([Session.Done]).
@@ -1126,210 +1121,17 @@ func (s *Session) readLoop() {
 		if observer != nil {
 			observer(typ)
 		}
-
-		switch typ {
-		case protocol.MsgIndexSyncRequest:
-			var m protocol.IndexSyncRequest
-			if !s.decodeWire(payload, &m) {
-				continue
-			}
-			if !s.servesOutboundShare(m.ShareID) {
-				s.rejectShareOperation()
-				s.logf("dropping index request for inactive or outbound-blocked share %s", m.ShareID)
-				continue
-			}
-			if !s.enqueueIndex("sync\x00"+m.ShareID, func() {
-				if err := s.answerSyncRequest(s.ctx, m); err != nil {
-					s.logf("answer index sync: %v", err)
-				}
-			}) {
-				s.rejectWork()
-				s.logf("closing overloaded session: index queue is full")
-				_ = s.conn.Close()
+		if handler, ok := sessionFrameHandlers[typ]; ok {
+			if !handler(s, payload) {
 				return
 			}
-		case protocol.MsgIndexSnapshotBegin:
-			var m protocol.IndexSnapshotBegin
-			if !s.decodeWire(payload, &m) {
-				continue
-			}
-			if !s.acceptsInboundIndex(m.ShareID) || m.SnapshotID == "" {
-				s.rejectShareOperation()
-				continue
-			}
-			s.snapshotMu.Lock()
-			s.snapshots[m.ShareID] = m
-			s.snapshotMu.Unlock()
-			_ = s.store.SetCursor(s.ctx, s.peerID, m.ShareID, "incoming", index.Cursor{Epoch: m.Epoch, SnapshotID: m.SnapshotID})
-		case protocol.MsgIndexSnapshotBatch:
-			var m protocol.IndexSnapshotBatch
-			if !s.decodeWire(payload, &m) {
-				continue
-			}
-			if !s.acceptsInboundIndex(m.ShareID) {
-				s.rejectShareOperation()
-				continue
-			}
-			s.snapshotMu.Lock()
-			b, ok := s.snapshots[m.ShareID]
-			s.snapshotMu.Unlock()
-			if !ok || b.SnapshotID != m.SnapshotID {
-				s.protocolViolation()
-				continue
-			}
-			c, _ := s.store.Cursor(s.ctx, s.peerID, m.ShareID, "incoming")
-			if m.Batch < c.SnapshotBatch {
-				continue
-			}
-			if m.Batch != c.SnapshotBatch {
-				_ = s.writer.WriteLatestMessageContext(s.ctx, "index-sync\x00"+m.ShareID, protocol.MsgIndexSyncRequest, protocol.IndexSyncRequest{ShareID: m.ShareID, Epoch: c.Epoch, AppliedSeq: c.AppliedSeq, SnapshotID: c.SnapshotID, SnapshotBatch: c.SnapshotBatch})
-				continue
-			}
-			rr := make([]index.FileRow, len(m.Files))
-			for i, f := range m.Files {
-				rr[i] = index.FileRowFromInfo(m.ShareID, f, time.Now())
-			}
-			if s.store.StageSnapshotBatch(s.ctx, s.peerID, m.ShareID, m.SnapshotID, m.Batch, rr) == nil {
-				c.SnapshotBatch++
-				_ = s.store.SetCursor(s.ctx, s.peerID, m.ShareID, "incoming", c)
-			}
-		case protocol.MsgIndexSnapshotEnd:
-			var m protocol.IndexSnapshotEnd
-			if !s.decodeWire(payload, &m) {
-				continue
-			}
-			if !s.acceptsInboundIndex(m.ShareID) {
-				s.rejectShareOperation()
-				continue
-			}
-			s.snapshotMu.Lock()
-			b, ok := s.snapshots[m.ShareID]
-			if ok && b.SnapshotID == m.SnapshotID {
-				delete(s.snapshots, m.ShareID)
-			}
-			s.snapshotMu.Unlock()
-			c, _ := s.store.Cursor(s.ctx, s.peerID, m.ShareID, "incoming")
-			if ok && b.SnapshotID == m.SnapshotID && c.SnapshotBatch == m.BatchCount && s.store.CommitSnapshot(s.ctx, s.peerID, m.ShareID, m.SnapshotID, b.Epoch, b.HighSeq) == nil {
-				_ = s.writer.WriteLatestMessageContext(s.ctx, "index-ack\x00"+m.ShareID, protocol.MsgIndexAck, protocol.IndexAck{ShareID: m.ShareID, Epoch: b.Epoch, AppliedSeq: b.HighSeq, SnapshotID: m.SnapshotID})
-				if !s.enqueueIndex("reconcile\x00"+m.ShareID, func() {
-					s.reconcilePeerShare(s.ctx, m.ShareID)
-				}) {
-					s.rejectWork()
-					s.logf("closing overloaded session: index queue is full")
-					_ = s.conn.Close()
-					return
-				}
-			}
-		case protocol.MsgIndexDeltaBatch:
-			var m protocol.IndexDeltaBatch
-			if !s.decodeWire(payload, &m) {
-				continue
-			}
-			if !s.acceptsInboundIndex(m.ShareID) {
-				s.rejectShareOperation()
-				continue
-			}
-			rr := make([]index.FileRow, len(m.Entries))
-			valid := true
-			for i, e := range m.Entries {
-				if e.Seq != m.FromSeq+uint64(i) {
-					valid = false
-					break
-				}
-				rr[i] = index.FileRowFromInfo(m.ShareID, e.File, time.Now())
-			}
-			if valid && s.store.ApplyPeerDelta(s.ctx, s.peerID, m.ShareID, m.Epoch, m.FromSeq, m.ToSeq, rr) == nil {
-				_ = s.writer.WriteLatestMessageContext(s.ctx, "index-ack\x00"+m.ShareID, protocol.MsgIndexAck, protocol.IndexAck{ShareID: m.ShareID, Epoch: m.Epoch, AppliedSeq: m.ToSeq})
-				if !s.enqueueIndex("reconcile\x00"+m.ShareID, func() {
-					s.reconcilePeerShare(s.ctx, m.ShareID)
-				}) {
-					s.rejectWork()
-					s.logf("closing overloaded session: index queue is full")
-					_ = s.conn.Close()
-					return
-				}
-			} else {
-				c, _ := s.store.Cursor(s.ctx, s.peerID, m.ShareID, "incoming")
-				_ = s.writer.WriteLatestMessageContext(s.ctx, "index-sync\x00"+m.ShareID, protocol.MsgIndexSyncRequest, protocol.IndexSyncRequest{ShareID: m.ShareID, Epoch: c.Epoch, AppliedSeq: c.AppliedSeq})
-			}
-		case protocol.MsgIndexAck:
-			var m protocol.IndexAck
-			if s.decodeWire(payload, &m) && s.servesOutboundShare(m.ShareID) {
-				s.acceptIndexAck(m)
-			} else if m.ShareID != "" {
-				s.rejectShareOperation()
-			}
-		case protocol.MsgIndexUpdate:
-			var msg protocol.IndexUpdate
-			if !s.decodeWire(payload, &msg) {
-				continue
-			}
-			if !s.acceptsInboundIndex(msg.ShareID) {
-				s.rejectShareOperation()
-				continue
-			}
-			if !s.startBounded(s.indexSem, func() {
-				s.handleIndexUpdate(s.ctx, msg)
-			}) {
-				s.rejectWork()
-				s.logf("closing overloaded session: index workers are full")
-				_ = s.conn.Close()
-				return
-			}
+			continue
+		}
 
-		case protocol.MsgFileRequest:
-			var req protocol.FileRequest
-			if !s.decodeWire(payload, &req) {
-				continue
-			}
-			if !s.servesOutboundShare(req.ShareID) {
-				s.rejectShareOperation()
-				s.sendFileError(req, protocol.ErrCodeFileNotFound, "unknown share")
-				continue
-			}
-			if !s.startBounded(s.serveSem, func() {
-				s.handleFileRequest(s.ctx, req)
-			}) {
-				s.rejectWork()
-				s.logf("closing overloaded session: file workers are full")
-				_ = s.conn.Close()
-				return
-			}
-
-		case protocol.MsgFileChunk:
-			hdr, data, err := protocol.DecodeFileChunk(payload)
-			if err != nil {
-				s.protocolViolation()
-				s.logf("decode FileChunk: %v", err)
-				continue
-			}
-			s.routeChunk(hdr.TransferID, pullChunk{header: hdr, data: data, eof: hdr.EOF})
-
-		case protocol.MsgError:
-			var e protocol.Error
-			if !s.decodeWire(payload, &e) {
-				continue
-			}
-			if e.TransferID != "" {
-				s.routeChunk(e.TransferID, pullChunk{err: &protocol.RemoteError{Code: e.Code, Msg: e.Msg}})
-			} else {
-				s.logf("peer error: %s: %s", protocol.SanitizeDiagnostic(e.Code), protocol.SanitizeDiagnostic(e.Msg))
-			}
-		case protocol.MsgCancelTransfer:
-			var m protocol.CancelTransfer
-			if s.decodeWire(payload, &m) {
-				s.stats.transferCancellations.Add(1)
-				s.cancelServe(m.TransferID)
-			}
-
-		default:
-			// Handshake/share-list/access/ping-pong messages: not this
-			// type's concern. Session assumes the handshake already
-			// happened, and hands the rest to internal/core's peer
-			// manager via SetControlHandler, if it registered one.
-			if ctrlHandler != nil {
-				ctrlHandler(typ, payload)
-			}
+		// Handshake/share-list/access/ping-pong messages are owned by the
+		// core control plane. Session remains the connection's sole reader.
+		if ctrlHandler != nil {
+			ctrlHandler(typ, payload)
 		}
 	}
 }

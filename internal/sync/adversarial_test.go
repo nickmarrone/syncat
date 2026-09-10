@@ -11,6 +11,24 @@ import (
 	"github.com/nickmarrone/syncat/internal/protocol"
 )
 
+func TestSessionFrameHandlerTableCoversDataPlane(t *testing.T) {
+	want := []protocol.MsgType{
+		protocol.MsgIndexSyncRequest, protocol.MsgIndexSnapshotBegin,
+		protocol.MsgIndexSnapshotBatch, protocol.MsgIndexSnapshotEnd,
+		protocol.MsgIndexDeltaBatch, protocol.MsgIndexAck, protocol.MsgIndexUpdate,
+		protocol.MsgFileRequest, protocol.MsgFileChunk, protocol.MsgError,
+		protocol.MsgCancelTransfer,
+	}
+	if len(sessionFrameHandlers) != len(want) {
+		t.Fatalf("handler table has %d entries, want %d", len(sessionFrameHandlers), len(want))
+	}
+	for _, typ := range want {
+		if sessionFrameHandlers[typ] == nil {
+			t.Errorf("handler table is missing %s", typ)
+		}
+	}
+}
+
 // FuzzSessionDecodeValidateDispatch drives attacker-controlled payloads
 // through the live Session reader, semantic validators, admission checks, and
 // dispatcher. Framing itself has a separate byte-stream fuzz target in the
