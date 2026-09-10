@@ -212,6 +212,31 @@ func TestDaemonRunningFallsBackWhenConfigIsUnreadable(t *testing.T) {
 	}
 }
 
+func TestNewAPIClientNormalizesEmptyHostToLoopback(t *testing.T) {
+	p := tempPaths(t)
+	if err := p.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.APIAddr = ":8347"
+	if err := config.Save(p.ConfigFile(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p.APITokenFile(), []byte(" test-token\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	client, err := newAPIClient(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if client.baseURL != "http://127.0.0.1:8347" {
+		t.Fatalf("baseURL = %q, want loopback URL", client.baseURL)
+	}
+	if client.token != "test-token" {
+		t.Fatalf("token = %q, want trimmed token", client.token)
+	}
+}
+
 func TestOwnershipConflictFindsTheFirstForeignOwner(t *testing.T) {
 	const me = 1000
 	owners := map[string]int{

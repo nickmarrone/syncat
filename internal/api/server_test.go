@@ -235,6 +235,64 @@ func TestUITokenAcceptsAbsentOrigin(t *testing.T) {
 	}
 }
 
+func TestUITokenAcceptsEveryDeclaredAuthority(t *testing.T) {
+	srv, node, _ := newTestServer(t)
+	srv = NewServerWithAuthorities(node, testToken, nil, "localhost:8347", "127.0.0.1:8347", "[::1]:8347")
+	for _, authority := range []string{"localhost:8347", "127.0.0.1:8347", "[::1]:8347"} {
+		t.Run(authority, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/ui-token", nil)
+			req.RemoteAddr = "127.0.0.1:54321"
+			req.Host = authority
+			req.Header.Set("Origin", "http://"+authority)
+			w := httptest.NewRecorder()
+			srv.Handler().ServeHTTP(w, req)
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
+func TestNormalizeLoopbackAddress(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"127.0.0.1:8347", "127.0.0.1:8347"},
+		{"localhost:8347", "localhost:8347"},
+		{"[::1]:8347", "[::1]:8347"},
+		{":8347", "127.0.0.1:8347"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got, err := NormalizeLoopbackAddress(tt.input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.BindAddress != tt.want || got.ClientAuthority != tt.want {
+				t.Fatalf("NormalizeLoopbackAddress(%q) = %+v, want both fields %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNormalizeLoopbackAddressRejectsUnsafeOrMalformedAddresses(t *testing.T) {
+	for _, addr := range []string{"0.0.0.0:8347", "192.0.2.1:8347", "example.com:8347", "127.0.0.1", "127.0.0.1:"} {
+		t.Run(addr, func(t *testing.T) {
+			if _, err := NormalizeLoopbackAddress(addr); err == nil {
+				t.Fatalf("NormalizeLoopbackAddress(%q) succeeded", addr)
+			}
+		})
+	}
+}
+
+func TestNewHTTPServerSetsResourceTimeouts(t *testing.T) {
+	srv := NewHTTPServer(http.NotFoundHandler())
+	if srv.ReadHeaderTimeout != HTTPReadHeaderTimeout || srv.IdleTimeout != HTTPIdleTimeout || srv.MaxHeaderBytes != HTTPMaxHeaderBytes {
+		t.Fatalf("HTTP server limits = (%v, %v, %d), want (%v, %v, %d)", srv.ReadHeaderTimeout, srv.IdleTimeout, srv.MaxHeaderBytes, HTTPReadHeaderTimeout, HTTPIdleTimeout, HTTPMaxHeaderBytes)
+	}
+}
+
 func TestUITokenRequiresNoAuthToken(t *testing.T) {
 	// /ui-token is deliberately login-less: no X-Syncat-Token needed.
 	srv, _, _ := newTestServer(t)

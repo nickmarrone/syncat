@@ -550,8 +550,14 @@ func startDaemon(nodeCtx context.Context, paths *config.Paths, apiAddr string, l
 		return nil, nil, nil, fmt.Errorf("start node: %w", err)
 	}
 
-	srv := api.NewServer(n, apiToken, ln.Addr().String(), logger)
-	httpServer := &http.Server{Handler: srv.Handler()}
+	normalized, err := api.NormalizeLoopbackAddress(cfg.APIAddr)
+	if err != nil {
+		n.Close()
+		ln.Close()
+		return nil, nil, nil, err
+	}
+	srv := api.NewServerWithAuthorities(n, apiToken, logger, normalized.ClientAuthority, ln.Addr().String())
+	httpServer := api.NewHTTPServer(srv.Handler())
 	return n, httpServer, ln, nil
 }
 
