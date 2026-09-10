@@ -327,7 +327,13 @@ func (s *Session) handleFileRequest(ctx context.Context, req protocol.FileReques
 	}
 
 	if row.Type == protocol.FileTypeSymlink {
-		s.serveSymlink(absPath, req, row.Version)
+		if err := s.streamSymlink(ctx, absPath, req, row); err != nil {
+			code := protocol.ErrCodeTransferFailed
+			if errors.Is(err, errFileChangedDuringTransfer) {
+				code = protocol.ErrCodeVersionChanged
+			}
+			s.sendFileError(req, code, err.Error())
+		}
 		return
 	}
 
@@ -405,27 +411,48 @@ func (s *Session) streamFile(ctx context.Context, f *os.File, req protocol.FileR
 	return nil
 }
 
-// serveSymlink sends a symlink's target path as its "content" (SPEC.md
-// §5: "the symlink entry itself (target string) syncs on Unix"), using
-// the same chunk framing as a regular file.
-func (s *Session) serveSymlink(absPath string, req protocol.FileRequest, version protocol.VersionVector) {
+// streamSymlink sends a symlink's target path as its "content" (SPEC.md §5).
+// Unlike a regular file, the target is one atomic, small read, so it can be
+// fully verified against the indexed size and hash before any frame is queued.
+// Lstat on both sides also detects replacement during the read without
+// following the link outside the share.
+func (s *Session) streamSymlink(ctx context.Context, absPath string, req protocol.FileRequest, row index.FileRow) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+	before, err := os.Lstat(absPath)
+	if err != nil {
+		return fmt.Errorf("lstat before readlink: %w", err)
+	}
+	if before.Mode()&os.ModeSymlink == 0 {
+		return errFileChangedDuringTransfer
+	}
 	target, err := os.Readlink(absPath)
 	if err != nil {
-		s.sendFileError(req, protocol.ErrCodeFileNotFound, "readlink: "+err.Error())
-		return
+		return fmt.Errorf("readlink: %w", err)
 	}
 	data := []byte(target)
+	after, err := os.Lstat(absPath)
+	if err != nil {
+		return fmt.Errorf("lstat after readlink: %w", err)
+	}
+	sum := sha256.Sum256(data)
+	if !os.SameFile(before, after) || before.Size() != after.Size() || before.ModTime() != after.ModTime() || int64(len(data)) != row.Size || !bytes.Equal(sum[:], row.SHA256) {
+		return errFileChangedDuringTransfer
+	}
 	if err := s.writer.WriteFileChunk(protocol.FileChunkHeader{
-		TransferID: req.TransferID, ShareID: req.ShareID, RelPath: req.RelPath, Version: version, Offset: 0, EOF: false,
+		TransferID: req.TransferID, ShareID: req.ShareID, RelPath: req.RelPath, Version: row.Version, Offset: 0, EOF: false,
 	}, data); err != nil {
-		s.logf("serve symlink %s/%s: %v", req.ShareID, req.RelPath, err)
-		return
+		return fmt.Errorf("write symlink target: %w", err)
 	}
 	if err := s.writer.WriteFileChunk(protocol.FileChunkHeader{
-		TransferID: req.TransferID, ShareID: req.ShareID, RelPath: req.RelPath, Version: version, Offset: int64(len(data)), EOF: true,
+		TransferID: req.TransferID, ShareID: req.ShareID, RelPath: req.RelPath, Version: row.Version, Offset: int64(len(data)), EOF: true,
 	}, nil); err != nil {
-		s.logf("serve symlink %s/%s: eof: %v", req.ShareID, req.RelPath, err)
+		return fmt.Errorf("write symlink eof: %w", err)
 	}
+	return nil
 }
 
 func (s *Session) sendFileError(req protocol.FileRequest, code, msg string) {
