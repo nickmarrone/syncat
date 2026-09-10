@@ -140,6 +140,27 @@ func TestStreamWriterObserverFiresAfterWriteNotEnqueue(t *testing.T) {
 	}
 }
 
+func TestStreamWriterPerFrameCallbackFiresAfterWrite(t *testing.T) {
+	sw, far := startedWriter(t, time.Minute)
+	written := make(chan struct{}, 1)
+	if err := sw.WriteMessageOnWritten(MsgPing, Ping{}, func() { written <- struct{}{} }); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-written:
+		t.Fatal("per-frame callback fired before socket write")
+	case <-time.After(25 * time.Millisecond):
+	}
+	if _, _, err := NewReader(far).ReadFrame(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-written:
+	case <-time.After(time.Second):
+		t.Fatal("per-frame callback did not fire after write")
+	}
+}
+
 func TestStreamWriterBoundsControlBurstSoBulkProgresses(t *testing.T) {
 	gate := &firstWriteGate{entered: make(chan struct{}), release: make(chan struct{})}
 	sw := NewStreamWriterTo(gate)

@@ -148,6 +148,8 @@ type Session struct {
 	shares     map[string]*ShareConfig
 	snapshotMu sync.Mutex
 	snapshots  map[string]protocol.IndexSnapshotBegin
+	sentMu     sync.Mutex
+	sentIndex  map[string]sentIndexState
 
 	// reconcileMu serializes Reconcile+apply+index-update passes across
 	// the whole session (all shares). IndexUpdates are handled
@@ -210,6 +212,16 @@ type Session struct {
 
 type sessionLifecycle uint8
 
+// sentIndexState is the highest index position which this live session has
+// actually put on the connection for one share. Store high-water marks are
+// deliberately insufficient: they can include a local change queued after the
+// last frame the peer received.
+type sentIndexState struct {
+	epoch      string
+	high       uint64
+	snapshotID string
+}
+
 const (
 	sessionNew sessionLifecycle = iota
 	sessionRunning
@@ -247,6 +259,7 @@ func NewSession(conn net.Conn, store *index.Store, nodeID, peerID string, clock 
 		warnIndex:   make(map[string]int),
 		shares:      make(map[string]*ShareConfig),
 		snapshots:   make(map[string]protocol.IndexSnapshotBegin),
+		sentIndex:   make(map[string]sentIndexState),
 		pullSem:     make(chan struct{}, maxConcurrentPulls),
 		pullTbl:     make(map[transferKey]*pullEntry),
 		serveSem:    make(chan struct{}, maxConcurrentServes),
@@ -492,6 +505,45 @@ func (s *Session) servesOutboundShare(shareID string) bool {
 	return ok && !cfg.Direction.OutboundBlocked
 }
 
+func (s *Session) noteSnapshotWritten(shareID, epoch, snapshotID string, high uint64) {
+	s.sentMu.Lock()
+	defer s.sentMu.Unlock()
+	cur := s.sentIndex[shareID]
+	if cur.epoch != epoch || high >= cur.high {
+		s.sentIndex[shareID] = sentIndexState{epoch: epoch, high: high, snapshotID: snapshotID}
+	}
+}
+
+func (s *Session) noteDeltaWritten(shareID, epoch string, high uint64) {
+	s.sentMu.Lock()
+	defer s.sentMu.Unlock()
+	cur := s.sentIndex[shareID]
+	if cur.epoch != epoch || high >= cur.high {
+		s.sentIndex[shareID] = sentIndexState{epoch: epoch, high: high}
+	}
+}
+
+// acceptIndexAck advances the persistent cursor only to the newest index
+// endpoint actually written by this live session. Requiring the exact newest
+// endpoint keeps the admission state constant-sized; an older legitimate ack
+// may be ignored because the peer will also acknowledge the newer frame it has
+// already received.
+func (s *Session) acceptIndexAck(m protocol.IndexAck) bool {
+	s.sentMu.Lock()
+	sent, ok := s.sentIndex[m.ShareID]
+	s.sentMu.Unlock()
+	if !ok || m.Epoch != sent.epoch || m.AppliedSeq != sent.high || m.SnapshotID != sent.snapshotID {
+		return false
+	}
+	cur, err := s.store.Cursor(s.ctx, s.peerID, m.ShareID, "outgoing")
+	if err != nil || (cur.Epoch == m.Epoch && cur.AppliedSeq >= m.AppliedSeq) {
+		return false
+	}
+	return s.store.SetCursor(s.ctx, s.peerID, m.ShareID, "outgoing", index.Cursor{
+		Epoch: m.Epoch, AppliedSeq: m.AppliedSeq,
+	}) == nil
+}
+
 // Start begins the session's read loop and its writer in background
 // goroutines and returns immediately. ctx bounds the session's lifetime in
 // addition to Close: canceling ctx (or calling Close) stops all background
@@ -659,7 +711,9 @@ func (s *Session) answerSyncRequest(ctx context.Context, req protocol.IndexSyncR
 		batch++
 		rows = rows[n:]
 	}
-	return s.writer.WriteMessage(protocol.MsgIndexSnapshotEnd, protocol.IndexSnapshotEnd{ShareID: req.ShareID, SnapshotID: id, BatchCount: batch})
+	return s.writer.WriteMessageOnWritten(protocol.MsgIndexSnapshotEnd, protocol.IndexSnapshotEnd{ShareID: req.ShareID, SnapshotID: id, BatchCount: batch}, func() {
+		s.noteSnapshotWritten(req.ShareID, epoch, id, high)
+	})
 }
 
 // journalPageSize bounds how many journal rows one read holds in memory at
@@ -719,7 +773,9 @@ func (s *Session) sendJournalDeltas(ctx context.Context, cfg ShareConfig, epoch 
 				entries[i] = protocol.IndexDeltaEntry{Seq: page[i].Seq, File: page[i].Row.Info()}
 			}
 			m := protocol.IndexDeltaBatch{ShareID: shareID, Epoch: epoch, FromSeq: entries[0].Seq, ToSeq: entries[n-1].Seq, Entries: entries}
-			if err := s.writer.WriteMessage(protocol.MsgIndexDeltaBatch, m); err != nil {
+			if err := s.writer.WriteMessageOnWritten(protocol.MsgIndexDeltaBatch, m, func() {
+				s.noteDeltaWritten(shareID, epoch, m.ToSeq)
+			}); err != nil {
 				return false, err
 			}
 			page = page[n:]
@@ -1031,13 +1087,7 @@ func (s *Session) readLoop() {
 		case protocol.MsgIndexAck:
 			var m protocol.IndexAck
 			if protocol.DecodeAndValidateMessage(payload, &m) == nil && s.servesOutboundShare(m.ShareID) {
-				// Never let a forged acknowledgement skip data this node has not
-				// produced. A later request can safely repeat already-sent rows;
-				// accepting a cursor beyond our high-water mark loses them.
-				epoch, high, err := s.store.ShareState(s.ctx, m.ShareID)
-				if err == nil && m.Epoch == epoch && m.AppliedSeq <= high {
-					_ = s.store.SetCursor(s.ctx, s.peerID, m.ShareID, "outgoing", index.Cursor{Epoch: m.Epoch, AppliedSeq: m.AppliedSeq})
-				}
+				s.acceptIndexAck(m)
 			}
 		case protocol.MsgIndexUpdate:
 			var msg protocol.IndexUpdate
