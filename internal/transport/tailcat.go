@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -60,6 +61,16 @@ const (
 	tailcatStateClosed
 )
 
+// OpError keeps the internal cause available to errors.Is/errors.As without
+// copying a credential-bearing tailcat error into Error(), logs, or status.
+type OpError struct {
+	Op  string
+	Err error
+}
+
+func (e *OpError) Error() string { return "transport: tailcat: " + e.Op + " failed" }
+func (e *OpError) Unwrap() error { return e.Err }
+
 // NewTailcatTransport returns a transport using key as this node's tailcat
 // identity (see config.LoadOrCreateTailcatKey, which bakes in a concrete
 // DERP RegionID so the resulting address is stable across runs). logf, if
@@ -68,6 +79,7 @@ func NewTailcatTransport(key *tailcat.PrivateKey, logf func(string, ...any)) *Ta
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
+	logf = redactingLogf(logf, string(key.Public.Addr()), fmt.Sprint(key.Public.PresharedKey))
 	t := &TailcatTransport{key: key, logf: logf}
 	t.newServer = func(onConn func(net.Conn)) tailcatServer {
 		srv := &tailcat.Server{
@@ -208,7 +220,7 @@ func (t *TailcatTransport) clientForLocked(addr string) *tailcat.Client {
 	}
 	c := &tailcat.Client{
 		Server: tailcat.Addr(addr),
-		Logf:   t.logf,
+		Logf:   redactingLogf(t.logf, addr),
 	}
 	if t.clients == nil {
 		t.clients = make(map[string]*tailcat.Client)
@@ -238,7 +250,7 @@ func (t *TailcatTransport) Dial(ctx context.Context, addr string) (net.Conn, err
 	conn, err := c.DialTCPPort(ctx, SyncatPort)
 	if err != nil {
 		t.discardClient(addr, c)
-		return nil, fmt.Errorf("transport: tailcat: dial %s: %w", addr, err)
+		return nil, &OpError{Op: "dial", Err: err}
 	}
 	return conn, nil
 }
@@ -332,9 +344,9 @@ func (t *TailcatTransport) Close() error {
 	clients := t.clients
 	t.clients = nil
 	t.clientsMu.Unlock()
-	for addr, c := range clients {
+	for _, c := range clients {
 		if err := c.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("transport: tailcat: close client %s: %w", addr, err))
+			errs = append(errs, &OpError{Op: "close peer client", Err: err})
 		}
 	}
 
@@ -352,4 +364,27 @@ func (t *TailcatTransport) Close() error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+func redactingLogf(next func(string, ...any), secrets ...string) func(string, ...any) {
+	return func(format string, args ...any) {
+		msg := fmt.Sprintf(format, args...)
+		for _, secret := range secrets {
+			if secret != "" {
+				msg = strings.ReplaceAll(msg, secret, "[redacted]")
+			}
+		}
+		msg = strings.Map(func(r rune) rune {
+			if r < 0x20 || r == 0x7f {
+				return ' '
+			}
+			return r
+		}, msg)
+		const maxLogRunes = 1024
+		runes := []rune(msg)
+		if len(runes) > maxLogRunes {
+			msg = string(runes[:maxLogRunes]) + "…"
+		}
+		next("%s", msg)
+	}
 }

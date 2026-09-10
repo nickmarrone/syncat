@@ -636,7 +636,7 @@ func (n *Node) snapshotPeers() []*peerConn {
 func (n *Node) recordRejected(peerKeyHex, peerName, reason string) {
 	n.rejectedMu.Lock()
 	n.rejected = append(n.rejected, RejectedConnection{
-		PeerKey: peerKeyHex, PeerName: peerName, At: n.clock.Now(), Reason: reason,
+		PeerKey: peerKeyHex, PeerName: protocol.SanitizeDiagnostic(peerName), At: n.clock.Now(), Reason: protocol.SanitizeDiagnostic(reason),
 	})
 	if len(n.rejected) > maxRejectedConnections {
 		n.rejected = n.rejected[len(n.rejected)-maxRejectedConnections:]

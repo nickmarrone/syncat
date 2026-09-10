@@ -439,7 +439,7 @@ type RemoteError struct {
 }
 
 func (e *RemoteError) Error() string {
-	return fmt.Sprintf("protocol: peer sent error %q: %s", e.Code, e.Msg)
+	return fmt.Sprintf("protocol: peer sent error %q: %s", SanitizeDiagnostic(e.Code), SanitizeDiagnostic(e.Msg))
 }
 
 // readExpected reads one frame and returns its payload if it has type

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -101,6 +102,25 @@ func TestTailcatStartFailureClosesPartialServerAndStaysFailed(t *testing.T) {
 	}
 	if err := tr.Start(context.Background(), func(net.Conn) {}); err == nil {
 		t.Fatal("second Start succeeded after failed startup")
+	}
+}
+
+func TestTailcatDiagnosticsDoNotExposeCredentialsOrControls(t *testing.T) {
+	const credential = "tc-distinctive-private-credential"
+	cause := fmt.Errorf("dial %s failed", credential)
+	err := &OpError{Op: "dial", Err: cause}
+	if strings.Contains(err.Error(), credential) {
+		t.Fatalf("typed transport error exposed credential: %q", err)
+	}
+	if !errors.Is(err, cause) {
+		t.Fatal("typed transport error did not retain its internal cause")
+	}
+
+	var logged string
+	logf := redactingLogf(func(format string, args ...any) { logged = fmt.Sprintf(format, args...) }, credential)
+	logf("failure at %s\nforged\x1b[31m", credential)
+	if strings.Contains(logged, credential) || strings.ContainsAny(logged, "\r\n\x1b") {
+		t.Fatalf("tailcat log was not safely redacted: %q", logged)
 	}
 }
 
