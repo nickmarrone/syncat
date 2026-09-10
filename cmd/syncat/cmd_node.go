@@ -431,9 +431,9 @@ func cmdVersion(paths *config.Paths, args []string) error {
 // shutdownGrace bounds how long cmdDaemon waits for in-flight HTTP
 // requests to finish before forcing the API listener closed, and
 // separately how long it waits for it to finish before giving up on a
-// clean core.Node shutdown. Generous, since the whole point is letting
-// the trash janitor and in-flight transfers finish rather than being
-// killed mid-write (SPEC.md §8's graceful-shutdown requirement).
+// clean core.Node shutdown. The HTTP grace drains accepted API requests;
+// Node.Close then cancels peer work promptly. Interrupted protocol-v3
+// transfers resume from their verified offset after reconnecting.
 const shutdownGrace = 15 * time.Second
 
 // cmdDaemon implements `syncat daemon [--api ADDR]` (SPEC.md §1/§8): it

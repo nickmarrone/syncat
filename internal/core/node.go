@@ -454,9 +454,9 @@ func (n *Node) Close() error {
 //
 // Holding closeMu for read across the Add, and taking it for write in
 // Close before waiting, orders every Add strictly before the Wait.
-// Deliberately *not* done by closing the transport before waiting, which
-// would be simpler but would abandon in-flight transfers that SPEC.md §8's
-// graceful shutdown exists to let finish.
+// The transport is closed later in Node.Close after admission has stopped.
+// Shutdown cancels peer sessions promptly; interrupted protocol-v3 transfers
+// are resumable on the next connection rather than drained during shutdown.
 func (n *Node) goTracked(fn func()) bool {
 	n.closeMu.RLock()
 	defer n.closeMu.RUnlock()

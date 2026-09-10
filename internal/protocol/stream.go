@@ -8,7 +8,6 @@ import (
 	"io"
 	"net"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -52,6 +51,9 @@ var ErrWriterClosed = errors.New("protocol: stream writer is closed")
 // programming error, not a runtime condition.
 var ErrWriterNotStarted = errors.New("protocol: stream writer has not been started")
 
+// ErrWriterAlreadyStarted is returned when Start is called more than once.
+var ErrWriterAlreadyStarted = errors.New("protocol: stream writer has already been started")
+
 // StreamWriter serializes every frame written to one live session
 // connection onto a single goroutine, fed by reserved urgent, ordinary
 // control, and shallow bulk queues. It replaces sharing a [Writer] directly across every
@@ -87,15 +89,24 @@ type StreamWriter struct {
 	observerMu    sync.Mutex
 	writeObserver func(MsgType)
 
-	started   atomic.Bool
-	startOnce sync.Once
-	stopOnce  sync.Once
-	stop      chan struct{} // closed by Close or by a terminal failure
-	done      chan struct{} // closed when the writer goroutine exits
+	stateMu    sync.Mutex
+	state      streamWriterState
+	wasStarted bool
+	stopOnce   sync.Once
+	stop       chan struct{} // closed by Close or by a terminal failure
+	done       chan struct{} // closed when the writer goroutine exits
 
 	errMu sync.Mutex
 	err   error
 }
+
+type streamWriterState uint8
+
+const (
+	streamWriterNew streamWriterState = iota
+	streamWriterRunning
+	streamWriterClosed
+)
 
 type queuedFrame struct {
 	typ  MsgType
@@ -143,13 +154,21 @@ func NewStreamWriterTo(w io.Writer) *StreamWriter {
 	return s
 }
 
-// Start launches the writer goroutine. Safe to call more than once; only
-// the first call does anything.
-func (s *StreamWriter) Start() {
-	s.startOnce.Do(func() {
-		s.started.Store(true)
-		go s.run()
-	})
+// Start launches the writer goroutine. It returns a stable error when the
+// writer has already started or was closed before being started.
+func (s *StreamWriter) Start() error {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	switch s.state {
+	case streamWriterRunning:
+		return ErrWriterAlreadyStarted
+	case streamWriterClosed:
+		return ErrWriterClosed
+	}
+	s.state = streamWriterRunning
+	s.wasStarted = true
+	go s.run()
+	return nil
 }
 
 // Close stops the writer. Frames still queued are discarded rather than
@@ -162,8 +181,11 @@ func (s *StreamWriter) Start() {
 // want it prompt should close the connection first (internal/sync.Session
 // does).
 func (s *StreamWriter) Close() error {
-	started := s.started.Load()
+	s.stateMu.Lock()
+	started := s.wasStarted
+	s.state = streamWriterClosed
 	s.stopOnce.Do(func() { close(s.stop) })
+	s.stateMu.Unlock()
 	if started {
 		<-s.done
 	}
@@ -233,8 +255,14 @@ func (s *StreamWriter) enqueue(ctx context.Context, typ MsgType, frame []byte) e
 	if err := s.Err(); err != nil {
 		return err
 	}
-	if !s.started.Load() {
+	s.stateMu.Lock()
+	state := s.state
+	s.stateMu.Unlock()
+	if state == streamWriterNew {
 		return ErrWriterNotStarted
+	}
+	if state == streamWriterClosed {
+		return s.errOrClosed()
 	}
 
 	q := queuedFrame{typ: typ, data: frame}

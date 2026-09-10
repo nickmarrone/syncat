@@ -432,7 +432,17 @@ func (pc *peerConn) offer(ctx context.Context, conn net.Conn, result *protocol.H
 	done := pc.connDone
 	pc.mu.Unlock()
 
-	sess.Start(sessCtx)
+	if err := sess.Start(sessCtx); err != nil {
+		cancel()
+		_ = sess.Close()
+		pc.mu.Lock()
+		pc.session = nil
+		pc.conn = nil
+		pc.state = ConnStateDisconnected
+		close(done)
+		pc.mu.Unlock()
+		return offerAdopted, fmt.Errorf("start session: %w", err)
+	}
 
 	// The one line that says this pairing is actually up. Without it a
 	// healthy node and one whose peer flaps every thirty seconds produce
