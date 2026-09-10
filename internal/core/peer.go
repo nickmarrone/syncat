@@ -402,6 +402,7 @@ func (pc *peerConn) offer(ctx context.Context, conn net.Conn, result *protocol.H
 	sess.SetDebug(node.debugEnabled())
 
 	ka := protocol.NewKeepalive(asProtocolClock(node.clock), 0, 0)
+	sess.Writer().SetWriteObserver(func(protocol.MsgType) { ka.RecordSent() })
 	sess.SetFrameObserver(func(protocol.MsgType) { ka.RecordReceived() })
 	sess.SetControlHandler(func(typ protocol.MsgType, payload []byte) {
 		pc.handleControl(sessCtx, sess, typ, payload)
@@ -546,7 +547,6 @@ func (pc *peerConn) runKeepalive(ctx context.Context, ka *protocol.Keepalive, se
 			conn.Close()
 			return
 		}
-		ka.RecordSent()
 	}, func() {
 		// The single most diagnostic event the transport has: the peer
 		// stopped answering entirely. Silently closing here made it

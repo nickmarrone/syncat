@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -11,7 +12,7 @@ import (
 	"time"
 )
 
-// --- the session writer: one goroutine, two lanes ----------------------
+// --- the session writer: one goroutine, three lanes --------------------
 
 // DefaultWriteTimeout bounds one frame's write on a live session. It is
 // deliberately generous: a full 1 MiB FileChunk still only needs ~17 KB/s
@@ -22,7 +23,7 @@ import (
 // connection had a deadline of any kind.
 const DefaultWriteTimeout = 60 * time.Second
 
-// Queue depths for [StreamWriter]'s two lanes.
+// Queue depths for [StreamWriter]'s urgent, control, and data lanes.
 //
 // The data lane is deliberately shallow: it exists to keep the socket fed
 // while a transfer reads its next chunk off disk, not to buffer a transfer.
@@ -35,8 +36,10 @@ const DefaultWriteTimeout = 60 * time.Second
 // per in-flight pull), because enqueueing there must never block — see
 // [StreamWriter.enqueue].
 const (
-	ctrlQueueDepth = 32
-	dataQueueDepth = 4
+	urgentQueueDepth = 8
+	ctrlQueueDepth   = 64
+	dataQueueDepth   = 4
+	maxControlBurst  = 8
 )
 
 // ErrWriterClosed is returned by [StreamWriter]'s write methods after
@@ -50,9 +53,8 @@ var ErrWriterClosed = errors.New("protocol: stream writer is closed")
 var ErrWriterNotStarted = errors.New("protocol: stream writer has not been started")
 
 // StreamWriter serializes every frame written to one live session
-// connection onto a single goroutine, fed by two queues: a priority lane
-// for control frames and a shallow lane for bulk ones (FileChunk,
-// IndexUpdate). It replaces sharing a [Writer] directly across every
+// connection onto a single goroutine, fed by reserved urgent, ordinary
+// control, and shallow bulk queues. It replaces sharing a [Writer] directly across every
 // goroutine that writes to a session.
 //
 // The point is that no caller ever waits on a bulk write. With a shared
@@ -79,8 +81,11 @@ type StreamWriter struct {
 	w       io.Writer
 	timeout time.Duration
 
-	ctrl chan []byte
-	data chan []byte
+	urgent        chan queuedFrame
+	ctrl          chan queuedFrame
+	data          chan queuedFrame
+	observerMu    sync.Mutex
+	writeObserver func(MsgType)
 
 	started   atomic.Bool
 	startOnce sync.Once
@@ -90,6 +95,11 @@ type StreamWriter struct {
 
 	errMu sync.Mutex
 	err   error
+}
+
+type queuedFrame struct {
+	typ  MsgType
+	data []byte
 }
 
 // NewStreamWriter returns a StreamWriter writing frames to conn, arming
@@ -104,8 +114,9 @@ func NewStreamWriter(conn net.Conn, timeout time.Duration) *StreamWriter {
 	s := &StreamWriter{
 		conn:    conn,
 		timeout: timeout,
-		ctrl:    make(chan []byte, ctrlQueueDepth),
-		data:    make(chan []byte, dataQueueDepth),
+		urgent:  make(chan queuedFrame, urgentQueueDepth),
+		ctrl:    make(chan queuedFrame, ctrlQueueDepth),
+		data:    make(chan queuedFrame, dataQueueDepth),
 		stop:    make(chan struct{}),
 		done:    make(chan struct{}),
 	}
@@ -113,6 +124,14 @@ func NewStreamWriter(conn net.Conn, timeout time.Duration) *StreamWriter {
 		s.w = conn
 	}
 	return s
+}
+
+// SetWriteObserver installs a callback invoked only after a complete frame
+// has been written successfully. Set it before Start.
+func (s *StreamWriter) SetWriteObserver(fn func(MsgType)) {
+	s.observerMu.Lock()
+	s.writeObserver = fn
+	s.observerMu.Unlock()
 }
 
 // NewStreamWriterTo is [NewStreamWriter] for an arbitrary io.Writer, with
@@ -162,11 +181,15 @@ func (s *StreamWriter) Err() error {
 // WriteMessage CBOR-encodes v and queues it as a frame of the given type,
 // on the control lane unless typ is a bulk type (see isBulk).
 func (s *StreamWriter) WriteMessage(typ MsgType, v any) error {
+	return s.WriteMessageContext(context.Background(), typ, v)
+}
+
+func (s *StreamWriter) WriteMessageContext(ctx context.Context, typ MsgType, v any) error {
 	payload, err := encodeMessage(typ, v)
 	if err != nil {
 		return err
 	}
-	return s.WriteFrame(typ, payload)
+	return s.WriteFrameContext(ctx, typ, payload)
 }
 
 // WriteFileChunk queues a MsgFileChunk frame (hdr followed by data's raw
@@ -184,11 +207,15 @@ func (s *StreamWriter) WriteFileChunk(hdr FileChunkHeader, data []byte) error {
 // WriteFrame queues one frame of the given type with payload as its body.
 // See [Writer.WriteFrame] for when to prefer WriteMessage/WriteFileChunk.
 func (s *StreamWriter) WriteFrame(typ MsgType, payload []byte) error {
+	return s.WriteFrameContext(context.Background(), typ, payload)
+}
+
+func (s *StreamWriter) WriteFrameContext(ctx context.Context, typ MsgType, payload []byte) error {
 	frame, err := encodeFrame(typ, payload)
 	if err != nil {
 		return err
 	}
-	return s.enqueue(typ, frame)
+	return s.enqueue(ctx, typ, frame)
 }
 
 // enqueue hands a built frame to the lane its type belongs on.
@@ -202,7 +229,7 @@ func (s *StreamWriter) WriteFrame(typ MsgType, payload []byte) error {
 // there would reintroduce the very stall this type exists to prevent (the
 // read loop enqueues its Pong inline), so instead the connection is
 // declared dead and torn down.
-func (s *StreamWriter) enqueue(typ MsgType, frame []byte) error {
+func (s *StreamWriter) enqueue(ctx context.Context, typ MsgType, frame []byte) error {
 	if err := s.Err(); err != nil {
 		return err
 	}
@@ -210,26 +237,41 @@ func (s *StreamWriter) enqueue(typ MsgType, frame []byte) error {
 		return ErrWriterNotStarted
 	}
 
+	q := queuedFrame{typ: typ, data: frame}
 	if isBulk(typ) {
 		select {
-		case s.data <- frame:
+		case s.data <- q:
 			return nil
+		case <-ctx.Done():
+			return ctx.Err()
 		case <-s.stop:
 			return s.errOrClosed()
 		}
 	}
+	if isUrgent(typ) {
+		select {
+		case s.urgent <- q:
+			return nil
+		case <-s.stop:
+			return s.errOrClosed()
+		default:
+			err := errors.New("protocol: stream writer: urgent liveness queue is full")
+			s.fail(err)
+			return err
+		}
+	}
 
 	select {
-	case s.ctrl <- frame:
+	case s.ctrl <- q:
 		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	case <-s.stop:
 		return s.errOrClosed()
-	default:
-		err := fmt.Errorf("protocol: stream writer: %d control frames are queued and unsent; the connection is not draining", ctrlQueueDepth)
-		s.fail(err)
-		return err
 	}
 }
+
+func isUrgent(typ MsgType) bool { return typ == MsgPong || typ == MsgError }
 
 // isBulk reports whether typ is a bulk frame, i.e. one big enough that
 // letting a control frame queue behind it would matter. Everything else —
@@ -245,27 +287,43 @@ func isBulk(typ MsgType) bool {
 // frame from either lane, repeat.
 func (s *StreamWriter) run() {
 	defer close(s.done)
+	burst := 0
 	for {
-		// Priority pass: never touch the data lane while a control frame
-		// is waiting.
 		select {
-		case frame := <-s.ctrl:
+		case frame := <-s.urgent:
 			if !s.writeFrame(frame) {
 				return
 			}
 			continue
 		default:
 		}
+		if burst >= maxControlBurst {
+			select {
+			case frame := <-s.data:
+				if !s.writeFrame(frame) {
+					return
+				}
+				burst = 0
+				continue
+			default:
+			}
+		}
 
 		select {
+		case frame := <-s.urgent:
+			if !s.writeFrame(frame) {
+				return
+			}
 		case frame := <-s.ctrl:
 			if !s.writeFrame(frame) {
 				return
 			}
+			burst++
 		case frame := <-s.data:
 			if !s.writeFrame(frame) {
 				return
 			}
+			burst = 0
 		case <-s.stop:
 			return
 		}
@@ -274,7 +332,7 @@ func (s *StreamWriter) run() {
 
 // writeFrame writes one built frame, reporting whether the writer should
 // keep going. A failure is terminal (see fail).
-func (s *StreamWriter) writeFrame(frame []byte) bool {
+func (s *StreamWriter) writeFrame(frame queuedFrame) bool {
 	if s.w == nil {
 		s.fail(errors.New("protocol: stream writer: no underlying writer"))
 		return false
@@ -287,7 +345,7 @@ func (s *StreamWriter) writeFrame(frame []byte) bool {
 	}
 	// io.Copy gives a frame the stdlib's full-write/error checking rather
 	// than assuming one Writer.Write consumed the entire buffer.
-	_, err := io.Copy(s.w, bytes.NewReader(frame))
+	_, err := io.Copy(s.w, bytes.NewReader(frame.data))
 	if s.conn != nil {
 		// Clear it again: the deadline is an absolute time, and leaving one
 		// armed would poison a connection that is merely idle.
@@ -296,6 +354,12 @@ func (s *StreamWriter) writeFrame(frame []byte) bool {
 	if err != nil {
 		s.fail(fmt.Errorf("protocol: stream writer: write frame: %w", err))
 		return false
+	}
+	s.observerMu.Lock()
+	observer := s.writeObserver
+	s.observerMu.Unlock()
+	if observer != nil {
+		observer(frame.typ)
 	}
 	return true
 }
