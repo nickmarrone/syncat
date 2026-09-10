@@ -81,3 +81,47 @@ func TestAnswerSyncRequestRejectsUnknownAndReceiveOnlyShares(t *testing.T) {
 		}
 	}
 }
+
+func TestIndexAckCannotAdvancePastFramesWrittenBySession(t *testing.T) {
+	n := newTestNode(t, "ack-range")
+	s := NewSession(nil, n.store, n.id, "peer", nil, nil)
+	s.ctx = context.Background()
+
+	const shareID = "share"
+	s.noteDeltaWritten(shareID, "epoch", 4)
+	if s.acceptIndexAck(protocol.IndexAck{ShareID: shareID, Epoch: "epoch", AppliedSeq: 5}) {
+		t.Fatal("ack for an unsent sequence was accepted")
+	}
+	c, err := n.store.Cursor(context.Background(), "peer", shareID, "outgoing")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.AppliedSeq != 0 {
+		t.Fatalf("forged ack advanced cursor to %d", c.AppliedSeq)
+	}
+
+	if !s.acceptIndexAck(protocol.IndexAck{ShareID: shareID, Epoch: "epoch", AppliedSeq: 4}) {
+		t.Fatal("ack for the last transmitted delta endpoint was rejected")
+	}
+	c, err = n.store.Cursor(context.Background(), "peer", shareID, "outgoing")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Epoch != "epoch" || c.AppliedSeq != 4 {
+		t.Fatalf("accepted ack stored cursor %+v", c)
+	}
+}
+
+func TestIndexAckRequiresMatchingSnapshot(t *testing.T) {
+	n := newTestNode(t, "snapshot-ack")
+	s := NewSession(nil, n.store, n.id, "peer", nil, nil)
+	s.ctx = context.Background()
+	s.noteSnapshotWritten("share", "epoch", "snapshot-good", 9)
+
+	if s.acceptIndexAck(protocol.IndexAck{ShareID: "share", Epoch: "epoch", AppliedSeq: 9, SnapshotID: "snapshot-forged"}) {
+		t.Fatal("ack for an unsent snapshot was accepted")
+	}
+	if !s.acceptIndexAck(protocol.IndexAck{ShareID: "share", Epoch: "epoch", AppliedSeq: 9, SnapshotID: "snapshot-good"}) {
+		t.Fatal("ack for the transmitted snapshot was rejected")
+	}
+}

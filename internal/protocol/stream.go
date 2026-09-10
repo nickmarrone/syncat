@@ -109,8 +109,9 @@ const (
 )
 
 type queuedFrame struct {
-	typ  MsgType
-	data []byte
+	typ       MsgType
+	data      []byte
+	onWritten func()
 }
 
 // NewStreamWriter returns a StreamWriter writing frames to conn, arming
@@ -211,7 +212,20 @@ func (s *StreamWriter) WriteMessageContext(ctx context.Context, typ MsgType, v a
 	if err != nil {
 		return err
 	}
-	return s.WriteFrameContext(ctx, typ, payload)
+	return s.writeFrameContext(ctx, typ, payload, nil)
+}
+
+// WriteMessageOnWritten queues a message and invokes onWritten on the writer
+// goroutine only after the complete frame reaches the underlying connection.
+// The callback must not block. It is intended for protocol state which must
+// distinguish queue admission from transmission, such as acknowledgement
+// ranges; general activity observation should use [StreamWriter.SetWriteObserver].
+func (s *StreamWriter) WriteMessageOnWritten(typ MsgType, v any, onWritten func()) error {
+	payload, err := encodeMessage(typ, v)
+	if err != nil {
+		return err
+	}
+	return s.writeFrameContext(context.Background(), typ, payload, onWritten)
 }
 
 // WriteFileChunk queues a MsgFileChunk frame (hdr followed by data's raw
@@ -233,11 +247,15 @@ func (s *StreamWriter) WriteFrame(typ MsgType, payload []byte) error {
 }
 
 func (s *StreamWriter) WriteFrameContext(ctx context.Context, typ MsgType, payload []byte) error {
+	return s.writeFrameContext(ctx, typ, payload, nil)
+}
+
+func (s *StreamWriter) writeFrameContext(ctx context.Context, typ MsgType, payload []byte, onWritten func()) error {
 	frame, err := encodeFrame(typ, payload)
 	if err != nil {
 		return err
 	}
-	return s.enqueue(ctx, typ, frame)
+	return s.enqueue(ctx, queuedFrame{typ: typ, data: frame, onWritten: onWritten})
 }
 
 // enqueue hands a built frame to the lane its type belongs on.
@@ -251,7 +269,7 @@ func (s *StreamWriter) WriteFrameContext(ctx context.Context, typ MsgType, paylo
 // there would reintroduce the very stall this type exists to prevent (the
 // read loop enqueues its Pong inline), so instead the connection is
 // declared dead and torn down.
-func (s *StreamWriter) enqueue(ctx context.Context, typ MsgType, frame []byte) error {
+func (s *StreamWriter) enqueue(ctx context.Context, q queuedFrame) error {
 	if err := s.Err(); err != nil {
 		return err
 	}
@@ -265,8 +283,7 @@ func (s *StreamWriter) enqueue(ctx context.Context, typ MsgType, frame []byte) e
 		return s.errOrClosed()
 	}
 
-	q := queuedFrame{typ: typ, data: frame}
-	if isBulk(typ) {
+	if isBulk(q.typ) {
 		select {
 		case s.data <- q:
 			return nil
@@ -276,7 +293,7 @@ func (s *StreamWriter) enqueue(ctx context.Context, typ MsgType, frame []byte) e
 			return s.errOrClosed()
 		}
 	}
-	if isUrgent(typ) {
+	if isUrgent(q.typ) {
 		select {
 		case s.urgent <- q:
 			return nil
@@ -388,6 +405,9 @@ func (s *StreamWriter) writeFrame(frame queuedFrame) bool {
 	s.observerMu.Unlock()
 	if observer != nil {
 		observer(frame.typ)
+	}
+	if frame.onWritten != nil {
+		frame.onWritten()
 	}
 	return true
 }
