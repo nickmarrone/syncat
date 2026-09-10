@@ -73,6 +73,45 @@ func newTestNode(t *testing.T, name string) *Node {
 	return n
 }
 
+type startFailureTransport struct {
+	transport.Transport
+	closed atomic.Bool
+}
+
+func (t *startFailureTransport) Start(context.Context, func(net.Conn)) error {
+	return errors.New("injected start failure")
+}
+func (t *startFailureTransport) Close() error {
+	t.closed.Store(true)
+	return nil
+}
+
+func TestOpenClosesTransportAfterStartFailure(t *testing.T) {
+	dir := t.TempDir()
+	paths, err := config.ResolvePaths(filepath.Join(dir, "config"), filepath.Join(dir, "data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := paths.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	identity, _, err := config.LoadOrCreateIdentityKey(paths.IdentityKeyFile())
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := &startFailureTransport{}
+	_, err = Open(context.Background(), Options{
+		Paths: paths, Config: config.Default(), Identity: identity,
+		Transport: tr, Logger: log.New(io.Discard, "", 0),
+	})
+	if err == nil {
+		t.Fatal("Open succeeded despite transport startup failure")
+	}
+	if !tr.closed.Load() {
+		t.Fatal("Open did not close transport after its Start returned an error")
+	}
+}
+
 // waitFor polls cond until it returns true or timeout elapses, failing the
 // test on timeout. Matches the identical helper already used by
 // internal/sync's and internal/index's integration-style tests.

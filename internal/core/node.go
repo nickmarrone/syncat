@@ -202,13 +202,15 @@ func Open(ctx context.Context, opts Options) (*Node, error) {
 	n.janitor = syncsvc.NewJanitor(n.trash, time.Duration(in.cfg.TrashRetentionDays)*24*time.Hour, asJanitorClock(in.clock), 0, n.onTrashSweep)
 	n.janitor.Start(nodeCtx)
 
-	// From here on a failure has to unwind what has already been started,
-	// in this order (the transport only once Start has succeeded).
-	ok, transportStarted := false, false
+	// From here on a failure has to unwind what has already been started.
+	// Once Start is attempted, Close is mandatory even if Start returns an
+	// error: transports may have partially initialized or may finish their
+	// uninterruptible startup asynchronously.
+	ok, transportAttempted := false, false
 	cleanup := func() {
 		n.janitor.Close()
 		store.Close()
-		if transportStarted {
+		if transportAttempted {
 			opts.Transport.Close()
 		}
 		cancel()
@@ -219,10 +221,10 @@ func Open(ctx context.Context, opts Options) (*Node, error) {
 		}
 	}()
 
+	transportAttempted = true
 	if err := opts.Transport.Start(nodeCtx, n.onAccept); err != nil {
 		return nil, fmt.Errorf("core: open: start transport: %w", err)
 	}
-	transportStarted = true
 
 	addr, err := opts.Transport.LocalAddress()
 	if err != nil {
