@@ -18,8 +18,7 @@ import (
 
 // --- offerer side: a peer wants access to a share we offer ----------------
 
-// provisionShareForRequest is SPEC.md §6's grant decision point (the MVP
-// auto-grants unconditionally — see the package doc comment) and the
+// provisionShareForRequest is SPEC.md §6's grant decision point and the
 // synchronous half of handling a SubscribeRequest: it must run on the
 // session's read-loop goroutine (called directly from handleControl,
 // never from a spawned goroutine), because it establishes sess's local
@@ -33,9 +32,9 @@ import (
 // Session logging "index update for unknown share" when the two halves of
 // this handling ran on independent, unordered goroutines.
 //
-// Returns the share's config (for finishSubscribeRequest) and whether a
-// matching share was found at all.
-func (n *Node) provisionShareForRequest(pc *peerConn, sess *syncsvc.Session, shareID string) (config.Share, bool) {
+// Returns the share's config, the access decision to persist and report,
+// and whether a matching share was found at all.
+func (n *Node) provisionShareForRequest(pc *peerConn, sess *syncsvc.Session, shareID string) (config.Share, string, bool) {
 	n.cfgMu.RLock()
 	i := findShareIndex(n.cfg, shareID)
 	var share config.Share
@@ -44,21 +43,25 @@ func (n *Node) provisionShareForRequest(pc *peerConn, sess *syncsvc.Session, sha
 	}
 	n.cfgMu.RUnlock()
 	if i < 0 {
-		return config.Share{}, false // unknown share; no Error code defined for this in SPEC.md §4
+		return config.Share{}, "", false // unknown share; no Error code defined for this in SPEC.md §4
 	}
 
-	// TODO(approvals): SPEC.md §6 says a share with ApprovalRequired=true
-	// should instead queue this for UI/CLI approval and only grant (and
-	// only then provision the session) on an explicit decision. The MVP
-	// auto-grants regardless — see the package doc comment — so the
-	// share's ApprovalRequired flag is intentionally unused here; it's
-	// still persisted in config for that future queue. Enforcing it will
-	// need to reconcile with this function's "must run synchronously"
-	// requirement above, since an approval decision can't be synchronous
-	// with an inbound frame that arrived before a human ever acts on it.
+	access := share.Access[pc.peerKeyHex]
+	if !share.ApprovalRequired {
+		access = protocol.AccessGranted
+	} else if access == "" || access == protocol.AccessNone {
+		access = protocol.AccessPending
+	}
+
+	// A pending, denied, or revoked request must not make the share known to
+	// the session. SetShareAccess can provision it later, on this same open
+	// connection, when an operator grants the request.
+	if access != protocol.AccessGranted {
+		return share, access, true
+	}
 	sess.AddShare(syncsvc.ShareConfig{ShareID: shareID, Root: share.Path, Direction: syncsvc.DirectionFor(share.Permission, ""), Ignore: n.shareIgnoreFunc(shareID)})
 	pc.markShareActive(shareID)
-	return share, true
+	return share, access, true
 }
 
 // finishSubscribeRequest is the asynchronous remainder of handling a
@@ -67,9 +70,9 @@ func (n *Node) provisionShareForRequest(pc *peerConn, sess *syncsvc.Session, sha
 // already did — a harmless idempotent overwrite — since SetShareAccess is
 // also the REST API's direct entry point and shouldn't have a
 // provision-already-done special case).
-func (n *Node) finishSubscribeRequest(pc *peerConn, share config.Share) {
-	if err := n.SetShareAccess(share.ID, pc.peerKeyHex, protocol.AccessGranted); err != nil {
-		n.logger.Printf("core: grant %s to %s: %v", share.ID, pc.peerKeyHex, err)
+func (n *Node) finishSubscribeRequest(pc *peerConn, share config.Share, access string) {
+	if err := n.SetShareAccess(share.ID, pc.peerKeyHex, access); err != nil {
+		n.logger.Printf("core: set %s access to %s for %s: %v", share.ID, access, pc.peerKeyHex, err)
 	}
 }
 

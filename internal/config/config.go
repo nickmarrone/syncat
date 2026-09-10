@@ -72,8 +72,8 @@ type Share struct {
 	Path             string
 	Permission       string
 	ApprovalRequired bool
-	// Access maps a peer's Ed25519 public key (hex) to "granted" or
-	// "denied".
+	// Access maps a peer's Ed25519 public key (hex) to its pending, granted,
+	// denied, or revoked access state.
 	Access map[string]string
 }
 
