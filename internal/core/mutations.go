@@ -428,7 +428,7 @@ func (n *Node) SetShareAccess(shareRef, peerRef, access string) error {
 	} else {
 		pc.neuterShare(shareID)
 	}
-	if err := sess.Writer().WriteMessage(protocol.MsgAccessUpdate, protocol.AccessUpdate{ShareID: shareID, Access: access}); err != nil {
+	if err := sess.Writer().WriteLatestMessage("access-update\x00"+shareID, protocol.MsgAccessUpdate, protocol.AccessUpdate{ShareID: shareID, Access: access}); err != nil {
 		n.logger.Printf("core: send access update for %s to %s: %v", shareID, peerKeyHex, err)
 	}
 	// An access decision changes what this peer's ShareList looks like, and

@@ -354,6 +354,9 @@ func (s *Session) handleFileRequest(ctx context.Context, req protocol.FileReques
 
 	if row.Type == protocol.FileTypeSymlink {
 		if err := s.streamSymlink(ctx, absPath, req, row); err != nil {
+			if errors.Is(err, context.Canceled) {
+				return
+			}
 			code := protocol.ErrCodeTransferFailed
 			if errors.Is(err, errFileChangedDuringTransfer) {
 				code = protocol.ErrCodeVersionChanged
@@ -371,6 +374,9 @@ func (s *Session) handleFileRequest(ctx context.Context, req protocol.FileReques
 	defer f.Close()
 
 	if err := s.streamFile(ctx, f, req, row); err != nil {
+		if errors.Is(err, context.Canceled) {
+			return
+		}
 		code := protocol.ErrCodeTransferFailed
 		if errors.Is(err, errFileChangedDuringTransfer) {
 			code = protocol.ErrCodeVersionChanged
@@ -408,7 +414,7 @@ func (s *Session) streamFile(ctx context.Context, f *os.File, req protocol.FileR
 		n, readErr := f.Read(buf)
 		if n > 0 {
 			_, _ = hasher.Write(buf[:n])
-			if err := s.writer.WriteFileChunkOnWritten(protocol.FileChunkHeader{
+			if err := s.writer.WriteFileChunkContextOnWritten(ctx, protocol.FileChunkHeader{
 				TransferID: req.TransferID, ShareID: req.ShareID, RelPath: req.RelPath, Version: row.Version, Offset: offset, EOF: false,
 			}, buf[:n], func() { s.stats.bytesSent.Add(uint64(n)) }); err != nil {
 				return fmt.Errorf("write chunk at offset %d: %w", offset, err)
@@ -429,7 +435,7 @@ func (s *Session) streamFile(ctx context.Context, f *os.File, req protocol.FileR
 	if after.Size() != before.Size() || after.ModTime() != before.ModTime() || offset != row.Size || !bytes.Equal(hasher.Sum(nil), row.SHA256) {
 		return errFileChangedDuringTransfer
 	}
-	if err := s.writer.WriteFileChunk(protocol.FileChunkHeader{
+	if err := s.writer.WriteFileChunkContext(ctx, protocol.FileChunkHeader{
 		TransferID: req.TransferID, ShareID: req.ShareID, RelPath: req.RelPath, Version: row.Version, Offset: offset, EOF: true,
 	}, nil); err != nil {
 		return fmt.Errorf("write eof chunk: %w", err)
@@ -468,12 +474,12 @@ func (s *Session) streamSymlink(ctx context.Context, absPath string, req protoco
 	if !os.SameFile(before, after) || before.Size() != after.Size() || before.ModTime() != after.ModTime() || int64(len(data)) != row.Size || !bytes.Equal(sum[:], row.SHA256) {
 		return errFileChangedDuringTransfer
 	}
-	if err := s.writer.WriteFileChunkOnWritten(protocol.FileChunkHeader{
+	if err := s.writer.WriteFileChunkContextOnWritten(ctx, protocol.FileChunkHeader{
 		TransferID: req.TransferID, ShareID: req.ShareID, RelPath: req.RelPath, Version: row.Version, Offset: 0, EOF: false,
 	}, data, func() { s.stats.bytesSent.Add(uint64(len(data))) }); err != nil {
 		return fmt.Errorf("write symlink target: %w", err)
 	}
-	if err := s.writer.WriteFileChunk(protocol.FileChunkHeader{
+	if err := s.writer.WriteFileChunkContext(ctx, protocol.FileChunkHeader{
 		TransferID: req.TransferID, ShareID: req.ShareID, RelPath: req.RelPath, Version: row.Version, Offset: int64(len(data)), EOF: true,
 	}, nil); err != nil {
 		return fmt.Errorf("write symlink eof: %w", err)
