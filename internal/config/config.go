@@ -390,6 +390,9 @@ func pathsOverlap(a, b string) bool {
 	return pathContains(a, b) || pathContains(b, a)
 }
 
+// ErrPathOverlap identifies the symmetric share/subscription tree conflict.
+var ErrPathOverlap = errors.New("share and subscription paths overlap")
+
 // CheckSharePath reports whether path may be offered as a local share,
 // given the subscriptions already in c.
 func (c *Config) CheckSharePath(path string) error {
@@ -399,9 +402,9 @@ func (c *Config) CheckSharePath(path string) error {
 	for _, sub := range c.Subscriptions {
 		if sub.LocalPath != "" && pathsOverlap(path, sub.LocalPath) {
 			return fmt.Errorf(
-				"cannot share %q: it overlaps %q, which is synced down from peer %q (share %s); "+
+				"%w: cannot share %q: it overlaps %q, which is synced down from peer %q (share %s); "+
 					"a directory received from another node cannot be offered back out",
-				path, sub.LocalPath, sub.Peer, sub.ShareID)
+				ErrPathOverlap, path, sub.LocalPath, sub.Peer, sub.ShareID)
 		}
 	}
 	return nil
@@ -418,9 +421,9 @@ func (c *Config) CheckSubscriptionPath(localPath string) error {
 	for _, s := range c.Shares {
 		if s.Path != "" && pathsOverlap(localPath, s.Path) {
 			return fmt.Errorf(
-				"cannot sync into %q: it overlaps local share %q (%s), which this node offers to peers; "+
+				"%w: cannot sync into %q: it overlaps local share %q (%s), which this node offers to peers; "+
 					"a directory received from another node cannot be offered back out",
-				localPath, s.Path, s.Name)
+				ErrPathOverlap, localPath, s.Path, s.Name)
 		}
 	}
 	return nil

@@ -543,6 +543,16 @@ func TestHandshakeRejectsUnsupportedVersion(t *testing.T) {
 	}
 }
 
+func TestHandshakeErrorCodeUsesTypedRejection(t *testing.T) {
+	err := &HandshakeRejectionError{Code: ErrCodeUnauthorized, Err: errors.New("wording without classification hints")}
+	if got := errorCode(fmt.Errorf("accept peer: %w", err)); got != ErrCodeUnauthorized {
+		t.Fatalf("errorCode = %q, want %q", got, ErrCodeUnauthorized)
+	}
+	if got := errorCode(errors.New("unknown peer key text alone")); got != ErrCodeBadHello {
+		t.Fatalf("untyped errorCode = %q, want %q", got, ErrCodeBadHello)
+	}
+}
+
 // TestHandshakeTimesOutOnSilence: the peer "connects" (the pipe is
 // already up) and then never says a word.
 func TestHandshakeTimesOutOnSilence(t *testing.T) {

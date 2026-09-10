@@ -37,13 +37,12 @@ import (
 // pair, and name may be empty.
 func matchRef(kind, ref string, candidates [][2]string) (string, error) {
 	if ref == "" {
-		return "", fmt.Errorf("empty %s reference", kind)
+		return "", mutationErrorf(MutationInvalid, "empty %s reference", kind)
 	}
 	if len(candidates) == 0 {
-		// Same "no <kind> matches" opening as the miss below, deliberately:
-		// callers (internal/api's mutationError) key the not-found status
-		// off that phrase, and an empty collection is still a miss.
-		return "", fmt.Errorf("no %s matches %q — no %ss are configured", kind, ref, kind)
+		// An empty collection is the same typed miss as a non-empty set with
+		// no matching candidate; wording remains solely diagnostic.
+		return "", mutationErrorf(MutationNotFound, "no %s matches %q — no %ss are configured", kind, ref, kind)
 	}
 
 	var byName, byPrefix []string
@@ -68,10 +67,10 @@ func matchRef(kind, ref string, candidates [][2]string) (string, error) {
 		case 1:
 			return matches[0], nil
 		default:
-			return "", fmt.Errorf("%s %q is ambiguous — it matches %s; use the full id", kind, ref, joinIDs(matches))
+			return "", mutationErrorf(MutationInvalid, "%s %q is ambiguous — it matches %s; use the full id", kind, ref, joinIDs(matches))
 		}
 	}
-	return "", fmt.Errorf("no %s matches %q — known %ss are %s", kind, ref, kind, describeCandidates(candidates))
+	return "", mutationErrorf(MutationNotFound, "no %s matches %q — known %ss are %s", kind, ref, kind, describeCandidates(candidates))
 }
 
 func joinIDs(ids []string) string {

@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 
@@ -113,7 +114,7 @@ func (n *Node) AddPeer(name, token string) (string, error) {
 	p := config.Peer{Name: name, Token: token, Enabled: true}
 	if _, err := n.mutateConfig(func(cfg *config.Config) error {
 		if findPeerIndex(cfg, peerKeyHex) >= 0 {
-			return fmt.Errorf("peer %s is already configured", peerKeyHex)
+			return mutationErrorf(MutationConflict, "peer %s is already configured", peerKeyHex)
 		}
 		cfg.Peers = append(cfg.Peers, p)
 		return nil
@@ -166,7 +167,7 @@ func (n *Node) RemovePeer(peerRef string) error {
 	if _, err := n.mutateConfig(func(cfg *config.Config) error {
 		i := findPeerIndex(cfg, peerKeyHex)
 		if i < 0 {
-			return fmt.Errorf("peer %s is not configured", peerKeyHex)
+			return mutationErrorf(MutationNotFound, "peer %s is not configured", peerKeyHex)
 		}
 		cfg.Peers = append(cfg.Peers[:i], cfg.Peers[i+1:]...)
 
@@ -233,6 +234,9 @@ func (n *Node) AddShare(path, name, permission string, approvalRequired bool) (s
 
 	if _, err := n.mutateConfig(func(cfg *config.Config) error {
 		if err := cfg.CheckSharePath(path); err != nil {
+			if errors.Is(err, config.ErrPathOverlap) {
+				return mutationError(MutationConflict, err)
+			}
 			return err
 		}
 		cfg.Shares = append(cfg.Shares, config.Share{
@@ -265,7 +269,7 @@ func (n *Node) RemoveShare(shareRef string) error {
 	if _, err := n.mutateConfig(func(cfg *config.Config) error {
 		i := findShareIndex(cfg, shareID)
 		if i < 0 {
-			return fmt.Errorf("share %s is not configured", shareID)
+			return mutationErrorf(MutationNotFound, "share %s is not configured", shareID)
 		}
 		cfg.Shares = append(cfg.Shares[:i], cfg.Shares[i+1:]...)
 		return nil
@@ -289,7 +293,7 @@ func (n *Node) RenameShare(shareRef, name string) error {
 	if _, err := n.mutateConfig(func(cfg *config.Config) error {
 		i := findShareIndex(cfg, shareID)
 		if i < 0 {
-			return fmt.Errorf("share %s is not configured", shareID)
+			return mutationErrorf(MutationNotFound, "share %s is not configured", shareID)
 		}
 		cfg.Shares[i].Name = name
 		return nil
@@ -315,7 +319,7 @@ func (n *Node) SetSharePermission(shareRef, permission string) error {
 	if _, err := n.mutateConfig(func(cfg *config.Config) error {
 		i := findShareIndex(cfg, shareID)
 		if i < 0 {
-			return fmt.Errorf("share %s is not configured", shareID)
+			return mutationErrorf(MutationNotFound, "share %s is not configured", shareID)
 		}
 		cfg.Shares[i].Permission = permission
 		return nil
@@ -355,7 +359,7 @@ func (n *Node) SetShareApprovalRequired(shareRef string, required bool) error {
 	if _, err := n.mutateConfig(func(cfg *config.Config) error {
 		i := findShareIndex(cfg, shareID)
 		if i < 0 {
-			return fmt.Errorf("share %s is not configured", shareID)
+			return mutationErrorf(MutationNotFound, "share %s is not configured", shareID)
 		}
 		cfg.Shares[i].ApprovalRequired = required
 		return nil
@@ -394,7 +398,7 @@ func (n *Node) SetShareAccess(shareRef, peerRef, access string) error {
 	if _, err := n.mutateConfig(func(cfg *config.Config) error {
 		i := findShareIndex(cfg, shareID)
 		if i < 0 {
-			return fmt.Errorf("share %s is not configured", shareID)
+			return mutationErrorf(MutationNotFound, "share %s is not configured", shareID)
 		}
 		if cfg.Shares[i].Access == nil {
 			cfg.Shares[i].Access = map[string]string{}
@@ -476,12 +480,12 @@ func (n *Node) AddSubscription(peerRef, shareRef, localPath, mode string) error 
 	}
 	pc, err := n.resolvePeerRef(peerRef)
 	if err != nil {
-		return fmt.Errorf("core: add subscription: %w", err)
+		return mutationError(MutationInvalid, fmt.Errorf("core: add subscription: %w", err))
 	}
 	peerKeyHex := pc.peerKeyHex
 	shareID, err := n.resolveOfferedShareRef(pc, shareRef)
 	if err != nil {
-		return fmt.Errorf("core: add subscription: %w", err)
+		return mutationError(MutationInvalid, fmt.Errorf("core: add subscription: %w", err))
 	}
 	if err := os.MkdirAll(localPath, 0o700); err != nil {
 		return fmt.Errorf("core: add subscription: create local path: %w", err)
@@ -489,11 +493,14 @@ func (n *Node) AddSubscription(peerRef, shareRef, localPath, mode string) error 
 
 	if _, err := n.mutateConfig(func(cfg *config.Config) error {
 		if err := cfg.CheckSubscriptionPath(localPath); err != nil {
+			if errors.Is(err, config.ErrPathOverlap) {
+				return mutationError(MutationConflict, err)
+			}
 			return err
 		}
 		for _, s := range cfg.Subscriptions {
 			if s.Peer == peerKeyHex && s.ShareID == shareID {
-				return fmt.Errorf("subscription to peer %s share %s already exists", peerKeyHex, shareID)
+				return mutationErrorf(MutationConflict, "subscription to peer %s share %s already exists", peerKeyHex, shareID)
 			}
 		}
 		cfg.Subscriptions = append(cfg.Subscriptions, config.Subscription{
@@ -525,7 +532,7 @@ func (n *Node) RemoveSubscription(peerRef, shareRef string) error {
 	if _, err := n.mutateConfig(func(cfg *config.Config) error {
 		idx := findSubscriptionIndex(cfg, peerKeyHex, shareID)
 		if idx < 0 {
-			return fmt.Errorf("subscription to peer %s share %s is not configured", peerKeyHex, shareID)
+			return mutationErrorf(MutationNotFound, "subscription to peer %s share %s is not configured", peerKeyHex, shareID)
 		}
 		cfg.Subscriptions = append(cfg.Subscriptions[:idx], cfg.Subscriptions[idx+1:]...)
 		return nil
@@ -550,7 +557,7 @@ func (n *Node) PauseSubscription(peerRef, shareRef string, paused bool) error {
 	if _, err := n.mutateConfig(func(cfg *config.Config) error {
 		idx := findSubscriptionIndex(cfg, peerKeyHex, shareID)
 		if idx < 0 {
-			return fmt.Errorf("subscription to peer %s share %s is not configured", peerKeyHex, shareID)
+			return mutationErrorf(MutationNotFound, "subscription to peer %s share %s is not configured", peerKeyHex, shareID)
 		}
 		cfg.Subscriptions[idx].Paused = paused
 		sub = cfg.Subscriptions[idx]
@@ -628,7 +635,7 @@ func (n *Node) shareOrSubscriptionRoot(shareID string) (string, error) {
 			return sub.LocalPath, nil
 		}
 	}
-	return "", fmt.Errorf("share %s is not a local share or subscription", shareID)
+	return "", mutationErrorf(MutationNotFound, "share %s is not a local share or subscription", shareID)
 }
 
 // ListTrash returns every trashed entry for shareID (SPEC.md §7),
@@ -679,7 +686,7 @@ func (n *Node) RestoreTrash(ctx context.Context, shareRef, relPath string) (inde
 		}
 	}
 	if match == nil {
-		return index.FileRow{}, fmt.Errorf("core: restore trash: no trashed entry %q for share %s", relPath, shareID)
+		return index.FileRow{}, mutationErrorf(MutationNotFound, "core: restore trash: no trashed entry %q for share %s", relPath, shareID)
 	}
 
 	row, err := n.trash.Restore(ctx, n.store, n.identity.ShortID(), root, *match)

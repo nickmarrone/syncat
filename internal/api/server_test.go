@@ -296,6 +296,30 @@ func TestNewHTTPServerSetsResourceTimeouts(t *testing.T) {
 	}
 }
 
+func TestMutationErrorUsesCoreTypeNotWording(t *testing.T) {
+	cases := []struct {
+		kind   core.MutationErrorKind
+		status int
+		code   string
+	}{
+		{core.MutationInvalid, http.StatusBadRequest, "bad_request"},
+		{core.MutationNotFound, http.StatusNotFound, "not_found"},
+		{core.MutationConflict, http.StatusConflict, "conflict"},
+	}
+	for _, tc := range cases {
+		err := fmt.Errorf("outer context: %w", &core.MutationError{Kind: tc.kind, Err: errors.New("opaque wording")})
+		status, code, message := mutationError(err)
+		if status != tc.status || code != tc.code || message != err.Error() {
+			t.Errorf("kind %d => (%d, %q, %q), want (%d, %q, %q)", tc.kind, status, code, message, tc.status, tc.code, err.Error())
+		}
+	}
+
+	status, code, _ := mutationError(errors.New("already configured but untyped"))
+	if status != http.StatusBadRequest || code != "bad_request" {
+		t.Fatalf("untyped keyword error => (%d, %q), want bad request", status, code)
+	}
+}
+
 func TestHTTPServerClosesLiveSlowHeaderConnection(t *testing.T) {
 	srv := NewHTTPServer(http.NotFoundHandler())
 	srv.ReadHeaderTimeout = 50 * time.Millisecond

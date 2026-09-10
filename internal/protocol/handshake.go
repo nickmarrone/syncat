@@ -14,7 +14,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"strings"
 	"time"
 
 	"github.com/nickmarrone/syncat/internal/config"
@@ -318,27 +317,33 @@ func checkOwnToken(token string, ourPub ed25519.PublicKey) error {
 
 func validatePeerHello(cfg HandshakeConfig, ourVersion, minVersion int, h Hello) error {
 	if err := validateHelloShape(h); err != nil {
-		return err
+		return &HandshakeRejectionError{Code: ErrCodeBadHello, Err: err}
 	}
 	if _, err := negotiateVersion(ourVersion, minVersion, h.ProtoVersion); err != nil {
-		return err
+		return &HandshakeRejectionError{Code: ErrCodeUnsupportedVersion, Err: err}
 	}
 	if !cfg.IsKnownPeer(ed25519.PublicKey(h.Ed25519Pub)) {
-		return fmt.Errorf("unknown peer key %x", h.Ed25519Pub)
+		return &HandshakeRejectionError{Code: ErrCodeUnauthorized, Err: fmt.Errorf("unknown peer key %x", h.Ed25519Pub)}
 	}
 	return nil
 }
 
+// HandshakeRejectionError binds a stable wire error code to the detailed
+// validation failure without classifying human-readable text.
+type HandshakeRejectionError struct {
+	Code string
+	Err  error
+}
+
+func (e *HandshakeRejectionError) Error() string { return e.Err.Error() }
+func (e *HandshakeRejectionError) Unwrap() error { return e.Err }
+
 func errorCode(err error) string {
-	s := err.Error()
-	switch {
-	case strings.Contains(s, "proto_version"):
-		return ErrCodeUnsupportedVersion
-	case strings.Contains(s, "unknown peer key"):
-		return ErrCodeUnauthorized
-	default:
-		return ErrCodeBadHello
+	var rejection *HandshakeRejectionError
+	if errors.As(err, &rejection) {
+		return rejection.Code
 	}
+	return ErrCodeBadHello
 }
 
 func handshakeTranscript(client, server Hello, negotiated int) []byte {
