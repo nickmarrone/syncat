@@ -162,11 +162,13 @@ type Session struct {
 	// on the read loop independently).
 	reconcileMu sync.Mutex
 
-	pullMu   sync.Mutex
-	pullSem  chan struct{}
-	pullTbl  map[transferKey]*pullEntry
-	serveSem chan struct{}
-	indexSem chan struct{}
+	pullMu      sync.Mutex
+	pullSem     chan struct{}
+	pullTbl     map[transferKey]*pullEntry
+	serveSem    chan struct{}
+	indexSem    chan struct{}
+	serveMu     sync.Mutex
+	serveCancel map[string]context.CancelFunc
 
 	// pullActive/pullPeak instrument concurrent-pull behavior for tests
 	// (see integration_test.go's interleaving test); always zero-cost in
@@ -218,23 +220,24 @@ func NewSession(conn net.Conn, store *index.Store, nodeID, peerID string, clock 
 		logger = log.Default()
 	}
 	return &Session{
-		conn:      conn,
-		reader:    protocol.NewReader(conn),
-		writer:    protocol.NewStreamWriter(conn, 0),
-		store:     store,
-		nodeID:    nodeID,
-		peerID:    peerID,
-		peerLabel: peerID,
-		clock:     clock,
-		logger:    logger,
-		warnIndex: make(map[string]int),
-		shares:    make(map[string]*ShareConfig),
-		snapshots: make(map[string]protocol.IndexSnapshotBegin),
-		pullSem:   make(chan struct{}, maxConcurrentPulls),
-		pullTbl:   make(map[transferKey]*pullEntry),
-		serveSem:  make(chan struct{}, maxConcurrentServes),
-		indexSem:  make(chan struct{}, maxConcurrentIndexJobs),
-		done:      make(chan struct{}),
+		conn:        conn,
+		reader:      protocol.NewReader(conn),
+		writer:      protocol.NewStreamWriter(conn, 0),
+		store:       store,
+		nodeID:      nodeID,
+		peerID:      peerID,
+		peerLabel:   peerID,
+		clock:       clock,
+		logger:      logger,
+		warnIndex:   make(map[string]int),
+		shares:      make(map[string]*ShareConfig),
+		snapshots:   make(map[string]protocol.IndexSnapshotBegin),
+		pullSem:     make(chan struct{}, maxConcurrentPulls),
+		pullTbl:     make(map[transferKey]*pullEntry),
+		serveSem:    make(chan struct{}, maxConcurrentServes),
+		indexSem:    make(chan struct{}, maxConcurrentIndexJobs),
+		serveCancel: make(map[string]context.CancelFunc),
+		done:        make(chan struct{}),
 	}
 }
 
@@ -1041,7 +1044,7 @@ func (s *Session) readLoop() {
 				s.logf("decode FileChunk: %v", err)
 				continue
 			}
-			s.routeChunk(hdr.ShareID, hdr.RelPath, pullChunk{data: data, eof: hdr.EOF})
+			s.routeChunk(hdr.TransferID, pullChunk{header: hdr, data: data, eof: hdr.EOF})
 
 		case protocol.MsgError:
 			var e protocol.Error
@@ -1049,10 +1052,15 @@ func (s *Session) readLoop() {
 				s.logf("decode Error: %v", err)
 				continue
 			}
-			if e.ShareID != "" || e.RelPath != "" {
-				s.routeChunk(e.ShareID, e.RelPath, pullChunk{err: &protocol.RemoteError{Code: e.Code, Msg: e.Msg}})
+			if e.TransferID != "" {
+				s.routeChunk(e.TransferID, pullChunk{err: &protocol.RemoteError{Code: e.Code, Msg: e.Msg}})
 			} else {
 				s.logf("peer error: %s: %s", protocol.SanitizeDiagnostic(e.Code), protocol.SanitizeDiagnostic(e.Msg))
+			}
+		case protocol.MsgCancelTransfer:
+			var m protocol.CancelTransfer
+			if protocol.DecodeAndValidateMessage(payload, &m) == nil {
+				s.cancelServe(m.TransferID)
 			}
 
 		default:

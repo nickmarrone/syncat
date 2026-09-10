@@ -65,6 +65,7 @@ const (
 	MsgIndexSnapshotEnd
 	MsgIndexDeltaBatch
 	MsgIndexAck
+	MsgCancelTransfer
 )
 
 func (t MsgType) String() string {
@@ -105,6 +106,8 @@ func (t MsgType) String() string {
 		return "IndexDeltaBatch"
 	case MsgIndexAck:
 		return "IndexAck"
+	case MsgCancelTransfer:
+		return "CancelTransfer"
 	default:
 		return fmt.Sprintf("MsgType(%d)", byte(t))
 	}
@@ -289,10 +292,11 @@ type IndexAck struct {
 // FileRequest asks the holder of a file for its bytes, optionally resuming
 // from Offset (puller → holder, SPEC.md §4).
 type FileRequest struct {
-	ShareID string        `cbor:"share_id"`
-	RelPath string        `cbor:"relpath"`
-	Version VersionVector `cbor:"version"`
-	Offset  int64         `cbor:"offset"`
+	TransferID string        `cbor:"transfer_id"`
+	ShareID    string        `cbor:"share_id"`
+	RelPath    string        `cbor:"relpath"`
+	Version    VersionVector `cbor:"version"`
+	Offset     int64         `cbor:"offset"`
 }
 
 // FileChunkHeader is the small CBOR header preceding a FileChunk's raw
@@ -301,11 +305,16 @@ type FileRequest struct {
 // FileChunk's payload is CBOR header + raw bytes concatenated, not a
 // single CBOR value.
 type FileChunkHeader struct {
-	ShareID string        `cbor:"share_id"`
-	RelPath string        `cbor:"relpath"`
-	Version VersionVector `cbor:"version"`
-	Offset  int64         `cbor:"offset"`
-	EOF     bool          `cbor:"eof"`
+	TransferID string        `cbor:"transfer_id"`
+	ShareID    string        `cbor:"share_id"`
+	RelPath    string        `cbor:"relpath"`
+	Version    VersionVector `cbor:"version"`
+	Offset     int64         `cbor:"offset"`
+	EOF        bool          `cbor:"eof"`
+}
+
+type CancelTransfer struct {
+	TransferID string `cbor:"transfer_id"`
 }
 
 // Ping and Pong are empty keepalive messages (SPEC.md §4); see keepalive.go
@@ -328,8 +337,10 @@ const (
 	// never a hung stream"). Unlike the handshake codes above, an Error
 	// carrying one of these also sets ShareID/RelPath so the requester can
 	// route it back to the specific FileRequest it answers.
-	ErrCodeFileNotFound   = "file_not_found"
-	ErrCodeVersionChanged = "version_changed"
+	ErrCodeFileNotFound      = "file_not_found"
+	ErrCodeVersionChanged    = "version_changed"
+	ErrCodeUnsupportedOffset = "unsupported_offset"
+	ErrCodeTransferFailed    = "transfer_failed"
 )
 
 // Error reports a protocol-level failure to the peer before closing the
@@ -341,10 +352,11 @@ const (
 // the package doc comment above): Error is CBOR-map encoded, so older
 // decoders that don't know about them simply ignore them.
 type Error struct {
-	Code    string `cbor:"code"`
-	Msg     string `cbor:"msg"`
-	ShareID string `cbor:"share_id,omitempty"`
-	RelPath string `cbor:"relpath,omitempty"`
+	Code       string `cbor:"code"`
+	Msg        string `cbor:"msg"`
+	ShareID    string `cbor:"share_id,omitempty"`
+	RelPath    string `cbor:"relpath,omitempty"`
+	TransferID string `cbor:"transfer_id,omitempty"`
 }
 
 // --- framing: length-prefixed frames on the wire -----------------------
@@ -696,6 +708,9 @@ func validateFiles(files []FileInfo) error {
 }
 
 func validateFileChunkHeader(h FileChunkHeader) error {
+	if err := validateTransferID(h.TransferID); err != nil {
+		return err
+	}
 	if err := validateShareID(h.ShareID); err != nil {
 		return err
 	}
@@ -706,6 +721,18 @@ func validateFileChunkHeader(h FileChunkHeader) error {
 		return errors.New("file chunk offset is negative")
 	}
 	return validateVersion(h.Version)
+}
+
+func validateTransferID(id string) error {
+	if len(id) != 32 {
+		return errors.New("transfer_id must be 32 hexadecimal characters")
+	}
+	for _, c := range id {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return errors.New("transfer_id is not canonical lowercase hex")
+		}
+	}
+	return nil
 }
 
 // ValidateMessage validates supported post-handshake message structs.
@@ -799,6 +826,9 @@ func ValidateMessage(v any) error {
 		}
 		return validBoundedText("snapshot_id", m.SnapshotID, maxWireIDLen, false)
 	case *FileRequest:
+		if err := validateTransferID(m.TransferID); err != nil {
+			return err
+		}
 		if err := validateShareID(m.ShareID); err != nil {
 			return err
 		}
@@ -822,8 +852,15 @@ func ValidateMessage(v any) error {
 			}
 		}
 		if m.RelPath != "" {
-			return validateRelPath(m.RelPath)
+			if err := validateRelPath(m.RelPath); err != nil {
+				return err
+			}
 		}
+		if m.ShareID != "" || m.RelPath != "" || m.TransferID != "" {
+			return validateTransferID(m.TransferID)
+		}
+	case *CancelTransfer:
+		return validateTransferID(m.TransferID)
 	}
 	return nil
 }

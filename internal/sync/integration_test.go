@@ -108,6 +108,10 @@ func indexFileWithMTime(t *testing.T, store *index.Store, nodeID, relpath, root 
 	if err != nil {
 		t.Fatalf("read %s: %v", full, err)
 	}
+	mtime := time.Unix(0, mtimeNS)
+	if err := os.Chtimes(full, mtime, mtime); err != nil {
+		t.Fatalf("set mtime %s: %v", full, err)
+	}
 	sum := sha256.Sum256(data)
 	return putIndexRow(t, store, nodeID, relpath, protocol.FileTypeFile, int64(len(data)), mtimeNS, sum[:])
 }

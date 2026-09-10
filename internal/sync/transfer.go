@@ -6,7 +6,11 @@
 package sync
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -14,6 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/nickmarrone/syncat/internal/index"
 	"github.com/nickmarrone/syncat/internal/protocol"
 )
 
@@ -41,17 +46,17 @@ const pullStallTimeout = 60 * time.Second
 // FileChunk's header carries, so the read loop can demultiplex chunks for
 // several concurrent transfers arriving interleaved on the same stream.
 type transferKey struct {
-	shareID string
-	relpath string
+	id string
 }
 
 // pullChunk is one unit handed from the read loop to a waiting pullFile
 // call: either a chunk of data (possibly the final, EOF-marked one) or an
 // error the peer reported for this specific transfer.
 type pullChunk struct {
-	data []byte
-	eof  bool
-	err  error
+	header protocol.FileChunkHeader
+	data   []byte
+	eof    bool
+	err    error
 }
 
 // pullQueueDepth is how many received chunks one in-flight pull will hold
@@ -96,8 +101,8 @@ var ErrTransferStalled = errors.New("peer sent neither a chunk nor an error befo
 // any. A chunk for an unknown or already-finished/cancelled transfer
 // (e.g. arriving after the puller gave up) is discarded here rather than
 // corrupting or blocking on some other transfer's channel.
-func (s *Session) routeChunk(shareID, relpath string, c pullChunk) {
-	key := transferKey{shareID, relpath}
+func (s *Session) routeChunk(transferID string, c pullChunk) {
+	key := transferKey{id: transferID}
 	s.pullMu.Lock()
 	entry, ok := s.pullTbl[key]
 	s.pullMu.Unlock()
@@ -108,6 +113,14 @@ func (s *Session) routeChunk(shareID, relpath string, c pullChunk) {
 	case entry.ch <- c:
 	case <-s.ctx.Done():
 	}
+}
+
+func newTransferID() (string, error) {
+	var id [16]byte
+	if _, err := rand.Read(id[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(id[:]), nil
 }
 
 // pullFile fetches wireRelPath's content (as shareID's holder — the peer
@@ -123,7 +136,7 @@ func (s *Session) routeChunk(shareID, relpath string, c pullChunk) {
 // While waiting for chunks, pullFile is fed by the Session's single read
 // loop via routeChunk, which demultiplexes interleaved FileChunk frames
 // for every concurrently in-flight pull by (shareID, relpath).
-func (s *Session) pullFile(ctx context.Context, shareID, wireRelPath string, version protocol.VersionVector, dst io.Writer) (int64, error) {
+func (s *Session) pullFile(ctx context.Context, shareID, wireRelPath string, version protocol.VersionVector, expectedSize int64, dst io.Writer) (int64, error) {
 	select {
 	case s.pullSem <- struct{}{}:
 	case <-ctx.Done():
@@ -134,7 +147,11 @@ func (s *Session) pullFile(ctx context.Context, shareID, wireRelPath string, ver
 	done := s.notePullActive()
 	defer done()
 
-	key := transferKey{shareID, wireRelPath}
+	transferID, err := newTransferID()
+	if err != nil {
+		return 0, fmt.Errorf("sync: create transfer id: %w", err)
+	}
+	key := transferKey{id: transferID}
 	entry := &pullEntry{ch: make(chan pullChunk, pullQueueDepth)}
 	s.pullMu.Lock()
 	if _, exists := s.pullTbl[key]; exists {
@@ -150,9 +167,10 @@ func (s *Session) pullFile(ctx context.Context, shareID, wireRelPath string, ver
 	}()
 
 	if err := s.writer.WriteMessage(protocol.MsgFileRequest, protocol.FileRequest{
-		ShareID: shareID,
-		RelPath: wireRelPath,
-		Version: version,
+		TransferID: transferID,
+		ShareID:    shareID,
+		RelPath:    wireRelPath,
+		Version:    version,
 		// Offset is always 0: resume is deferred (SPEC.md §4 keeps the
 		// field on the wire for a later phase to populate).
 		Offset: 0,
@@ -172,6 +190,12 @@ func (s *Session) pullFile(ctx context.Context, shareID, wireRelPath string, ver
 	defer stall.Stop()
 
 	var total int64
+	terminal := false
+	defer func() {
+		if !terminal {
+			_ = s.writer.WriteMessage(protocol.MsgCancelTransfer, protocol.CancelTransfer{TransferID: transferID})
+		}
+	}()
 	for {
 		select {
 		case c, ok := <-entry.ch:
@@ -179,7 +203,11 @@ func (s *Session) pullFile(ctx context.Context, shareID, wireRelPath string, ver
 				return total, fmt.Errorf("sync: pull %s/%s: transfer channel closed", shareID, wireRelPath)
 			}
 			if c.err != nil {
+				terminal = true
 				return total, fmt.Errorf("sync: pull %s/%s: %w", shareID, wireRelPath, c.err)
+			}
+			if c.header.TransferID != transferID || c.header.ShareID != shareID || c.header.RelPath != wireRelPath || !Equal(c.header.Version, version) || c.header.Offset != total {
+				return total, fmt.Errorf("sync: pull %s/%s: invalid chunk identity or offset", shareID, wireRelPath)
 			}
 			if len(c.data) > 0 {
 				n, err := dst.Write(c.data)
@@ -189,6 +217,10 @@ func (s *Session) pullFile(ctx context.Context, shareID, wireRelPath string, ver
 				}
 			}
 			if c.eof {
+				if expectedSize >= 0 && total != expectedSize {
+					return total, fmt.Errorf("sync: pull %s/%s: EOF at %d bytes, expected %d", shareID, wireRelPath, total, expectedSize)
+				}
+				terminal = true
 				return total, nil
 			}
 			resetStallTimer(stall, stallAfter)
@@ -236,6 +268,17 @@ func resetStallTimer(t *time.Timer, d time.Duration) {
 // whose current version differs from what the requester asked for, gets
 // an Error reply (SPEC.md §4/§5) rather than a hung or truncated stream.
 func (s *Session) handleFileRequest(ctx context.Context, req protocol.FileRequest) {
+	if req.Offset != 0 {
+		s.sendFileError(req, protocol.ErrCodeUnsupportedOffset, "resume offsets are not supported")
+		return
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	if !s.registerServe(req.TransferID, cancel) {
+		cancel()
+		s.sendFileError(req, protocol.ErrCodeTransferFailed, "duplicate transfer id")
+		return
+	}
+	defer func() { s.unregisterServe(req.TransferID); cancel() }()
 	cfg, ok := s.getShare(req.ShareID)
 	if !ok || cfg.Direction.OutboundBlocked {
 		s.sendFileError(req, protocol.ErrCodeFileNotFound, "unknown share")
@@ -295,10 +338,16 @@ func (s *Session) handleFileRequest(ctx context.Context, req protocol.FileReques
 	}
 	defer f.Close()
 
-	if err := s.streamFile(f, req, row.Version); err != nil {
-		s.logf("serve %s/%s: %v", req.ShareID, req.RelPath, err)
+	if err := s.streamFile(ctx, f, req, row); err != nil {
+		code := protocol.ErrCodeTransferFailed
+		if errors.Is(err, errFileChangedDuringTransfer) {
+			code = protocol.ErrCodeVersionChanged
+		}
+		s.sendFileError(req, code, err.Error())
 	}
 }
+
+var errFileChangedDuringTransfer = errors.New("file changed during transfer")
 
 // streamFile sends f's contents as a sequence of FileChunk frames of at
 // most protocol.MaxFileChunkData bytes each — f is never read into memory
@@ -307,14 +356,28 @@ func (s *Session) handleFileRequest(ctx context.Context, req protocol.FileReques
 // trying to detect end-of-file on the same read that returned the last
 // data) keeps the read side's contract simple: EOF is only ever true, and
 // only needs handling, on a frame it already received.
-func (s *Session) streamFile(f *os.File, req protocol.FileRequest, version protocol.VersionVector) error {
+func (s *Session) streamFile(ctx context.Context, f *os.File, req protocol.FileRequest, row index.FileRow) error {
+	before, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("stat before read: %w", err)
+	}
+	if before.Size() != row.Size || before.ModTime().UnixNano() != row.MTimeNS {
+		return errFileChangedDuringTransfer
+	}
 	buf := make([]byte, protocol.MaxFileChunkData)
+	hasher := sha256.New()
 	var offset int64
 	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
 		n, readErr := f.Read(buf)
 		if n > 0 {
+			_, _ = hasher.Write(buf[:n])
 			if err := s.writer.WriteFileChunk(protocol.FileChunkHeader{
-				ShareID: req.ShareID, RelPath: req.RelPath, Version: version, Offset: offset, EOF: false,
+				TransferID: req.TransferID, ShareID: req.ShareID, RelPath: req.RelPath, Version: row.Version, Offset: offset, EOF: false,
 			}, buf[:n]); err != nil {
 				return fmt.Errorf("write chunk at offset %d: %w", offset, err)
 			}
@@ -327,8 +390,15 @@ func (s *Session) streamFile(f *os.File, req protocol.FileRequest, version proto
 			return fmt.Errorf("read at offset %d: %w", offset, readErr)
 		}
 	}
+	after, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("stat after read: %w", err)
+	}
+	if after.Size() != before.Size() || after.ModTime() != before.ModTime() || offset != row.Size || !bytes.Equal(hasher.Sum(nil), row.SHA256) {
+		return errFileChangedDuringTransfer
+	}
 	if err := s.writer.WriteFileChunk(protocol.FileChunkHeader{
-		ShareID: req.ShareID, RelPath: req.RelPath, Version: version, Offset: offset, EOF: true,
+		TransferID: req.TransferID, ShareID: req.ShareID, RelPath: req.RelPath, Version: row.Version, Offset: offset, EOF: true,
 	}, nil); err != nil {
 		return fmt.Errorf("write eof chunk: %w", err)
 	}
@@ -346,13 +416,13 @@ func (s *Session) serveSymlink(absPath string, req protocol.FileRequest, version
 	}
 	data := []byte(target)
 	if err := s.writer.WriteFileChunk(protocol.FileChunkHeader{
-		ShareID: req.ShareID, RelPath: req.RelPath, Version: version, Offset: 0, EOF: false,
+		TransferID: req.TransferID, ShareID: req.ShareID, RelPath: req.RelPath, Version: version, Offset: 0, EOF: false,
 	}, data); err != nil {
 		s.logf("serve symlink %s/%s: %v", req.ShareID, req.RelPath, err)
 		return
 	}
 	if err := s.writer.WriteFileChunk(protocol.FileChunkHeader{
-		ShareID: req.ShareID, RelPath: req.RelPath, Version: version, Offset: int64(len(data)), EOF: true,
+		TransferID: req.TransferID, ShareID: req.ShareID, RelPath: req.RelPath, Version: version, Offset: int64(len(data)), EOF: true,
 	}, nil); err != nil {
 		s.logf("serve symlink %s/%s: eof: %v", req.ShareID, req.RelPath, err)
 	}
@@ -361,5 +431,29 @@ func (s *Session) serveSymlink(absPath string, req protocol.FileRequest, version
 func (s *Session) sendFileError(req protocol.FileRequest, code, msg string) {
 	_ = s.writer.WriteMessage(protocol.MsgError, protocol.Error{
 		Code: code, Msg: msg, ShareID: req.ShareID, RelPath: req.RelPath,
+		TransferID: req.TransferID,
 	})
+}
+
+func (s *Session) registerServe(id string, cancel context.CancelFunc) bool {
+	s.serveMu.Lock()
+	defer s.serveMu.Unlock()
+	if _, exists := s.serveCancel[id]; exists {
+		return false
+	}
+	s.serveCancel[id] = cancel
+	return true
+}
+func (s *Session) unregisterServe(id string) {
+	s.serveMu.Lock()
+	delete(s.serveCancel, id)
+	s.serveMu.Unlock()
+}
+func (s *Session) cancelServe(id string) {
+	s.serveMu.Lock()
+	cancel := s.serveCancel[id]
+	s.serveMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 }
