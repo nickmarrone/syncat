@@ -6,15 +6,18 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/nickmarrone/syncat/internal/config"
 	"github.com/nickmarrone/syncat/internal/core"
@@ -290,6 +293,47 @@ func TestNewHTTPServerSetsResourceTimeouts(t *testing.T) {
 	srv := NewHTTPServer(http.NotFoundHandler())
 	if srv.ReadHeaderTimeout != HTTPReadHeaderTimeout || srv.IdleTimeout != HTTPIdleTimeout || srv.MaxHeaderBytes != HTTPMaxHeaderBytes {
 		t.Fatalf("HTTP server limits = (%v, %v, %d), want (%v, %v, %d)", srv.ReadHeaderTimeout, srv.IdleTimeout, srv.MaxHeaderBytes, HTTPReadHeaderTimeout, HTTPIdleTimeout, HTTPMaxHeaderBytes)
+	}
+}
+
+func TestHTTPServerClosesLiveSlowHeaderConnection(t *testing.T) {
+	srv := NewHTTPServer(http.NotFoundHandler())
+	srv.ReadHeaderTimeout = 50 * time.Millisecond
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = srv.Close()
+		_ = ln.Close()
+	})
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- srv.Serve(ln) }()
+
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := io.WriteString(conn, "GET / HTTP/1.1\r\nHost: localhost\r\nX-Slow:"); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadAll(conn); err != nil {
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			t.Fatalf("slow header connection remained open past read deadline: %v", err)
+		}
+		t.Fatalf("read timed-out response: %v", err)
+	}
+
+	if err := srv.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-serveDone; err != nil && !errors.Is(err, http.ErrServerClosed) {
+		t.Fatalf("Serve returned %v", err)
 	}
 }
 

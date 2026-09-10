@@ -547,10 +547,18 @@ func FuzzDecode(f *testing.F) {
 	seedMessage(f, MsgIndexUpdate, IndexUpdate{ShareID: "s1", Full: true, Files: []FileInfo{
 		{RelPath: "a/b.txt", Type: FileTypeFile, Size: 42, MTimeNS: 123, Mode: 0644, SHA256: bytes.Repeat([]byte{4}, 32), Version: VersionVector{"aaaaaaaaaaaaaaaa": 3}},
 	}})
-	seedMessage(f, MsgFileRequest, FileRequest{ShareID: "s1", RelPath: "a/b.txt", Version: VersionVector{"aaaaaaaaaaaaaaaa": 3}, Offset: 100})
+	seedMessage(f, MsgFileRequest, FileRequest{TransferID: "11111111111111111111111111111111", ShareID: "s1", RelPath: "a/b.txt", Version: VersionVector{"aaaaaaaaaaaaaaaa": 3}, Offset: 100})
 	seedMessage(f, MsgPing, Ping{})
 	seedMessage(f, MsgPong, Pong{})
 	seedMessage(f, MsgError, Error{Code: ErrCodeBadAuth, Msg: "nope"})
+	seedMessage(f, MsgFinished, Finished{})
+	seedMessage(f, MsgIndexSyncRequest, IndexSyncRequest{ShareID: "s1", Epoch: "epoch", AppliedSeq: 1})
+	seedMessage(f, MsgIndexSnapshotBegin, IndexSnapshotBegin{ShareID: "s1", SnapshotID: "snap", Epoch: "epoch", HighSeq: 1})
+	seedMessage(f, MsgIndexSnapshotBatch, IndexSnapshotBatch{ShareID: "s1", SnapshotID: "snap", Batch: 0})
+	seedMessage(f, MsgIndexSnapshotEnd, IndexSnapshotEnd{ShareID: "s1", SnapshotID: "snap", BatchCount: 0})
+	seedMessage(f, MsgIndexDeltaBatch, IndexDeltaBatch{ShareID: "s1", Epoch: "epoch", FromSeq: 1, ToSeq: 1, Entries: []IndexDeltaEntry{{Seq: 1, File: FileInfo{RelPath: "a", Type: FileTypeDir, Version: VersionVector{"aaaaaaaaaaaaaaaa": 1}}}}})
+	seedMessage(f, MsgIndexAck, IndexAck{ShareID: "s1", Epoch: "epoch", AppliedSeq: 1})
+	seedMessage(f, MsgCancelTransfer, CancelTransfer{TransferID: "11111111111111111111111111111111"})
 
 	// A valid FileChunk frame (header + raw bytes), built by hand since
 	// it's not a single CBOR-marshaled struct.
@@ -601,10 +609,72 @@ func FuzzDecode(f *testing.F) {
 			var errMsg Error
 			_ = DecodeMessage(payload, &errMsg)
 			_, _, _ = DecodeFileChunk(payload)
+			decodeAndValidateKnownType(typ, payload)
 
 			_ = typ
 		}
 	})
+}
+
+func decodeAndValidateKnownType(typ MsgType, payload []byte) {
+	switch typ {
+	case MsgHello:
+		var m Hello
+		_ = DecodeAndValidateMessage(payload, &m)
+	case MsgAuth:
+		var m Auth
+		_ = DecodeAndValidateMessage(payload, &m)
+	case MsgShareList:
+		var m ShareList
+		_ = DecodeAndValidateMessage(payload, &m)
+	case MsgSubscribeRequest:
+		var m SubscribeRequest
+		_ = DecodeAndValidateMessage(payload, &m)
+	case MsgAccessUpdate:
+		var m AccessUpdate
+		_ = DecodeAndValidateMessage(payload, &m)
+	case MsgIndexUpdate:
+		var m IndexUpdate
+		_ = DecodeAndValidateMessage(payload, &m)
+	case MsgFileRequest:
+		var m FileRequest
+		_ = DecodeAndValidateMessage(payload, &m)
+	case MsgFileChunk:
+		_, _, _ = DecodeFileChunk(payload)
+	case MsgPing:
+		var m Ping
+		_ = DecodeAndValidateMessage(payload, &m)
+	case MsgPong:
+		var m Pong
+		_ = DecodeAndValidateMessage(payload, &m)
+	case MsgError:
+		var m Error
+		_ = DecodeAndValidateMessage(payload, &m)
+	case MsgFinished:
+		var m Finished
+		_ = DecodeAndValidateMessage(payload, &m)
+	case MsgIndexSyncRequest:
+		var m IndexSyncRequest
+		_ = DecodeAndValidateMessage(payload, &m)
+	case MsgIndexSnapshotBegin:
+		var m IndexSnapshotBegin
+		_ = DecodeAndValidateMessage(payload, &m)
+	case MsgIndexSnapshotBatch:
+		var m IndexSnapshotBatch
+		_ = DecodeAndValidateMessage(payload, &m)
+	case MsgIndexSnapshotEnd:
+		var m IndexSnapshotEnd
+		_ = DecodeAndValidateMessage(payload, &m)
+	case MsgIndexDeltaBatch:
+		var m IndexDeltaBatch
+		_ = DecodeAndValidateMessage(payload, &m)
+	case MsgIndexAck:
+		var m IndexAck
+		_ = DecodeAndValidateMessage(payload, &m)
+	case MsgCancelTransfer:
+		var m CancelTransfer
+		_ = DecodeAndValidateMessage(payload, &m)
+	}
 }
 
 func seedMessage[T any](f *testing.F, typ MsgType, v T) {
