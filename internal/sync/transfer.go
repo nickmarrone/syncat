@@ -97,6 +97,8 @@ type pullEntry struct {
 // didn't actually wait would be worse than stating none.
 var ErrTransferStalled = errors.New("peer sent neither a chunk nor an error before the pull stall timeout")
 
+const staleTransferLogInterval = time.Minute
+
 // routeChunk hands one FileChunk/Error payload to the pull awaiting it, if
 // any. A chunk for an unknown or already-finished/cancelled transfer
 // (e.g. arriving after the puller gave up) is discarded here rather than
@@ -107,13 +109,30 @@ func (s *Session) routeChunk(transferID string, c pullChunk) {
 	entry, ok := s.pullTbl[key]
 	s.pullMu.Unlock()
 	if !ok {
-		s.stats.staleTransferFrames.Add(1)
+		s.noteStaleTransferFrame()
 		return
 	}
 	select {
 	case entry.ch <- c:
 	case <-s.ctx.Done():
 	}
+}
+
+func (s *Session) noteStaleTransferFrame() {
+	s.stats.staleTransferFrames.Add(1)
+	s.protocolViolation()
+	now := s.clock()
+	s.staleLogMu.Lock()
+	if s.lastStaleLog.IsZero() || now.Sub(s.lastStaleLog) >= staleTransferLogInterval {
+		count := s.staleSuppressed + 1
+		s.staleSuppressed = 0
+		s.lastStaleLog = now
+		s.staleLogMu.Unlock()
+		s.logf("dropped frame for an unknown or finished transfer (%d since last report)", count)
+		return
+	}
+	s.staleSuppressed++
+	s.staleLogMu.Unlock()
 }
 
 func newTransferID() (string, error) {

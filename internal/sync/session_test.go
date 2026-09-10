@@ -291,10 +291,23 @@ func TestCancelTransferCancelsActiveServe(t *testing.T) {
 }
 
 func TestSessionStatsCountStaleTransferFrames(t *testing.T) {
-	s := NewSession(nil, nil, "self", "peer", nil, log.New(io.Discard, "", 0))
-	s.routeChunk("11111111111111111111111111111111", pullChunk{})
-	if got := s.Stats().StaleTransferFrames; got != 1 {
-		t.Fatalf("stale transfer frames = %d, want 1", got)
+	now := time.Now()
+	var logs bytes.Buffer
+	s := NewSession(nil, nil, "self", "peer", func() time.Time { return now }, log.New(&logs, "", 0))
+	for range 100 {
+		s.routeChunk("11111111111111111111111111111111", pullChunk{})
+	}
+	stats := s.Stats()
+	if stats.StaleTransferFrames != 100 || stats.ProtocolViolations != 100 {
+		t.Fatalf("stale transfer stats = %+v, want 100 stale violations", stats)
+	}
+	if got := strings.Count(logs.String(), "unknown or finished transfer"); got != 1 {
+		t.Fatalf("rate-limited log count = %d, want 1; logs: %s", got, logs.String())
+	}
+	now = now.Add(staleTransferLogInterval)
+	s.routeChunk("22222222222222222222222222222222", pullChunk{})
+	if got := strings.Count(logs.String(), "unknown or finished transfer"); got != 2 {
+		t.Fatalf("log count after interval = %d, want 2", got)
 	}
 }
 

@@ -22,15 +22,17 @@ type WriterNetworkStatus struct {
 // SessionNetworkStatus is the cumulative and live work performed by one
 // configured peer across its connections during this node process.
 type SessionNetworkStatus struct {
-	IndexWorkersActive, ServeWorkersActive, PullsActive int
-	ProtocolViolations, RejectedShareOperations         uint64
-	RejectedWork, StaleTransferFrames                   uint64
-	PullsStarted, ServesStarted                         uint64
-	BytesReceived, BytesSent                            uint64
-	TransferStalls, TransferCancellations, HashFailures uint64
-	SnapshotsSent, SnapshotEntriesSent                  uint64
-	DeltaBatchesSent, DeltaEntriesSent, Reconciliations uint64
-	Writer                                              WriterNetworkStatus
+	IndexWorkersActive, IndexQueueDepth, IndexQueueCapacity int
+	ServeWorkersActive, PullsActive                         int
+	ProtocolViolations, RejectedShareOperations             uint64
+	RejectedWork, StaleTransferFrames                       uint64
+	PullsStarted, ServesStarted                             uint64
+	BytesReceived, BytesSent                                uint64
+	TransferStalls, TransferCancellations, HashFailures     uint64
+	SnapshotsSent, SnapshotEntriesSent                      uint64
+	DeltaBatchesSent, DeltaEntriesSent, Reconciliations     uint64
+	ReconciliationsCoalesced                                uint64
+	Writer                                                  WriterNetworkStatus
 }
 
 // PeerNetworkStatus contains connection lifecycle and current/cumulative
@@ -77,7 +79,8 @@ func addWriterStats(a, b protocol.StreamWriterStats, live bool) protocol.StreamW
 
 func addSessionStats(a, b syncsvc.SessionStats, live bool) syncsvc.SessionStats {
 	if live {
-		a.IndexWorkersActive, a.ServeWorkersActive, a.PullsActive = b.IndexWorkersActive, b.ServeWorkersActive, b.PullsActive
+		a.IndexWorkersActive, a.IndexQueueDepth, a.IndexQueueCapacity = b.IndexWorkersActive, b.IndexQueueDepth, b.IndexQueueCapacity
+		a.ServeWorkersActive, a.PullsActive = b.ServeWorkersActive, b.PullsActive
 	}
 	a.ProtocolViolations += b.ProtocolViolations
 	a.RejectedShareOperations += b.RejectedShareOperations
@@ -95,6 +98,7 @@ func addSessionStats(a, b syncsvc.SessionStats, live bool) syncsvc.SessionStats 
 	a.DeltaBatchesSent += b.DeltaBatchesSent
 	a.DeltaEntriesSent += b.DeltaEntriesSent
 	a.Reconciliations += b.Reconciliations
+	a.ReconciliationsCoalesced += b.ReconciliationsCoalesced
 	a.Writer = addWriterStats(a.Writer, b.Writer, live)
 	return a
 }
@@ -102,7 +106,8 @@ func addSessionStats(a, b syncsvc.SessionStats, live bool) syncsvc.SessionStats 
 func toSessionNetworkStatus(s syncsvc.SessionStats) SessionNetworkStatus {
 	w := s.Writer
 	return SessionNetworkStatus{
-		IndexWorkersActive: s.IndexWorkersActive, ServeWorkersActive: s.ServeWorkersActive, PullsActive: s.PullsActive,
+		IndexWorkersActive: s.IndexWorkersActive, IndexQueueDepth: s.IndexQueueDepth, IndexQueueCapacity: s.IndexQueueCapacity,
+		ServeWorkersActive: s.ServeWorkersActive, PullsActive: s.PullsActive,
 		ProtocolViolations: s.ProtocolViolations, RejectedShareOperations: s.RejectedShareOperations,
 		RejectedWork: s.RejectedWork, StaleTransferFrames: s.StaleTransferFrames,
 		PullsStarted: s.PullsStarted, ServesStarted: s.ServesStarted,
@@ -110,6 +115,7 @@ func toSessionNetworkStatus(s syncsvc.SessionStats) SessionNetworkStatus {
 		TransferStalls: s.TransferStalls, TransferCancellations: s.TransferCancellations, HashFailures: s.HashFailures,
 		SnapshotsSent: s.SnapshotsSent, SnapshotEntriesSent: s.SnapshotEntriesSent,
 		DeltaBatchesSent: s.DeltaBatchesSent, DeltaEntriesSent: s.DeltaEntriesSent, Reconciliations: s.Reconciliations,
+		ReconciliationsCoalesced: s.ReconciliationsCoalesced,
 		Writer: WriterNetworkStatus{
 			UrgentQueued: w.UrgentQueued, ControlQueued: w.ControlQueued, BulkQueued: w.BulkQueued,
 			UrgentCapacity: w.UrgentCapacity, ControlCapacity: w.ControlCapacity, BulkCapacity: w.BulkCapacity,
@@ -146,6 +152,8 @@ func addPeerNetworkStatus(a, b PeerNetworkStatus) PeerNetworkStatus {
 
 func addSessionNetworkStatus(a, b SessionNetworkStatus) SessionNetworkStatus {
 	a.IndexWorkersActive += b.IndexWorkersActive
+	a.IndexQueueDepth += b.IndexQueueDepth
+	a.IndexQueueCapacity += b.IndexQueueCapacity
 	a.ServeWorkersActive += b.ServeWorkersActive
 	a.PullsActive += b.PullsActive
 	a.ProtocolViolations += b.ProtocolViolations
@@ -164,6 +172,7 @@ func addSessionNetworkStatus(a, b SessionNetworkStatus) SessionNetworkStatus {
 	a.DeltaBatchesSent += b.DeltaBatchesSent
 	a.DeltaEntriesSent += b.DeltaEntriesSent
 	a.Reconciliations += b.Reconciliations
+	a.ReconciliationsCoalesced += b.ReconciliationsCoalesced
 	a.Writer.UrgentQueued += b.Writer.UrgentQueued
 	a.Writer.ControlQueued += b.Writer.ControlQueued
 	a.Writer.BulkQueued += b.Writer.BulkQueued
