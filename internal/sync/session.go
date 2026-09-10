@@ -433,6 +433,22 @@ func (s *Session) getShare(shareID string) (ShareConfig, bool) {
 	return *cfg, true
 }
 
+// acceptsInboundIndex is the admission gate for peer-supplied index state.
+// Session.shares is the authorization source: database rows and a wire
+// share ID never confer access by themselves.
+func (s *Session) acceptsInboundIndex(shareID string) bool {
+	cfg, ok := s.getShare(shareID)
+	return ok && !cfg.Direction.InboundBlocked
+}
+
+// servesOutboundShare is the admission gate for requests for our index or
+// file bytes. Receive-only shares are present locally but must never disclose
+// their local state back to the peer.
+func (s *Session) servesOutboundShare(shareID string) bool {
+	cfg, ok := s.getShare(shareID)
+	return ok && !cfg.Direction.OutboundBlocked
+}
+
 // Start begins the session's read loop and its writer in background
 // goroutines and returns immediately. ctx bounds the session's lifetime in
 // addition to Close: canceling ctx (or calling Close) stops all background
@@ -524,6 +540,12 @@ func (s *Session) SyncShare(ctx context.Context, shareID string) error {
 func newSnapshotID() string { var b [16]byte; _, _ = rand.Read(b[:]); return hex.EncodeToString(b[:]) }
 
 func (s *Session) answerSyncRequest(ctx context.Context, req protocol.IndexSyncRequest) error {
+	// Re-check here as well as in readLoop: this runs asynchronously, and a
+	// revocation can neuter the share after dispatch but before this goroutine
+	// reaches the store.
+	if !s.servesOutboundShare(req.ShareID) {
+		return fmt.Errorf("sync: index request for inactive or outbound-blocked share %s", req.ShareID)
+	}
 	epoch, high, err := s.store.ShareState(ctx, req.ShareID)
 	if err != nil {
 		return err
@@ -532,9 +554,7 @@ func (s *Session) answerSyncRequest(ctx context.Context, req protocol.IndexSyncR
 	if err != nil {
 		return err
 	}
-	// An unknown share yields the zero ShareConfig, whose Ignore is nil,
-	// so this answers unfiltered exactly as it did before.
-	cfg, _ := s.getShare(req.ShareID)
+	cfg, _ := s.getShare(req.ShareID) // admission above guarantees it exists
 
 	if canAnswerWithDeltas(req, epoch, high, oldest) {
 		done, err := s.sendJournalDeltas(ctx, cfg, epoch, req.AppliedSeq)
@@ -834,6 +854,10 @@ func (s *Session) readLoop() {
 			if protocol.DecodeMessage(payload, &m) != nil {
 				continue
 			}
+			if !s.servesOutboundShare(m.ShareID) {
+				s.logf("dropping index request for inactive or outbound-blocked share %s", m.ShareID)
+				continue
+			}
 			s.wg.Add(1)
 			go func() {
 				defer s.wg.Done()
@@ -846,6 +870,9 @@ func (s *Session) readLoop() {
 			if protocol.DecodeMessage(payload, &m) != nil {
 				continue
 			}
+			if !s.acceptsInboundIndex(m.ShareID) || m.SnapshotID == "" {
+				continue
+			}
 			s.snapshotMu.Lock()
 			s.snapshots[m.ShareID] = m
 			s.snapshotMu.Unlock()
@@ -853,6 +880,9 @@ func (s *Session) readLoop() {
 		case protocol.MsgIndexSnapshotBatch:
 			var m protocol.IndexSnapshotBatch
 			if protocol.DecodeMessage(payload, &m) != nil {
+				continue
+			}
+			if !s.acceptsInboundIndex(m.ShareID) {
 				continue
 			}
 			s.snapshotMu.Lock()
@@ -882,9 +912,14 @@ func (s *Session) readLoop() {
 			if protocol.DecodeMessage(payload, &m) != nil {
 				continue
 			}
+			if !s.acceptsInboundIndex(m.ShareID) {
+				continue
+			}
 			s.snapshotMu.Lock()
 			b, ok := s.snapshots[m.ShareID]
-			delete(s.snapshots, m.ShareID)
+			if ok && b.SnapshotID == m.SnapshotID {
+				delete(s.snapshots, m.ShareID)
+			}
 			s.snapshotMu.Unlock()
 			c, _ := s.store.Cursor(s.ctx, s.peerID, m.ShareID, "incoming")
 			if ok && b.SnapshotID == m.SnapshotID && c.SnapshotBatch == m.BatchCount && s.store.CommitSnapshot(s.ctx, s.peerID, m.ShareID, m.SnapshotID, b.Epoch, b.HighSeq) == nil {
@@ -898,6 +933,9 @@ func (s *Session) readLoop() {
 		case protocol.MsgIndexDeltaBatch:
 			var m protocol.IndexDeltaBatch
 			if protocol.DecodeMessage(payload, &m) != nil {
+				continue
+			}
+			if !s.acceptsInboundIndex(m.ShareID) {
 				continue
 			}
 			rr := make([]index.FileRow, len(m.Entries))
@@ -922,13 +960,22 @@ func (s *Session) readLoop() {
 			}
 		case protocol.MsgIndexAck:
 			var m protocol.IndexAck
-			if protocol.DecodeMessage(payload, &m) == nil {
-				_ = s.store.SetCursor(s.ctx, s.peerID, m.ShareID, "outgoing", index.Cursor{Epoch: m.Epoch, AppliedSeq: m.AppliedSeq})
+			if protocol.DecodeMessage(payload, &m) == nil && s.servesOutboundShare(m.ShareID) {
+				// Never let a forged acknowledgement skip data this node has not
+				// produced. A later request can safely repeat already-sent rows;
+				// accepting a cursor beyond our high-water mark loses them.
+				epoch, high, err := s.store.ShareState(s.ctx, m.ShareID)
+				if err == nil && m.Epoch == epoch && m.AppliedSeq <= high {
+					_ = s.store.SetCursor(s.ctx, s.peerID, m.ShareID, "outgoing", index.Cursor{Epoch: m.Epoch, AppliedSeq: m.AppliedSeq})
+				}
 			}
 		case protocol.MsgIndexUpdate:
 			var msg protocol.IndexUpdate
 			if err := protocol.DecodeMessage(payload, &msg); err != nil {
 				s.logf("decode IndexUpdate: %v", err)
+				continue
+			}
+			if !s.acceptsInboundIndex(msg.ShareID) {
 				continue
 			}
 			s.wg.Add(1)
@@ -941,6 +988,10 @@ func (s *Session) readLoop() {
 			var req protocol.FileRequest
 			if err := protocol.DecodeMessage(payload, &req); err != nil {
 				s.logf("decode FileRequest: %v", err)
+				continue
+			}
+			if !s.servesOutboundShare(req.ShareID) {
+				s.sendFileError(req, protocol.ErrCodeFileNotFound, "unknown share")
 				continue
 			}
 			s.wg.Add(1)
