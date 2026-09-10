@@ -232,17 +232,10 @@ func resetStallTimer(t *time.Timer, d time.Duration) {
 }
 
 // handleFileRequest serves one incoming FileRequest from our own share
-// content, respecting maxConcurrentServes. A file we no longer have, or
+// content after readLoop reserves a maxConcurrentServes slot. A file we no longer have, or
 // whose current version differs from what the requester asked for, gets
 // an Error reply (SPEC.md §4/§5) rather than a hung or truncated stream.
 func (s *Session) handleFileRequest(ctx context.Context, req protocol.FileRequest) {
-	select {
-	case s.serveSem <- struct{}{}:
-	case <-ctx.Done():
-		return
-	}
-	defer func() { <-s.serveSem }()
-
 	cfg, ok := s.getShare(req.ShareID)
 	if !ok || cfg.Direction.OutboundBlocked {
 		s.sendFileError(req, protocol.ErrCodeFileNotFound, "unknown share")

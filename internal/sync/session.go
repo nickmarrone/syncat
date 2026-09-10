@@ -32,6 +32,11 @@ const maxConcurrentPulls = 4
 // unboundedly with however many requests the peer happens to send at once.
 const maxConcurrentServes = 4
 
+// maxConcurrentIndexJobs bounds independently requested index work. Index
+// updates themselves are serialized by reconcileMu, so a larger number only
+// creates waiters and memory pressure without increasing useful throughput.
+const maxConcurrentIndexJobs = 4
+
 // --- the session: one authenticated peer connection --------------------
 
 // ShareConfig is one share this Session keeps in sync with the peer at the
@@ -161,6 +166,7 @@ type Session struct {
 	pullSem  chan struct{}
 	pullTbl  map[transferKey]*pullEntry
 	serveSem chan struct{}
+	indexSem chan struct{}
 
 	// pullActive/pullPeak instrument concurrent-pull behavior for tests
 	// (see integration_test.go's interleaving test); always zero-cost in
@@ -227,7 +233,26 @@ func NewSession(conn net.Conn, store *index.Store, nodeID, peerID string, clock 
 		pullSem:   make(chan struct{}, maxConcurrentPulls),
 		pullTbl:   make(map[transferKey]*pullEntry),
 		serveSem:  make(chan struct{}, maxConcurrentServes),
+		indexSem:  make(chan struct{}, maxConcurrentIndexJobs),
 		done:      make(chan struct{}),
+	}
+}
+
+// startBounded starts fn only after reserving capacity. It is called by the
+// single read loop, so a failed non-blocking reservation is an explicit
+// overload decision rather than another hidden queue of goroutines.
+func (s *Session) startBounded(sem chan struct{}, fn func()) bool {
+	select {
+	case sem <- struct{}{}:
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			defer func() { <-sem }()
+			fn()
+		}()
+		return true
+	default:
+		return false
 	}
 }
 
@@ -858,13 +883,15 @@ func (s *Session) readLoop() {
 				s.logf("dropping index request for inactive or outbound-blocked share %s", m.ShareID)
 				continue
 			}
-			s.wg.Add(1)
-			go func() {
-				defer s.wg.Done()
+			if !s.startBounded(s.indexSem, func() {
 				if err := s.answerSyncRequest(s.ctx, m); err != nil {
 					s.logf("answer index sync: %v", err)
 				}
-			}()
+			}) {
+				s.logf("closing overloaded session: index workers are full")
+				_ = s.conn.Close()
+				return
+			}
 		case protocol.MsgIndexSnapshotBegin:
 			var m protocol.IndexSnapshotBegin
 			if protocol.DecodeMessage(payload, &m) != nil {
@@ -924,11 +951,13 @@ func (s *Session) readLoop() {
 			c, _ := s.store.Cursor(s.ctx, s.peerID, m.ShareID, "incoming")
 			if ok && b.SnapshotID == m.SnapshotID && c.SnapshotBatch == m.BatchCount && s.store.CommitSnapshot(s.ctx, s.peerID, m.ShareID, m.SnapshotID, b.Epoch, b.HighSeq) == nil {
 				_ = s.writer.WriteMessage(protocol.MsgIndexAck, protocol.IndexAck{ShareID: m.ShareID, Epoch: b.Epoch, AppliedSeq: b.HighSeq, SnapshotID: m.SnapshotID})
-				s.wg.Add(1)
-				go func() {
-					defer s.wg.Done()
+				if !s.startBounded(s.indexSem, func() {
 					s.reconcilePeerShare(s.ctx, m.ShareID)
-				}()
+				}) {
+					s.logf("closing overloaded session: index workers are full")
+					_ = s.conn.Close()
+					return
+				}
 			}
 		case protocol.MsgIndexDeltaBatch:
 			var m protocol.IndexDeltaBatch
@@ -949,11 +978,13 @@ func (s *Session) readLoop() {
 			}
 			if valid && s.store.ApplyPeerDelta(s.ctx, s.peerID, m.ShareID, m.Epoch, m.FromSeq, m.ToSeq, rr) == nil {
 				_ = s.writer.WriteMessage(protocol.MsgIndexAck, protocol.IndexAck{ShareID: m.ShareID, Epoch: m.Epoch, AppliedSeq: m.ToSeq})
-				s.wg.Add(1)
-				go func() {
-					defer s.wg.Done()
+				if !s.startBounded(s.indexSem, func() {
 					s.handleIndexUpdate(s.ctx, protocol.IndexUpdate{ShareID: m.ShareID, Files: rowsToInfos(rr)})
-				}()
+				}) {
+					s.logf("closing overloaded session: index workers are full")
+					_ = s.conn.Close()
+					return
+				}
 			} else {
 				c, _ := s.store.Cursor(s.ctx, s.peerID, m.ShareID, "incoming")
 				_ = s.writer.WriteMessage(protocol.MsgIndexSyncRequest, protocol.IndexSyncRequest{ShareID: m.ShareID, Epoch: c.Epoch, AppliedSeq: c.AppliedSeq})
@@ -978,11 +1009,13 @@ func (s *Session) readLoop() {
 			if !s.acceptsInboundIndex(msg.ShareID) {
 				continue
 			}
-			s.wg.Add(1)
-			go func() {
-				defer s.wg.Done()
+			if !s.startBounded(s.indexSem, func() {
 				s.handleIndexUpdate(s.ctx, msg)
-			}()
+			}) {
+				s.logf("closing overloaded session: index workers are full")
+				_ = s.conn.Close()
+				return
+			}
 
 		case protocol.MsgFileRequest:
 			var req protocol.FileRequest
@@ -994,11 +1027,13 @@ func (s *Session) readLoop() {
 				s.sendFileError(req, protocol.ErrCodeFileNotFound, "unknown share")
 				continue
 			}
-			s.wg.Add(1)
-			go func() {
-				defer s.wg.Done()
+			if !s.startBounded(s.serveSem, func() {
 				s.handleFileRequest(s.ctx, req)
-			}()
+			}) {
+				s.logf("closing overloaded session: file workers are full")
+				_ = s.conn.Close()
+				return
+			}
 
 		case protocol.MsgFileChunk:
 			hdr, data, err := protocol.DecodeFileChunk(payload)
@@ -1050,22 +1085,12 @@ func (s *Session) reconcilePeerShare(ctx context.Context, shareID string) {
 		return
 	}
 	actions := Reconcile(rowsToInfos(local), rowsToInfos(rows), s.nodeID, cfg.Direction, s.clock, cfg.Ignore)
-	sem := make(chan struct{}, maxConcurrentPulls)
-	var wg sync.WaitGroup
 	var changed atomic.Bool
-	for _, a := range actions {
-		a := a
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			if len(s.applyAndPersist(ctx, cfg, a)) > 0 {
-				changed.Store(true)
-			}
-		}()
-	}
-	wg.Wait()
+	s.runActionWorkers(ctx, cfg, actions, func(_ Action, rows []index.FileRow) {
+		if len(rows) > 0 {
+			changed.Store(true)
+		}
+	})
 	if changed.Load() && !cfg.Direction.OutboundBlocked {
 		// Reconciliation results are journaled by applyAndPersist; publish
 		// them so conflict copies converge on every peer.
@@ -1073,8 +1098,8 @@ func (s *Session) reconcilePeerShare(ctx context.Context, shareID string) {
 	}
 }
 
-// handleIndexUpdate is the core reconcile-and-apply pass, run in its own
-// goroutine per incoming IndexUpdate (see readLoop). It folds the peer's
+// handleIndexUpdate is the core reconcile-and-apply pass, run under the
+// read loop's bounded index-worker admission (see readLoop). It folds the peer's
 // reported files into our mirror of their view (peer_files), reconciles
 // that against our own current view ([Reconcile]), executes every
 // resulting Action against the filesystem and index, and — unless this
@@ -1167,30 +1192,24 @@ func (s *Session) reconcileLocked(ctx context.Context, cfg ShareConfig, why stri
 
 	var mu sync.Mutex
 	var changed []index.FileRow
-	var wg sync.WaitGroup
 	counts := map[ActionKind]int{}
 	flagged := make(map[string]bool)
 	for _, a := range actions {
-		a := a
 		if a.Kind == ActionLocallyModified {
 			flagged[a.RelPath] = true
 		}
 		if a.Kind != ActionNone {
 			counts[a.Kind]++
 		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			rows := s.applyAndPersist(ctx, cfg, a)
-			if len(rows) == 0 {
-				return
-			}
-			mu.Lock()
-			changed = append(changed, rows...)
-			mu.Unlock()
-		}()
 	}
-	wg.Wait()
+	s.runActionWorkers(ctx, cfg, actions, func(_ Action, rows []index.FileRow) {
+		if len(rows) == 0 {
+			return
+		}
+		mu.Lock()
+		changed = append(changed, rows...)
+		mu.Unlock()
+	})
 
 	// Every path in the share was just reconciled, so flagged is the
 	// complete current set of locally-modified files for it; anything
@@ -1222,6 +1241,38 @@ func (s *Session) reconcileLocked(ctx context.Context, cfg ShareConfig, why stri
 	if len(counts) > 0 {
 		s.debugf("reconciled %s (%s): %s", shareID, why, formatActionCounts(counts))
 	}
+}
+
+// runActionWorkers applies an arbitrarily large reconciliation plan with a
+// fixed number of goroutines. The caller waits for completion, but goroutine
+// count is independent of the number of peer-controlled file entries.
+func (s *Session) runActionWorkers(ctx context.Context, cfg ShareConfig, actions []Action, consume func(Action, []index.FileRow)) {
+	workers := maxConcurrentPulls
+	if len(actions) < workers {
+		workers = len(actions)
+	}
+	jobs := make(chan Action)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for a := range jobs {
+				consume(a, s.applyAndPersist(ctx, cfg, a))
+			}
+		}()
+	}
+	for _, a := range actions {
+		select {
+		case jobs <- a:
+		case <-ctx.Done():
+			close(jobs)
+			wg.Wait()
+			return
+		}
+	}
+	close(jobs)
+	wg.Wait()
 }
 
 // formatActionCounts renders a reconcile pass's non-ActionNone tally in a

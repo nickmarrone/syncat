@@ -314,6 +314,31 @@ func TestEndToEndSync(t *testing.T) {
 	})
 }
 
+func TestInboundHandshakeLimitRejectsExcessConnection(t *testing.T) {
+	node := newTestNode(t, "handshake-limit")
+	clients := make([]net.Conn, 0, maxInboundHandshakes)
+	for i := 0; i < maxInboundHandshakes; i++ {
+		server, client := net.Pipe()
+		clients = append(clients, client)
+		node.onAccept(server)
+	}
+	t.Cleanup(func() {
+		for _, conn := range clients {
+			_ = conn.Close()
+		}
+	})
+	waitFor(t, 2*time.Second, func() bool { return len(node.inboundHandshakes) == maxInboundHandshakes })
+
+	server, client := net.Pipe()
+	defer client.Close()
+	node.onAccept(server)
+	_ = client.SetReadDeadline(time.Now().Add(time.Second))
+	var one [1]byte
+	if _, err := client.Read(one[:]); !errors.Is(err, io.EOF) {
+		t.Fatalf("excess inbound connection read error = %v, want immediate EOF", err)
+	}
+}
+
 // TestApprovalRequiredFailsClosed verifies that requesting a protected share
 // records a pending decision without provisioning or syncing it, and that an
 // explicit grant activates the already-open connection.
