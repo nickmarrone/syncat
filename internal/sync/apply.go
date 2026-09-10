@@ -385,7 +385,7 @@ func (s *Session) pullAndInstall(ctx context.Context, shareID, root, wireRelPath
 	}()
 
 	hasher := sha256.New()
-	n, err := s.pullFile(ctx, shareID, wireRelPath, wireVersion, io.MultiWriter(tmp, hasher))
+	n, err := s.pullFile(ctx, shareID, wireRelPath, wireVersion, info.Size, io.MultiWriter(tmp, hasher))
 	if err != nil {
 		return fmt.Errorf("sync: install %s: %w", destRelPath, err)
 	}

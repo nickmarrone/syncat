@@ -226,7 +226,7 @@ func TestFrameRoundTripAllMessageTypes(t *testing.T) {
 }
 
 func TestFrameRoundTripFileChunk(t *testing.T) {
-	hdr := FileChunkHeader{ShareID: "s1", RelPath: "a/b.txt", Version: VersionVector{"aaaaaaaaaaaaaaaa": 3}, Offset: 256, EOF: true}
+	hdr := FileChunkHeader{TransferID: "11111111111111111111111111111111", ShareID: "s1", RelPath: "a/b.txt", Version: VersionVector{"aaaaaaaaaaaaaaaa": 3}, Offset: 256, EOF: true}
 	data := bytes.Repeat([]byte{0xAB}, 1024)
 
 	var buf bytes.Buffer
@@ -287,7 +287,7 @@ func TestDecodeAndValidateRejectsInvalidWireSemantics(t *testing.T) {
 }
 
 func TestDecodeFileChunkRejectsOversizedRawData(t *testing.T) {
-	hdr, err := cbor.Marshal(FileChunkHeader{ShareID: "s", RelPath: "a", Version: VersionVector{"aaaaaaaaaaaaaaaa": 1}})
+	hdr, err := cbor.Marshal(FileChunkHeader{TransferID: "11111111111111111111111111111111", ShareID: "s", RelPath: "a", Version: VersionVector{"aaaaaaaaaaaaaaaa": 1}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -308,7 +308,7 @@ func TestHardenedDecoderRejectsDuplicateKeysAndIndefiniteCollections(t *testing.
 }
 
 func TestFrameRoundTripFileChunkEmptyData(t *testing.T) {
-	hdr := FileChunkHeader{ShareID: "s1", RelPath: "empty.txt", EOF: true}
+	hdr := FileChunkHeader{TransferID: "11111111111111111111111111111111", ShareID: "s1", RelPath: "empty.txt", EOF: true}
 	var buf bytes.Buffer
 	if err := NewWriter(&buf).WriteFileChunk(hdr, nil); err != nil {
 		t.Fatalf("WriteFileChunk: %v", err)
@@ -556,7 +556,7 @@ func FuzzDecode(f *testing.F) {
 	// it's not a single CBOR-marshaled struct.
 	{
 		var buf bytes.Buffer
-		if err := NewWriter(&buf).WriteFileChunk(FileChunkHeader{ShareID: "s1", RelPath: "a/b.txt", Offset: 0, EOF: true}, []byte("hello world")); err != nil {
+		if err := NewWriter(&buf).WriteFileChunk(FileChunkHeader{TransferID: "11111111111111111111111111111111", ShareID: "s1", RelPath: "a/b.txt", Offset: 0, EOF: true}, []byte("hello world")); err != nil {
 			f.Fatalf("seed: WriteFileChunk: %v", err)
 		}
 		f.Add(buf.Bytes())

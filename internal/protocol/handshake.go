@@ -22,7 +22,7 @@ import (
 
 // CurrentProtoVersion is the syncat wire protocol version this build
 // speaks (SPEC.md §4).
-const CurrentProtoVersion = 2
+const CurrentProtoVersion = 3
 
 // DefaultHandshakeTimeout bounds the whole handshake (SPEC.md §4): a peer
 // that opens a connection and says nothing must not pin a goroutine
@@ -35,7 +35,7 @@ const nonceSize = 32
 // authContext domain-separates the handshake signature from any other use
 // of the node's Ed25519 identity key, and from any other version of this
 // protocol that might reuse the same key.
-const authContext = "syncat-handshake-v2"
+const authContext = "syncat-handshake-v3"
 
 // --- the mutually-authenticated handshake (SPEC.md §4) -----------------
 

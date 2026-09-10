@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -84,7 +85,7 @@ func TestPullFileStallsWhenPeerNeverAnswers(t *testing.T) {
 	s := silentPeerSession(t, 300*time.Millisecond)
 
 	var buf bytes.Buffer
-	n, err := s.pullFile(context.Background(), testShareID, "a.txt", nil, &buf)
+	n, err := s.pullFile(context.Background(), testShareID, "a.txt", nil, -1, &buf)
 	if !errors.Is(err, ErrTransferStalled) {
 		t.Fatalf("pullFile = (%d, %v), want ErrTransferStalled", n, err)
 	}
@@ -98,7 +99,7 @@ func TestPullFileStallsWhenPeerNeverAnswers(t *testing.T) {
 		t.Errorf("%d of %d pull slots still held after the stall, want 0", held, maxConcurrentPulls)
 	}
 	s.pullMu.Lock()
-	_, inFlight := s.pullTbl[transferKey{testShareID, "a.txt"}]
+	inFlight := len(s.pullTbl) != 0
 	s.pullMu.Unlock()
 	if inFlight {
 		t.Error("the transfer is still registered after the stall; a retry would be rejected as already in flight")
@@ -118,7 +119,6 @@ func TestPullFileStallTimerResetsOnEachChunk(t *testing.T) {
 	s := silentPeerSession(t, stall)
 
 	relpath := "big.bin"
-	key := transferKey{testShareID, relpath}
 	fed := make(chan struct{})
 	go func() {
 		defer close(fed)
@@ -127,23 +127,26 @@ func TestPullFileStallTimerResetsOnEachChunk(t *testing.T) {
 		// below simply stalls and fails the test with that.
 		for i := 0; i < 400; i++ {
 			s.pullMu.Lock()
-			_, ok := s.pullTbl[key]
+			var id string
+			for key := range s.pullTbl {
+				id = key.id
+			}
 			s.pullMu.Unlock()
-			if ok {
+			if id != "" {
+				for i := 0; i < semi; i++ {
+					time.Sleep(gap)
+					s.routeChunk(id, pullChunk{header: protocol.FileChunkHeader{TransferID: id, ShareID: testShareID, RelPath: relpath, Offset: int64(i)}, data: []byte("x")})
+				}
+				time.Sleep(gap)
+				s.routeChunk(id, pullChunk{header: protocol.FileChunkHeader{TransferID: id, ShareID: testShareID, RelPath: relpath, Offset: semi}, eof: true})
 				break
 			}
 			time.Sleep(5 * time.Millisecond)
 		}
-		for i := 0; i < semi; i++ {
-			time.Sleep(gap)
-			s.routeChunk(testShareID, relpath, pullChunk{data: []byte("x")})
-		}
-		time.Sleep(gap)
-		s.routeChunk(testShareID, relpath, pullChunk{eof: true})
 	}()
 
 	var buf bytes.Buffer
-	n, err := s.pullFile(context.Background(), testShareID, relpath, nil, &buf)
+	n, err := s.pullFile(context.Background(), testShareID, relpath, nil, -1, &buf)
 	<-fed
 	if err != nil {
 		t.Fatalf("pullFile = %v, want it to survive %d chunks %v apart with a %v timeout", err, semi, gap, stall)
@@ -168,9 +171,58 @@ func TestPullFileWriterNotStartedBeforeStart(t *testing.T) {
 	s := NewSession(near, n.store, n.id, "peer", nil, log.New(io.Discard, "", 0))
 
 	var buf bytes.Buffer
-	_, err := s.pullFile(context.Background(), testShareID, "a.txt", nil, &buf)
+	_, err := s.pullFile(context.Background(), testShareID, "a.txt", nil, -1, &buf)
 	if !errors.Is(err, protocol.ErrWriterNotStarted) {
 		t.Errorf("pullFile before Start = %v, want ErrWriterNotStarted", err)
+	}
+}
+
+func TestPullFileRejectsStaleTransferAndWrongOffset(t *testing.T) {
+	s := silentPeerSession(t, time.Second)
+	result := make(chan error, 1)
+	go func() {
+		var dst bytes.Buffer
+		_, err := s.pullFile(context.Background(), testShareID, "a.txt", nil, 1, &dst)
+		result <- err
+	}()
+
+	var id string
+	waitFor(t, time.Second, func() bool {
+		s.pullMu.Lock()
+		defer s.pullMu.Unlock()
+		for key := range s.pullTbl {
+			id = key.id
+		}
+		return id != ""
+	})
+	// A late chunk from an earlier request has a different ID and must not
+	// enter the new request's queue.
+	s.routeChunk("22222222222222222222222222222222", pullChunk{data: []byte("stale")})
+	s.pullMu.Lock()
+	queued := len(s.pullTbl[transferKey{id: id}].ch)
+	s.pullMu.Unlock()
+	if queued != 0 {
+		t.Fatalf("stale transfer queued %d chunks", queued)
+	}
+
+	s.routeChunk(id, pullChunk{header: protocol.FileChunkHeader{TransferID: id, ShareID: testShareID, RelPath: "a.txt", Offset: 1}, data: []byte("x")})
+	if err := <-result; err == nil || !strings.Contains(err.Error(), "offset") {
+		t.Fatalf("wrong-offset pull error = %v", err)
+	}
+}
+
+func TestCancelTransferCancelsActiveServe(t *testing.T) {
+	s := &Session{serveCancel: make(map[string]context.CancelFunc)}
+	ctx, cancel := context.WithCancel(context.Background())
+	const id = "11111111111111111111111111111111"
+	if !s.registerServe(id, cancel) {
+		t.Fatal("registerServe rejected new transfer")
+	}
+	s.cancelServe(id)
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("CancelTransfer did not cancel active serve")
 	}
 }
 
