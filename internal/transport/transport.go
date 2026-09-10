@@ -197,6 +197,9 @@ type Supervisor struct {
 	Schedule Backoff
 	Clock    Clock      // defaults to RealClock if nil
 	Rand     *rand.Rand // defaults to no jitter if nil; see Backoff.NextDelay
+	// OnBackoff observes each chosen retry delay before the wait begins.
+	// It must not block.
+	OnBackoff func(time.Duration)
 }
 
 // Run calls dial in a loop until ctx is done. Each call should attempt one
@@ -224,6 +227,9 @@ func (s Supervisor) Run(ctx context.Context, dial func(ctx context.Context) erro
 			continue
 		}
 		delay := s.Schedule.NextDelay(failures, s.Rand)
+		if s.OnBackoff != nil {
+			s.OnBackoff(delay)
+		}
 		failures++
 		select {
 		case <-clock.After(delay):

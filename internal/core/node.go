@@ -41,6 +41,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/nickmarrone/syncat/internal/config"
@@ -141,7 +142,9 @@ type Node struct {
 	// inboundHandshakes bounds unauthenticated connections that may sit in
 	// the handshake timeout simultaneously. Admission is non-blocking so the
 	// transport callback never accumulates its own queue of waiting clients.
-	inboundHandshakes chan struct{}
+	inboundHandshakes  chan struct{}
+	rejectedHandshakes atomic.Uint64
+	rejectedOverload   atomic.Uint64
 }
 
 // maxRejectedConnections bounds RejectedConnections' memory: only the most
@@ -554,6 +557,7 @@ func (n *Node) onAccept(conn net.Conn) {
 		conn.Close()
 		return
 	default:
+		n.rejectedOverload.Add(1)
 		n.logger.Printf("core: rejecting inbound connection: %d handshakes already active", maxInboundHandshakes)
 		conn.Close()
 		return
@@ -585,6 +589,7 @@ func (n *Node) handleAccept(conn net.Conn) {
 		},
 	})
 	if err != nil {
+		n.rejectedHandshakes.Add(1)
 		if len(sawPub) > 0 {
 			n.recordRejected(hex.EncodeToString(sawPub), "", err.Error())
 		}
@@ -594,6 +599,7 @@ func (n *Node) handleAccept(conn net.Conn) {
 
 	pc := n.lookupPeer(hex.EncodeToString(result.PeerPub))
 	if pc == nil {
+		n.rejectedHandshakes.Add(1)
 		// IsKnownPeer said yes but the peer vanished from the map between
 		// then and now (e.g. RemovePeer raced this handshake) — treat as
 		// a rejection rather than panicking on a nil peerConn.

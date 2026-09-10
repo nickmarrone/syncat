@@ -394,6 +394,7 @@ func (s *Session) pullAndInstall(ctx context.Context, shareID, root, wireRelPath
 	}
 	sum := hasher.Sum(nil)
 	if !bytes.Equal(sum, info.SHA256) {
+		s.stats.hashFailures.Add(1)
 		return fmt.Errorf("sync: install %s: sha256 mismatch: got %x, peer advertised %x", destRelPath, sum, info.SHA256)
 	}
 

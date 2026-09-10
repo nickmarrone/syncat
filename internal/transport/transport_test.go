@@ -103,10 +103,11 @@ func TestSupervisorRunRetriesAndStopsOnCancel(t *testing.T) {
 	fc := &fakeClock{ch: make(chan time.Time, 1)}
 
 	var attempts int
+	var backoffs []time.Duration
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		s := Supervisor{Schedule: Backoff{Initial: time.Millisecond}, Clock: fc}
+		s := Supervisor{Schedule: Backoff{Initial: time.Millisecond}, Clock: fc, OnBackoff: func(d time.Duration) { backoffs = append(backoffs, d) }}
 		s.Run(ctx, func(context.Context) error {
 			attempts++
 			if attempts >= 3 {
@@ -137,6 +138,9 @@ func TestSupervisorRunRetriesAndStopsOnCancel(t *testing.T) {
 
 	if attempts != 3 {
 		t.Fatalf("got %d attempts, want exactly 3", attempts)
+	}
+	if len(backoffs) != 2 || backoffs[0] != time.Millisecond || backoffs[1] != 2*time.Millisecond {
+		t.Fatalf("observed backoffs = %v, want [1ms 2ms]", backoffs)
 	}
 }
 

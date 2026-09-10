@@ -219,4 +219,5 @@ type statusView struct {
 	RemoteShares  []remoteShareView  `json:"remote_shares"`
 	Subscriptions []subscriptionView `json:"subscriptions"`
 	Rejected      []rejectedView     `json:"rejected_connections"`
+	Network       map[string]any     `json:"network"`
 }

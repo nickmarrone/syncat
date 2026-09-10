@@ -107,6 +107,7 @@ func (s *Session) routeChunk(transferID string, c pullChunk) {
 	entry, ok := s.pullTbl[key]
 	s.pullMu.Unlock()
 	if !ok {
+		s.stats.staleTransferFrames.Add(1)
 		return
 	}
 	select {
@@ -146,6 +147,7 @@ func (s *Session) pullFile(ctx context.Context, shareID, wireRelPath string, ver
 
 	done := s.notePullActive()
 	defer done()
+	s.stats.pullsStarted.Add(1)
 
 	transferID, err := newTransferID()
 	if err != nil {
@@ -193,6 +195,7 @@ func (s *Session) pullFile(ctx context.Context, shareID, wireRelPath string, ver
 	terminal := false
 	defer func() {
 		if !terminal {
+			s.stats.transferCancellations.Add(1)
 			_ = s.writer.WriteMessage(protocol.MsgCancelTransfer, protocol.CancelTransfer{TransferID: transferID})
 		}
 	}()
@@ -207,11 +210,13 @@ func (s *Session) pullFile(ctx context.Context, shareID, wireRelPath string, ver
 				return total, fmt.Errorf("sync: pull %s/%s: %w", shareID, wireRelPath, c.err)
 			}
 			if c.header.TransferID != transferID || c.header.ShareID != shareID || c.header.RelPath != wireRelPath || !Equal(c.header.Version, version) || c.header.Offset != total {
+				s.protocolViolation()
 				return total, fmt.Errorf("sync: pull %s/%s: invalid chunk identity or offset", shareID, wireRelPath)
 			}
 			if len(c.data) > 0 {
 				n, err := dst.Write(c.data)
 				total += int64(n)
+				s.stats.bytesReceived.Add(uint64(n))
 				if err != nil {
 					return total, fmt.Errorf("sync: pull %s/%s: write: %w", shareID, wireRelPath, err)
 				}
@@ -225,6 +230,7 @@ func (s *Session) pullFile(ctx context.Context, shareID, wireRelPath string, ver
 			}
 			resetStallTimer(stall, stallAfter)
 		case <-stall.C:
+			s.stats.transferStalls.Add(1)
 			return total, fmt.Errorf("sync: pull %s/%s: %w", shareID, wireRelPath, ErrTransferStalled)
 		case <-ctx.Done():
 			return total, ctx.Err()
@@ -268,6 +274,7 @@ func resetStallTimer(t *time.Timer, d time.Duration) {
 // whose current version differs from what the requester asked for, gets
 // an Error reply (SPEC.md §4/§5) rather than a hung or truncated stream.
 func (s *Session) handleFileRequest(ctx context.Context, req protocol.FileRequest) {
+	s.stats.servesStarted.Add(1)
 	if req.Offset != 0 {
 		s.sendFileError(req, protocol.ErrCodeUnsupportedOffset, "resume offsets are not supported")
 		return
@@ -382,9 +389,9 @@ func (s *Session) streamFile(ctx context.Context, f *os.File, req protocol.FileR
 		n, readErr := f.Read(buf)
 		if n > 0 {
 			_, _ = hasher.Write(buf[:n])
-			if err := s.writer.WriteFileChunk(protocol.FileChunkHeader{
+			if err := s.writer.WriteFileChunkOnWritten(protocol.FileChunkHeader{
 				TransferID: req.TransferID, ShareID: req.ShareID, RelPath: req.RelPath, Version: row.Version, Offset: offset, EOF: false,
-			}, buf[:n]); err != nil {
+			}, buf[:n], func() { s.stats.bytesSent.Add(uint64(n)) }); err != nil {
 				return fmt.Errorf("write chunk at offset %d: %w", offset, err)
 			}
 			offset += int64(n)
@@ -442,9 +449,9 @@ func (s *Session) streamSymlink(ctx context.Context, absPath string, req protoco
 	if !os.SameFile(before, after) || before.Size() != after.Size() || before.ModTime() != after.ModTime() || int64(len(data)) != row.Size || !bytes.Equal(sum[:], row.SHA256) {
 		return errFileChangedDuringTransfer
 	}
-	if err := s.writer.WriteFileChunk(protocol.FileChunkHeader{
+	if err := s.writer.WriteFileChunkOnWritten(protocol.FileChunkHeader{
 		TransferID: req.TransferID, ShareID: req.ShareID, RelPath: req.RelPath, Version: row.Version, Offset: 0, EOF: false,
-	}, data); err != nil {
+	}, data, func() { s.stats.bytesSent.Add(uint64(len(data))) }); err != nil {
 		return fmt.Errorf("write symlink target: %w", err)
 	}
 	if err := s.writer.WriteFileChunk(protocol.FileChunkHeader{

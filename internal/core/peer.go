@@ -174,11 +174,22 @@ type peerConn struct {
 	remoteShares    []protocol.ShareListEntry
 	subAccess       map[string]string // shareID -> our access state, as offerer's peer reports it
 
-	sessCancel   context.CancelFunc // ends the current session; see notePeerRedialed
-	session      *syncsvc.Session
-	conn         net.Conn
-	activeShares map[string]bool // shareIDs currently added on session, for propagateShare
-	connDone     chan struct{}   // closed when the current connection ends
+	sessCancel    context.CancelFunc // ends the current session; see notePeerRedialed
+	session       *syncsvc.Session
+	conn          net.Conn
+	activeShares  map[string]bool // shareIDs currently added on session, for propagateShare
+	connDone      chan struct{}   // closed when the current connection ends
+	network       peerNetworkCounters
+	sessionTotals syncsvc.SessionStats
+	lastPingAt    time.Time
+}
+
+type peerNetworkCounters struct {
+	dialAttempts, dialFailures, transportFailures, handshakeFailures uint64
+	backoffs, backoffNanos, lastBackoffNanos                         uint64
+	connections, reconnects, dedupLosses                             uint64
+	pingsSent, pongsReceived, deadConnections                        uint64
+	lastPingRTTNanos                                                 uint64
 }
 
 func newPeerConn(n *Node, p config.Peer) (*peerConn, error) {
@@ -215,6 +226,13 @@ func (pc *peerConn) runSupervisor() {
 		Schedule: transport.Backoff{},
 		Clock:    asTransportClock(pc.node.clock),
 		Rand:     pc.node.rand,
+		OnBackoff: func(d time.Duration) {
+			pc.mu.Lock()
+			pc.network.backoffs++
+			pc.network.backoffNanos += uint64(d)
+			pc.network.lastBackoffNanos = uint64(d)
+			pc.mu.Unlock()
+		},
 	}
 	sup.Run(pc.ctx, pc.dialAttempt)
 }
@@ -243,6 +261,7 @@ func (pc *peerConn) dialAttempt(ctx context.Context) error {
 		return nil
 	}
 	addr, peerPub := pc.addr, pc.peerPub
+	pc.network.dialAttempts++
 	pc.mu.Unlock()
 
 	pc.setState(ConnStateConnecting)
@@ -427,6 +446,10 @@ func (pc *peerConn) offer(ctx context.Context, conn net.Conn, result *protocol.H
 	pc.lastConnectedAt = pc.connectedSince
 	pc.remoteName = safeRemoteName
 	pc.lastErr = ""
+	pc.network.connections++
+	if pc.network.connections > 1 {
+		pc.network.reconnects++
+	}
 	pc.dedupLosses = 0  // a connection was adopted (either direction) — see noteDedupLoss
 	pc.dialFailures = 0 // ... and getting here means dialling works — see noteDialFailure
 	done := pc.connDone
@@ -505,6 +528,7 @@ func (pc *peerConn) runConnection(sessCtx context.Context, cancel context.Cancel
 	cancel()
 	<-kaDone // cancel() above is what unblocks ka.Run
 	sess.Close()
+	finishedStats := sess.Stats()
 	conn.Close()
 
 	// Before close(done) releases dialAttempt to redial: whatever the
@@ -520,6 +544,7 @@ func (pc *peerConn) runConnection(sessCtx context.Context, cancel context.Cancel
 	pc.session = nil
 	pc.conn = nil
 	pc.activeShares = nil
+	pc.sessionTotals = addSessionStats(pc.sessionTotals, finishedStats, false)
 	if pc.state == ConnStateConnected {
 		pc.state = ConnStateDisconnected
 	}
@@ -557,6 +582,10 @@ func (pc *peerConn) runKeepalive(ctx context.Context, ka *protocol.Keepalive, se
 			conn.Close()
 			return
 		}
+		pc.mu.Lock()
+		pc.network.pingsSent++
+		pc.lastPingAt = pc.node.clock.Now()
+		pc.mu.Unlock()
 	}, func() {
 		// The single most diagnostic event the transport has: the peer
 		// stopped answering entirely. Silently closing here made it
@@ -564,6 +593,9 @@ func (pc *peerConn) runKeepalive(ctx context.Context, ka *protocol.Keepalive, se
 		// the difference between "the other node was restarted" and "the
 		// network between us is black-holing traffic".
 		pc.node.logger.Printf("core: peer %s (%s): no traffic for the keepalive dead interval; treating the connection as dead", pc.name, pc.peerShort)
+		pc.mu.Lock()
+		pc.network.deadConnections++
+		pc.mu.Unlock()
 		conn.Close() // dead per SPEC.md §4's 90s rule; unblocks the session's read loop
 	})
 }
@@ -582,11 +614,18 @@ func (pc *peerConn) handleControl(ctx context.Context, sess *syncsvc.Session, ty
 			node.logger.Printf("core: peer %s: reply pong: %v", pc.name, err)
 		}
 	case protocol.MsgPong:
-		// No action beyond the frame observer's RecordReceived.
+		pc.mu.Lock()
+		pc.network.pongsReceived++
+		if !pc.lastPingAt.IsZero() {
+			pc.network.lastPingRTTNanos = uint64(pc.node.clock.Now().Sub(pc.lastPingAt))
+			pc.lastPingAt = time.Time{}
+		}
+		pc.mu.Unlock()
 
 	case protocol.MsgShareList:
 		var msg protocol.ShareList
 		if err := protocol.DecodeAndValidateMessage(payload, &msg); err != nil {
+			sess.RecordProtocolViolation()
 			node.logger.Printf("core: peer %s: decode ShareList: %v", pc.name, err)
 			return
 		}
@@ -595,6 +634,7 @@ func (pc *peerConn) handleControl(ctx context.Context, sess *syncsvc.Session, ty
 	case protocol.MsgSubscribeRequest:
 		var msg protocol.SubscribeRequest
 		if err := protocol.DecodeAndValidateMessage(payload, &msg); err != nil {
+			sess.RecordProtocolViolation()
 			node.logger.Printf("core: peer %s: decode SubscribeRequest: %v", pc.name, err)
 			return
 		}
@@ -604,6 +644,7 @@ func (pc *peerConn) handleControl(ctx context.Context, sess *syncsvc.Session, ty
 		// happens-before ordering that the async work here relies on.
 		share, access, ok := node.provisionShareForRequest(pc, sess, msg.ShareID)
 		if !ok {
+			sess.RecordRejectedShareOperation()
 			return
 		}
 		node.goTracked(func() { node.finishSubscribeRequest(pc, share, access) })
@@ -611,6 +652,7 @@ func (pc *peerConn) handleControl(ctx context.Context, sess *syncsvc.Session, ty
 	case protocol.MsgAccessUpdate:
 		var msg protocol.AccessUpdate
 		if err := protocol.DecodeAndValidateMessage(payload, &msg); err != nil {
+			sess.RecordProtocolViolation()
 			node.logger.Printf("core: peer %s: decode AccessUpdate: %v", pc.name, err)
 			return
 		}
@@ -620,7 +662,8 @@ func (pc *peerConn) handleControl(ctx context.Context, sess *syncsvc.Session, ty
 
 	default:
 		// Hello/Auth: shouldn't arrive post-handshake from a well-behaved
-		// peer; ignore defensively rather than treating it as fatal.
+		// peer; count and ignore defensively rather than treating it as fatal.
+		sess.RecordProtocolViolation()
 	}
 }
 
@@ -721,6 +764,12 @@ func (pc *peerConn) noteDialFailure(stage string, err error) {
 	safeStage := protocol.SanitizeDiagnostic(stage)
 	pc.mu.Lock()
 	pc.dialFailures++
+	pc.network.dialFailures++
+	if stage == "dial" {
+		pc.network.transportFailures++
+	} else if stage == "handshake" {
+		pc.network.handshakeFailures++
+	}
 	failures := pc.dialFailures
 	// Never contradict an adopted connection. dialAttempt already declines
 	// to call this when supersededByAdoptedConn says a connection landed
@@ -759,6 +808,7 @@ func (pc *peerConn) noteDialFailure(stage string, err error) {
 func (pc *peerConn) noteDedupLoss() {
 	pc.mu.Lock()
 	pc.dedupLosses++
+	pc.network.dedupLosses++
 	losses := pc.dedupLosses
 	if losses >= dedupLossWarnAfter {
 		pc.lastErr = fmt.Sprintf("handshake succeeded but this connection lost the deduplication rule %d times in a row and the peer's own dial never arrived: the peer can be reached from here but may not be able to reach us, or may not have us configured as a peer", losses)

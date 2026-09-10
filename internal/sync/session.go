@@ -178,6 +178,7 @@ type Session struct {
 	// production beyond a couple of atomic ops.
 	pullActive int32
 	pullPeak   int32
+	stats      sessionCounters
 
 	// testServeDelay, if non-zero, is slept before serving each
 	// FileRequest. It exists solely so a test can make transfers slow
@@ -220,6 +221,67 @@ type sentIndexState struct {
 	epoch      string
 	high       uint64
 	snapshotID string
+}
+
+type sessionCounters struct {
+	protocolViolations, rejectedShareOperations, rejectedWork atomic.Uint64
+	staleTransferFrames, pullsStarted, servesStarted          atomic.Uint64
+	bytesReceived, bytesSent, transferStalls                  atomic.Uint64
+	transferCancellations, hashFailures                       atomic.Uint64
+	snapshotsSent, snapshotEntriesSent                        atomic.Uint64
+	deltaBatchesSent, deltaEntriesSent, reconciliations       atomic.Uint64
+}
+
+// SessionStats is a low-cardinality snapshot suitable for status and metrics.
+// Counters contain no share IDs, paths, or peer-provided labels.
+type SessionStats struct {
+	IndexWorkersActive, ServeWorkersActive, PullsActive int
+	ProtocolViolations, RejectedShareOperations         uint64
+	RejectedWork, StaleTransferFrames                   uint64
+	PullsStarted, ServesStarted                         uint64
+	BytesReceived, BytesSent                            uint64
+	TransferStalls, TransferCancellations, HashFailures uint64
+	SnapshotsSent, SnapshotEntriesSent                  uint64
+	DeltaBatchesSent, DeltaEntriesSent, Reconciliations uint64
+	Writer                                              protocol.StreamWriterStats
+}
+
+// Stats returns a race-safe point-in-time session snapshot.
+func (s *Session) Stats() SessionStats {
+	return SessionStats{
+		IndexWorkersActive: len(s.indexSem), ServeWorkersActive: len(s.serveSem), PullsActive: len(s.pullSem),
+		ProtocolViolations: s.stats.protocolViolations.Load(), RejectedShareOperations: s.stats.rejectedShareOperations.Load(),
+		RejectedWork: s.stats.rejectedWork.Load(), StaleTransferFrames: s.stats.staleTransferFrames.Load(),
+		PullsStarted: s.stats.pullsStarted.Load(), ServesStarted: s.stats.servesStarted.Load(),
+		BytesReceived: s.stats.bytesReceived.Load(), BytesSent: s.stats.bytesSent.Load(),
+		TransferStalls: s.stats.transferStalls.Load(), TransferCancellations: s.stats.transferCancellations.Load(), HashFailures: s.stats.hashFailures.Load(),
+		SnapshotsSent: s.stats.snapshotsSent.Load(), SnapshotEntriesSent: s.stats.snapshotEntriesSent.Load(),
+		DeltaBatchesSent: s.stats.deltaBatchesSent.Load(), DeltaEntriesSent: s.stats.deltaEntriesSent.Load(), Reconciliations: s.stats.reconciliations.Load(),
+		Writer: s.writer.Stats(),
+	}
+}
+
+func (s *Session) protocolViolation() { s.stats.protocolViolations.Add(1) }
+
+// RecordProtocolViolation lets the core control-message dispatcher account
+// for invalid post-handshake frames handled outside Session's index switch.
+func (s *Session) RecordProtocolViolation() { s.protocolViolation() }
+
+func (s *Session) rejectShareOperation() {
+	s.stats.rejectedShareOperations.Add(1)
+}
+
+// RecordRejectedShareOperation accounts for a control-plane share request
+// rejected before it becomes active on this session.
+func (s *Session) RecordRejectedShareOperation() { s.rejectShareOperation() }
+func (s *Session) rejectWork()                   { s.stats.rejectedWork.Add(1) }
+
+func (s *Session) decodeWire(payload []byte, dst any) bool {
+	if err := protocol.DecodeAndValidateMessage(payload, dst); err != nil {
+		s.protocolViolation()
+		return false
+	}
+	return true
 }
 
 const (
@@ -691,6 +753,7 @@ func (s *Session) answerSyncRequest(ctx context.Context, req protocol.IndexSyncR
 	// has not been applied to the index yet, and a snapshot must never
 	// advertise a path this node will refuse to serve.
 	rows = filterIgnoredRows(cfg, rows)
+	entryCount := len(rows)
 	id := newSnapshotID()
 	if err = s.writer.WriteMessage(protocol.MsgIndexSnapshotBegin, protocol.IndexSnapshotBegin{ShareID: req.ShareID, SnapshotID: id, Epoch: epoch, HighSeq: high}); err != nil {
 		return err
@@ -713,6 +776,8 @@ func (s *Session) answerSyncRequest(ctx context.Context, req protocol.IndexSyncR
 	}
 	return s.writer.WriteMessageOnWritten(protocol.MsgIndexSnapshotEnd, protocol.IndexSnapshotEnd{ShareID: req.ShareID, SnapshotID: id, BatchCount: batch}, func() {
 		s.noteSnapshotWritten(req.ShareID, epoch, id, high)
+		s.stats.snapshotsSent.Add(1)
+		s.stats.snapshotEntriesSent.Add(uint64(entryCount))
 	})
 }
 
@@ -775,6 +840,8 @@ func (s *Session) sendJournalDeltas(ctx context.Context, cfg ShareConfig, epoch 
 			m := protocol.IndexDeltaBatch{ShareID: shareID, Epoch: epoch, FromSeq: entries[0].Seq, ToSeq: entries[n-1].Seq, Entries: entries}
 			if err := s.writer.WriteMessageOnWritten(protocol.MsgIndexDeltaBatch, m, func() {
 				s.noteDeltaWritten(shareID, epoch, m.ToSeq)
+				s.stats.deltaBatchesSent.Add(1)
+				s.stats.deltaEntriesSent.Add(uint64(len(m.Entries)))
 			}); err != nil {
 				return false, err
 			}
@@ -971,10 +1038,11 @@ func (s *Session) readLoop() {
 		switch typ {
 		case protocol.MsgIndexSyncRequest:
 			var m protocol.IndexSyncRequest
-			if protocol.DecodeAndValidateMessage(payload, &m) != nil {
+			if !s.decodeWire(payload, &m) {
 				continue
 			}
 			if !s.servesOutboundShare(m.ShareID) {
+				s.rejectShareOperation()
 				s.logf("dropping index request for inactive or outbound-blocked share %s", m.ShareID)
 				continue
 			}
@@ -983,16 +1051,18 @@ func (s *Session) readLoop() {
 					s.logf("answer index sync: %v", err)
 				}
 			}) {
+				s.rejectWork()
 				s.logf("closing overloaded session: index workers are full")
 				_ = s.conn.Close()
 				return
 			}
 		case protocol.MsgIndexSnapshotBegin:
 			var m protocol.IndexSnapshotBegin
-			if protocol.DecodeAndValidateMessage(payload, &m) != nil {
+			if !s.decodeWire(payload, &m) {
 				continue
 			}
 			if !s.acceptsInboundIndex(m.ShareID) || m.SnapshotID == "" {
+				s.rejectShareOperation()
 				continue
 			}
 			s.snapshotMu.Lock()
@@ -1001,16 +1071,18 @@ func (s *Session) readLoop() {
 			_ = s.store.SetCursor(s.ctx, s.peerID, m.ShareID, "incoming", index.Cursor{Epoch: m.Epoch, SnapshotID: m.SnapshotID})
 		case protocol.MsgIndexSnapshotBatch:
 			var m protocol.IndexSnapshotBatch
-			if protocol.DecodeAndValidateMessage(payload, &m) != nil {
+			if !s.decodeWire(payload, &m) {
 				continue
 			}
 			if !s.acceptsInboundIndex(m.ShareID) {
+				s.rejectShareOperation()
 				continue
 			}
 			s.snapshotMu.Lock()
 			b, ok := s.snapshots[m.ShareID]
 			s.snapshotMu.Unlock()
 			if !ok || b.SnapshotID != m.SnapshotID {
+				s.protocolViolation()
 				continue
 			}
 			c, _ := s.store.Cursor(s.ctx, s.peerID, m.ShareID, "incoming")
@@ -1031,10 +1103,11 @@ func (s *Session) readLoop() {
 			}
 		case protocol.MsgIndexSnapshotEnd:
 			var m protocol.IndexSnapshotEnd
-			if protocol.DecodeAndValidateMessage(payload, &m) != nil {
+			if !s.decodeWire(payload, &m) {
 				continue
 			}
 			if !s.acceptsInboundIndex(m.ShareID) {
+				s.rejectShareOperation()
 				continue
 			}
 			s.snapshotMu.Lock()
@@ -1049,6 +1122,7 @@ func (s *Session) readLoop() {
 				if !s.startBounded(s.indexSem, func() {
 					s.reconcilePeerShare(s.ctx, m.ShareID)
 				}) {
+					s.rejectWork()
 					s.logf("closing overloaded session: index workers are full")
 					_ = s.conn.Close()
 					return
@@ -1056,10 +1130,11 @@ func (s *Session) readLoop() {
 			}
 		case protocol.MsgIndexDeltaBatch:
 			var m protocol.IndexDeltaBatch
-			if protocol.DecodeAndValidateMessage(payload, &m) != nil {
+			if !s.decodeWire(payload, &m) {
 				continue
 			}
 			if !s.acceptsInboundIndex(m.ShareID) {
+				s.rejectShareOperation()
 				continue
 			}
 			rr := make([]index.FileRow, len(m.Entries))
@@ -1076,6 +1151,7 @@ func (s *Session) readLoop() {
 				if !s.startBounded(s.indexSem, func() {
 					s.handleIndexUpdate(s.ctx, protocol.IndexUpdate{ShareID: m.ShareID, Files: rowsToInfos(rr)})
 				}) {
+					s.rejectWork()
 					s.logf("closing overloaded session: index workers are full")
 					_ = s.conn.Close()
 					return
@@ -1086,21 +1162,24 @@ func (s *Session) readLoop() {
 			}
 		case protocol.MsgIndexAck:
 			var m protocol.IndexAck
-			if protocol.DecodeAndValidateMessage(payload, &m) == nil && s.servesOutboundShare(m.ShareID) {
+			if s.decodeWire(payload, &m) && s.servesOutboundShare(m.ShareID) {
 				s.acceptIndexAck(m)
+			} else if m.ShareID != "" {
+				s.rejectShareOperation()
 			}
 		case protocol.MsgIndexUpdate:
 			var msg protocol.IndexUpdate
-			if err := protocol.DecodeAndValidateMessage(payload, &msg); err != nil {
-				s.logf("decode IndexUpdate: %v", err)
+			if !s.decodeWire(payload, &msg) {
 				continue
 			}
 			if !s.acceptsInboundIndex(msg.ShareID) {
+				s.rejectShareOperation()
 				continue
 			}
 			if !s.startBounded(s.indexSem, func() {
 				s.handleIndexUpdate(s.ctx, msg)
 			}) {
+				s.rejectWork()
 				s.logf("closing overloaded session: index workers are full")
 				_ = s.conn.Close()
 				return
@@ -1108,17 +1187,18 @@ func (s *Session) readLoop() {
 
 		case protocol.MsgFileRequest:
 			var req protocol.FileRequest
-			if err := protocol.DecodeAndValidateMessage(payload, &req); err != nil {
-				s.logf("decode FileRequest: %v", err)
+			if !s.decodeWire(payload, &req) {
 				continue
 			}
 			if !s.servesOutboundShare(req.ShareID) {
+				s.rejectShareOperation()
 				s.sendFileError(req, protocol.ErrCodeFileNotFound, "unknown share")
 				continue
 			}
 			if !s.startBounded(s.serveSem, func() {
 				s.handleFileRequest(s.ctx, req)
 			}) {
+				s.rejectWork()
 				s.logf("closing overloaded session: file workers are full")
 				_ = s.conn.Close()
 				return
@@ -1127,6 +1207,7 @@ func (s *Session) readLoop() {
 		case protocol.MsgFileChunk:
 			hdr, data, err := protocol.DecodeFileChunk(payload)
 			if err != nil {
+				s.protocolViolation()
 				s.logf("decode FileChunk: %v", err)
 				continue
 			}
@@ -1134,8 +1215,7 @@ func (s *Session) readLoop() {
 
 		case protocol.MsgError:
 			var e protocol.Error
-			if err := protocol.DecodeAndValidateMessage(payload, &e); err != nil {
-				s.logf("decode Error: %v", err)
+			if !s.decodeWire(payload, &e) {
 				continue
 			}
 			if e.TransferID != "" {
@@ -1145,7 +1225,8 @@ func (s *Session) readLoop() {
 			}
 		case protocol.MsgCancelTransfer:
 			var m protocol.CancelTransfer
-			if protocol.DecodeAndValidateMessage(payload, &m) == nil {
+			if s.decodeWire(payload, &m) {
+				s.stats.transferCancellations.Add(1)
 				s.cancelServe(m.TransferID)
 			}
 
@@ -1162,6 +1243,7 @@ func (s *Session) readLoop() {
 }
 
 func (s *Session) reconcilePeerShare(ctx context.Context, shareID string) {
+	s.stats.reconciliations.Add(1)
 	s.reconcileMu.Lock()
 	defer s.reconcileMu.Unlock()
 	rows, err := s.store.ListPeerFiles(ctx, s.peerID, shareID)
@@ -1270,6 +1352,7 @@ func (s *Session) ReconcileShare(ctx context.Context, shareID string) error {
 // recorded any newly-received peer rows. why names what prompted the pass,
 // for the debug line.
 func (s *Session) reconcileLocked(ctx context.Context, cfg ShareConfig, why string) {
+	s.stats.reconciliations.Add(1)
 	shareID := cfg.ShareID
 	localRows, err := s.store.ListShare(ctx, shareID, true)
 	if err != nil {

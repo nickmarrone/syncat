@@ -50,19 +50,21 @@ type statusResponse struct {
 	RemoteShares  []remoteShareDTO  `json:"remote_shares"`
 	Subscriptions []subscriptionDTO `json:"subscriptions"`
 	Rejected      []rejectedConnDTO `json:"rejected_connections"`
+	Network       map[string]any    `json:"network"`
 }
 
 type peerDTO struct {
-	ID              string    `json:"id"` // full Ed25519 public key, hex — same as PeerKey
-	PeerKey         string    `json:"peer_key"`
-	ShortID         string    `json:"short_id"`
-	Name            string    `json:"name"`
-	RemoteName      string    `json:"remote_name"`
-	Enabled         bool      `json:"enabled"`
-	State           string    `json:"state"`
-	LastError       string    `json:"last_error,omitempty"`
-	LastConnectedAt time.Time `json:"last_connected_at,omitempty"`
-	ConnectedSince  time.Time `json:"connected_since,omitempty"`
+	ID              string         `json:"id"` // full Ed25519 public key, hex — same as PeerKey
+	PeerKey         string         `json:"peer_key"`
+	ShortID         string         `json:"short_id"`
+	Name            string         `json:"name"`
+	RemoteName      string         `json:"remote_name"`
+	Enabled         bool           `json:"enabled"`
+	State           string         `json:"state"`
+	LastError       string         `json:"last_error,omitempty"`
+	LastConnectedAt time.Time      `json:"last_connected_at,omitempty"`
+	ConnectedSince  time.Time      `json:"connected_since,omitempty"`
+	Network         map[string]any `json:"network"`
 }
 
 type shareAccessDTO struct {
@@ -131,6 +133,52 @@ func toPeerDTO(p core.PeerStatus) peerDTO {
 		ID: p.PeerKey, PeerKey: p.PeerKey, ShortID: p.ShortID, Name: p.Name, RemoteName: p.RemoteName,
 		Enabled: p.Enabled, State: string(p.State), LastError: p.LastError,
 		LastConnectedAt: p.LastConnectedAt, ConnectedSince: p.ConnectedSince,
+		Network: toPeerNetworkDTO(p.Network),
+	}
+}
+
+func toWriterNetworkDTO(w core.WriterNetworkStatus) map[string]any {
+	return map[string]any{
+		"urgent_queued": w.UrgentQueued, "control_queued": w.ControlQueued, "bulk_queued": w.BulkQueued,
+		"urgent_capacity": w.UrgentCapacity, "control_capacity": w.ControlCapacity, "bulk_capacity": w.BulkCapacity,
+		"frames_written": w.FramesWritten, "urgent_frames_written": w.UrgentFramesWritten,
+		"control_frames_written": w.ControlFramesWritten, "bulk_frames_written": w.BulkFramesWritten,
+		"bytes_written": w.BytesWritten, "write_failures": w.WriteFailures, "write_timeouts": w.WriteTimeouts,
+		"last_write_seconds": w.LastWriteDuration.Seconds(), "max_write_seconds": w.MaxWriteDuration.Seconds(),
+	}
+}
+
+func toSessionNetworkDTO(s core.SessionNetworkStatus) map[string]any {
+	return map[string]any{
+		"index_workers_active": s.IndexWorkersActive, "serve_workers_active": s.ServeWorkersActive, "pulls_active": s.PullsActive,
+		"protocol_violations": s.ProtocolViolations, "rejected_share_operations": s.RejectedShareOperations,
+		"rejected_work": s.RejectedWork, "stale_transfer_frames": s.StaleTransferFrames,
+		"pulls_started": s.PullsStarted, "serves_started": s.ServesStarted,
+		"bytes_received": s.BytesReceived, "bytes_sent": s.BytesSent,
+		"transfer_stalls": s.TransferStalls, "transfer_cancellations": s.TransferCancellations, "hash_failures": s.HashFailures,
+		"snapshots_sent": s.SnapshotsSent, "snapshot_entries_sent": s.SnapshotEntriesSent,
+		"delta_batches_sent": s.DeltaBatchesSent, "delta_entries_sent": s.DeltaEntriesSent, "reconciliations": s.Reconciliations,
+		"writer": toWriterNetworkDTO(s.Writer),
+	}
+}
+
+func toPeerNetworkDTO(p core.PeerNetworkStatus) map[string]any {
+	return map[string]any{
+		"dial_attempts": p.DialAttempts, "dial_failures": p.DialFailures,
+		"transport_failures": p.TransportFailures, "handshake_failures": p.HandshakeFailures,
+		"backoffs": p.Backoffs, "total_backoff_seconds": p.TotalBackoff.Seconds(), "last_backoff_seconds": p.LastBackoff.Seconds(),
+		"connections": p.Connections, "reconnects": p.Reconnects, "dedup_losses": p.DedupLosses,
+		"pings_sent": p.PingsSent, "pongs_received": p.PongsReceived, "dead_connections": p.DeadConnections,
+		"last_ping_rtt_seconds": p.LastPingRTT.Seconds(), "session": toSessionNetworkDTO(p.Session),
+	}
+}
+
+func toNetworkDTO(n core.NetworkStatus) map[string]any {
+	return map[string]any{
+		"inbound_handshakes_active": n.InboundHandshakesActive,
+		"rejected_handshakes":       n.RejectedHandshakes,
+		"rejected_overload":         n.RejectedOverload,
+		"totals":                    toPeerNetworkDTO(n.Totals),
 	}
 }
 
@@ -202,7 +250,7 @@ func toStatusResponse(st core.Status) statusResponse {
 		NodeName: st.NodeName, NodeToken: st.NodeToken, ShortID: st.ShortID, PeerKey: st.PeerKey,
 		StartedAt: st.StartedAt, UptimeSeconds: st.UptimeSeconds,
 		Peers: peers, Shares: shares, RemoteShares: remoteShares, Subscriptions: subs,
-		Rejected: rejected,
+		Rejected: rejected, Network: toNetworkDTO(st.Network),
 	}
 }
 
