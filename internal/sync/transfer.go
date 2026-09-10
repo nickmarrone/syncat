@@ -244,7 +244,7 @@ func (s *Session) handleFileRequest(ctx context.Context, req protocol.FileReques
 	defer func() { <-s.serveSem }()
 
 	cfg, ok := s.getShare(req.ShareID)
-	if !ok {
+	if !ok || cfg.Direction.OutboundBlocked {
 		s.sendFileError(req, protocol.ErrCodeFileNotFound, "unknown share")
 		return
 	}
