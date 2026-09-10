@@ -70,11 +70,14 @@ type HandshakeConfig struct {
 	// connection. When dialing a specific configured peer, this is
 	// typically "pub equals the key I dialed"; when accepting an inbound
 	// connection, it's typically "pub is in my configured-peers set". An
-	// unknown key is a hard rejection — SPEC.md §2.3's pending-peer
-	// approval queue (recording an unknown inbound key for later
-	// approval, rather than closing outright) is not implemented; both
-	// sides must already have pasted tokens.
+	// unknown key is rejected for this connection; OnUnknownPeer may retain
+	// its validated Hello for later approval.
 	IsKnownPeer func(pub ed25519.PublicKey) bool
+
+	// OnUnknownPeer observes a structurally valid, version-compatible Hello
+	// whose key IsKnownPeer rejected. Responders use it to persist the peer's
+	// validated token for later approval before closing the connection.
+	OnUnknownPeer func(Hello)
 
 	// Timeout bounds the whole handshake; defaults to
 	// DefaultHandshakeTimeout if <= 0.
@@ -323,6 +326,9 @@ func validatePeerHello(cfg HandshakeConfig, ourVersion, minVersion int, h Hello)
 		return &HandshakeRejectionError{Code: ErrCodeUnsupportedVersion, Err: err}
 	}
 	if !cfg.IsKnownPeer(ed25519.PublicKey(h.Ed25519Pub)) {
+		if cfg.OnUnknownPeer != nil {
+			cfg.OnUnknownPeer(h)
+		}
 		return &HandshakeRejectionError{Code: ErrCodeUnauthorized, Err: fmt.Errorf("unknown peer key %x", h.Ed25519Pub)}
 	}
 	return nil

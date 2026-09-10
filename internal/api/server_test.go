@@ -21,6 +21,7 @@ import (
 
 	"github.com/nickmarrone/syncat/internal/config"
 	"github.com/nickmarrone/syncat/internal/core"
+	"github.com/nickmarrone/syncat/internal/protocol"
 	syncsvc "github.com/nickmarrone/syncat/internal/sync"
 	"github.com/nickmarrone/syncat/internal/transport"
 	"github.com/nickmarrone/syncat/internal/version"
@@ -461,19 +462,58 @@ func TestPeersAddMissingToken(t *testing.T) {
 	}
 }
 
-func TestPeersApproveNotImplemented(t *testing.T) {
+func TestPeersApproveUnknownPendingPeer(t *testing.T) {
 	srv, _, _ := newTestServer(t)
 	w := doRequest(t, srv, http.MethodPost, "/api/peers/deadbeef/approve", testToken, nil)
-	if w.Code != http.StatusNotImplemented {
-		t.Fatalf("status = %d, want 501; body: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404; body: %s", w.Code, w.Body.String())
 	}
 }
 
-func TestApprovalsNotImplemented(t *testing.T) {
+func TestApprovalsEmpty(t *testing.T) {
 	srv, _, _ := newTestServer(t)
 	w := doRequest(t, srv, http.MethodGet, "/api/approvals", testToken, nil)
-	if w.Code != http.StatusNotImplemented {
-		t.Fatalf("status = %d, want 501; body: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Approvals []approvalDTO `json:"approvals"`
+	}
+	decodeJSONBody(t, w, &resp)
+	if len(resp.Approvals) != 0 {
+		t.Fatalf("approvals = %+v, want empty", resp.Approvals)
+	}
+}
+
+func TestShareApprovalListAndDecision(t *testing.T) {
+	srv, node, _ := newTestServer(t)
+	peerToken := fakePeerToken(t, "bob")
+	peerID, err := node.AddPeer("bob", peerToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	shareID, err := node.AddShare(t.TempDir(), "docs", config.PermissionReadOnly, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := node.SetShareAccess(shareID, peerID, protocol.AccessPending); err != nil {
+		t.Fatal(err)
+	}
+
+	w := doRequest(t, srv, http.MethodGet, "/api/approvals", testToken, nil)
+	var resp struct {
+		Approvals []approvalDTO `json:"approvals"`
+	}
+	decodeJSONBody(t, w, &resp)
+	if len(resp.Approvals) != 1 || resp.Approvals[0].Kind != core.ApprovalShare || resp.Approvals[0].ShareID != shareID || resp.Approvals[0].PeerKey != peerID {
+		t.Fatalf("approvals = %+v", resp.Approvals)
+	}
+	w = doRequest(t, srv, http.MethodPost, "/api/approvals/"+resp.Approvals[0].ID, testToken, map[string]string{"decision": "deny"})
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("deny status = %d, want 204; body: %s", w.Code, w.Body.String())
+	}
+	if got := node.Approvals(); len(got) != 0 {
+		t.Fatalf("approval remained after denial: %+v", got)
 	}
 }
 

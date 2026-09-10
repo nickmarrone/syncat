@@ -152,15 +152,9 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/peers", s.auth(s.handlePeersList))
 	s.mux.HandleFunc("POST /api/peers", s.auth(s.handlePeersAdd))
 	s.mux.HandleFunc("DELETE /api/peers/{id}", s.auth(s.handlePeersDelete))
-	// Deferred: SPEC.md §2.3's pending-peer approval queue isn't
-	// implemented (see internal/core's package doc comment) — an unknown
-	// inbound key is rejected outright rather than queued. These two
-	// endpoints exist in the URL space so a client gets a clear,
-	// documented "not implemented" rather than a 404 that looks like a
-	// typo.
-	s.mux.HandleFunc("POST /api/peers/{id}/approve", s.auth(s.handleNotImplemented("peer approval queue (SPEC.md §2.3) is not implemented in this build")))
-	s.mux.HandleFunc("GET /api/approvals", s.auth(s.handleNotImplemented("approval queue (SPEC.md §2.3/§6) is not implemented in this build")))
-	s.mux.HandleFunc("POST /api/approvals/{id}", s.auth(s.handleNotImplemented("approval queue (SPEC.md §2.3/§6) is not implemented in this build")))
+	s.mux.HandleFunc("POST /api/peers/{id}/approve", s.auth(s.handlePeerApprove))
+	s.mux.HandleFunc("GET /api/approvals", s.auth(s.handleApprovalsList))
+	s.mux.HandleFunc("POST /api/approvals/{id}", s.auth(s.handleApprovalDecision))
 
 	s.mux.HandleFunc("GET /api/shares", s.auth(s.handleSharesList))
 	s.mux.HandleFunc("POST /api/shares", s.auth(s.handleSharesAdd))

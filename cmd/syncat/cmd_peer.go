@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"time"
 
 	"github.com/nickmarrone/syncat/internal/config"
 )
@@ -66,15 +67,16 @@ func cmdPeerLs(paths *config.Paths, args []string) error {
 		return err
 	}
 	var resp struct {
-		Peers []peerView `json:"peers"`
+		Peers        []peerView        `json:"peers"`
+		PendingPeers []pendingPeerView `json:"pending_peers"`
 	}
 	if err := c.do(context.Background(), http.MethodGet, "/api/peers", nil, &resp); err != nil {
 		return err
 	}
 	if *asJSON {
-		return printJSON(resp.Peers)
+		return printJSON(resp)
 	}
-	if len(resp.Peers) == 0 {
+	if len(resp.Peers) == 0 && len(resp.PendingPeers) == 0 {
 		fmt.Println("no peers configured")
 		return nil
 	}
@@ -84,6 +86,9 @@ func cmdPeerLs(paths *config.Paths, args []string) error {
 			line += fmt.Sprintf("\terror=%q", p.LastError)
 		}
 		fmt.Println(line)
+	}
+	for _, p := range resp.PendingPeers {
+		fmt.Printf("%s\t%-20s\tpending approval\tfirst_seen=%s\n", p.ID, p.Name, p.FirstSeen.Format(time.RFC3339))
 	}
 	return nil
 }
@@ -108,10 +113,6 @@ func cmdPeerRm(paths *config.Paths, args []string) error {
 	return nil
 }
 
-// cmdPeerApprove hits the peer-approval endpoint, which this build does
-// not implement (SPEC.md §2.3's pending-peer queue — see internal/core's
-// package doc comment); the server's 501 response message explains that
-// to the user rather than the CLI pretending the subcommand doesn't exist.
 func cmdPeerApprove(paths *config.Paths, args []string) error {
 	fs := flag.NewFlagSet("peer approve", flag.ContinueOnError)
 	if err := fs.Parse(args); err != nil {
@@ -125,7 +126,11 @@ func cmdPeerApprove(paths *config.Paths, args []string) error {
 	if err != nil {
 		return err
 	}
-	return c.do(context.Background(), http.MethodPost, "/api/peers/"+url.PathEscape(fs.Arg(0))+"/approve", nil, nil)
+	if err := c.do(context.Background(), http.MethodPost, "/api/peers/"+url.PathEscape(fs.Arg(0))+"/approve", nil, nil); err != nil {
+		return err
+	}
+	fmt.Printf("approved peer %s\n", fs.Arg(0))
+	return nil
 }
 
 // cmdRemote implements `syncat remote ls` (SPEC.md §8): everything
@@ -164,22 +169,43 @@ func cmdRemote(paths *config.Paths, args []string) error {
 	return nil
 }
 
-// cmdApprovals implements `syncat approvals [grant|deny ID]` (SPEC.md
-// §8). The approval queue itself (SPEC.md §2.3/§6) is not implemented —
-// see internal/core's package doc comment and internal/api's routes — so
-// both the list and grant/deny paths simply surface the server's 501
-// "not implemented" response rather than duplicating that decision here.
+// cmdApprovals implements `syncat approvals [grant|deny ID]` (SPEC.md §8).
 func cmdApprovals(paths *config.Paths, args []string) error {
 	c, err := newAPIClient(paths)
 	if err != nil {
 		return err
 	}
 	if len(args) == 0 {
-		return c.do(context.Background(), http.MethodGet, "/api/approvals", nil, nil)
+		var resp struct {
+			Approvals []approvalView `json:"approvals"`
+		}
+		if err := c.do(context.Background(), http.MethodGet, "/api/approvals", nil, &resp); err != nil {
+			return err
+		}
+		if len(resp.Approvals) == 0 {
+			fmt.Println("no pending approvals")
+			return nil
+		}
+		for _, approval := range resp.Approvals {
+			if approval.Kind == "peer" {
+				fmt.Printf("%s\tpeer\t%s (%s)\n", approval.ID, approval.PeerName, approval.PeerKey)
+			} else {
+				fmt.Printf("%s\tshare\t%s (%s) for %s (%s)\n", approval.ID, approval.ShareName, approval.ShareID, approval.PeerName, approval.PeerKey)
+			}
+		}
+		return nil
 	}
 	if len(args) != 2 || (args[0] != "grant" && args[0] != "deny") {
 		return fmt.Errorf("usage: syncat approvals [grant|deny ID]")
 	}
 	decision, id := args[0], args[1]
-	return c.do(context.Background(), http.MethodPost, "/api/approvals/"+url.PathEscape(id), map[string]string{"decision": decision}, nil)
+	if err := c.do(context.Background(), http.MethodPost, "/api/approvals/"+url.PathEscape(id), map[string]string{"decision": decision}, nil); err != nil {
+		return err
+	}
+	past := "granted"
+	if decision == "deny" {
+		past = "denied"
+	}
+	fmt.Printf("%s approval %s\n", past, id)
+	return nil
 }

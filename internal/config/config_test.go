@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestSaveLoadRoundTrip(t *testing.T) {
@@ -227,6 +228,7 @@ func TestMarshalUnmarshalRoundTrip(t *testing.T) {
 			{Name: "bob", Token: "sc1abc", Enabled: true},
 			{Name: "carol", Token: "sc1def", Enabled: false},
 		},
+		PendingPeers: []PendingPeer{{Name: "dave", Token: "sc1pending", FirstSeen: time.Unix(10, 0).UTC(), LastSeen: time.Unix(20, 0).UTC()}},
 		Shares: []Share{
 			{
 				ID:               "deadbeefcafef00d",

@@ -67,6 +67,28 @@ type peerDTO struct {
 	Network         map[string]any `json:"network"`
 }
 
+type pendingPeerDTO struct {
+	ID        string    `json:"id"`
+	PeerKey   string    `json:"peer_key"`
+	ShortID   string    `json:"short_id"`
+	Name      string    `json:"name"`
+	FirstSeen time.Time `json:"first_seen"`
+}
+
+type approvalDTO struct {
+	ID        string    `json:"id"`
+	Kind      string    `json:"kind"`
+	PeerKey   string    `json:"peer_key"`
+	PeerName  string    `json:"peer_name,omitempty"`
+	ShareID   string    `json:"share_id,omitempty"`
+	ShareName string    `json:"share_name,omitempty"`
+	CreatedAt time.Time `json:"created_at,omitempty"`
+}
+
+func toApprovalDTO(a core.Approval) approvalDTO {
+	return approvalDTO{ID: a.ID, Kind: a.Kind, PeerKey: a.PeerKey, PeerName: a.PeerName, ShareID: a.ShareID, ShareName: a.ShareName, CreatedAt: a.CreatedAt}
+}
+
 type shareAccessDTO struct {
 	PeerKey  string `json:"peer_key"`
 	PeerName string `json:"peer_name,omitempty"`

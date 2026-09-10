@@ -2,6 +2,8 @@ package api
 
 import (
 	"net/http"
+
+	"github.com/nickmarrone/syncat/internal/core"
 )
 
 // --- status ------------------------------------------------------------
@@ -42,7 +44,19 @@ func (s *Server) handlePeersList(w http.ResponseWriter, r *http.Request) {
 	for _, p := range st.Peers {
 		peers = append(peers, toPeerDTO(p))
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"peers": peers})
+	approvals := s.node.Approvals()
+	pending := make([]pendingPeerDTO, 0)
+	for _, approval := range approvals {
+		if approval.Kind != core.ApprovalPeer {
+			continue
+		}
+		shortID := approval.PeerKey
+		if len(shortID) > 16 {
+			shortID = shortID[:16]
+		}
+		pending = append(pending, pendingPeerDTO{ID: approval.ID, PeerKey: approval.PeerKey, ShortID: shortID, Name: approval.PeerName, FirstSeen: approval.CreatedAt})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"peers": peers, "pending_peers": pending})
 }
 
 type addPeerRequest struct {
@@ -74,6 +88,41 @@ func (s *Server) handlePeersAdd(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handlePeersDelete(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if err := s.node.RemovePeer(id); err != nil {
+		writeMutationError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handlePeerApprove(w http.ResponseWriter, r *http.Request) {
+	if err := s.node.ApprovePendingPeer(r.PathValue("id")); err != nil {
+		writeMutationError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// --- approvals ------------------------------------------------------------
+
+func (s *Server) handleApprovalsList(w http.ResponseWriter, r *http.Request) {
+	approvals := s.node.Approvals()
+	out := make([]approvalDTO, 0, len(approvals))
+	for _, approval := range approvals {
+		out = append(out, toApprovalDTO(approval))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"approvals": out})
+}
+
+type approvalDecisionRequest struct {
+	Decision string `json:"decision"`
+}
+
+func (s *Server) handleApprovalDecision(w http.ResponseWriter, r *http.Request) {
+	var req approvalDecisionRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if err := s.node.DecideApproval(r.PathValue("id"), req.Decision); err != nil {
 		writeMutationError(w, err)
 		return
 	}

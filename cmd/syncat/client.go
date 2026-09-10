@@ -144,6 +144,24 @@ type peerView struct {
 	ConnectedSince  time.Time `json:"connected_since"`
 }
 
+type pendingPeerView struct {
+	ID        string    `json:"id"`
+	PeerKey   string    `json:"peer_key"`
+	ShortID   string    `json:"short_id"`
+	Name      string    `json:"name"`
+	FirstSeen time.Time `json:"first_seen"`
+}
+
+type approvalView struct {
+	ID        string    `json:"id"`
+	Kind      string    `json:"kind"`
+	PeerKey   string    `json:"peer_key"`
+	PeerName  string    `json:"peer_name"`
+	ShareID   string    `json:"share_id"`
+	ShareName string    `json:"share_name"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
 type shareAccessView struct {
 	PeerKey  string `json:"peer_key"`
 	PeerName string `json:"peer_name"`

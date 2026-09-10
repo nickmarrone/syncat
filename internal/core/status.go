@@ -117,11 +117,9 @@ type SubscriptionStatus struct {
 	Warnings  []WarningStatus
 }
 
-// RejectedConnection records one inbound connection whose handshake
-// authenticated as an Ed25519 key that is not a configured peer (SPEC.md
-// §2.3's pending-peer queue is deferred past the MVP — see Node's doc
-// comment — but the attempt is still recorded here so the API and UI can
-// surface "someone tried to connect").
+// RejectedConnection records one inbound connection whose handshake did not
+// become a session. Valid unknown identities are also retained in the
+// standalone approval queue; this bounded history preserves diagnostics.
 type RejectedConnection struct {
 	PeerKey  string // the unknown key, hex-encoded, if the handshake got that far
 	PeerName string // the name they claimed, if any
