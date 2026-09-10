@@ -47,6 +47,10 @@ type testNode struct {
 
 func newTestNode(t *testing.T, id string) *testNode {
 	t.Helper()
+	if len(id) != 16 {
+		sum := sha256.Sum256([]byte(id))
+		id = fmt.Sprintf("%x", sum[:8])
+	}
 	dir := t.TempDir()
 	root := filepath.Join(dir, "share")
 	if err := os.MkdirAll(root, 0o700); err != nil {

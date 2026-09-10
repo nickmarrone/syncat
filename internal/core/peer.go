@@ -576,7 +576,7 @@ func (pc *peerConn) handleControl(ctx context.Context, sess *syncsvc.Session, ty
 
 	case protocol.MsgShareList:
 		var msg protocol.ShareList
-		if err := protocol.DecodeMessage(payload, &msg); err != nil {
+		if err := protocol.DecodeAndValidateMessage(payload, &msg); err != nil {
 			node.logger.Printf("core: peer %s: decode ShareList: %v", pc.name, err)
 			return
 		}
@@ -584,7 +584,7 @@ func (pc *peerConn) handleControl(ctx context.Context, sess *syncsvc.Session, ty
 
 	case protocol.MsgSubscribeRequest:
 		var msg protocol.SubscribeRequest
-		if err := protocol.DecodeMessage(payload, &msg); err != nil {
+		if err := protocol.DecodeAndValidateMessage(payload, &msg); err != nil {
 			node.logger.Printf("core: peer %s: decode SubscribeRequest: %v", pc.name, err)
 			return
 		}
@@ -600,7 +600,7 @@ func (pc *peerConn) handleControl(ctx context.Context, sess *syncsvc.Session, ty
 
 	case protocol.MsgAccessUpdate:
 		var msg protocol.AccessUpdate
-		if err := protocol.DecodeMessage(payload, &msg); err != nil {
+		if err := protocol.DecodeAndValidateMessage(payload, &msg); err != nil {
 			node.logger.Printf("core: peer %s: decode AccessUpdate: %v", pc.name, err)
 			return
 		}

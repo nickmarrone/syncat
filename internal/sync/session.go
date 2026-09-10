@@ -876,7 +876,7 @@ func (s *Session) readLoop() {
 		switch typ {
 		case protocol.MsgIndexSyncRequest:
 			var m protocol.IndexSyncRequest
-			if protocol.DecodeMessage(payload, &m) != nil {
+			if protocol.DecodeAndValidateMessage(payload, &m) != nil {
 				continue
 			}
 			if !s.servesOutboundShare(m.ShareID) {
@@ -894,7 +894,7 @@ func (s *Session) readLoop() {
 			}
 		case protocol.MsgIndexSnapshotBegin:
 			var m protocol.IndexSnapshotBegin
-			if protocol.DecodeMessage(payload, &m) != nil {
+			if protocol.DecodeAndValidateMessage(payload, &m) != nil {
 				continue
 			}
 			if !s.acceptsInboundIndex(m.ShareID) || m.SnapshotID == "" {
@@ -906,7 +906,7 @@ func (s *Session) readLoop() {
 			_ = s.store.SetCursor(s.ctx, s.peerID, m.ShareID, "incoming", index.Cursor{Epoch: m.Epoch, SnapshotID: m.SnapshotID})
 		case protocol.MsgIndexSnapshotBatch:
 			var m protocol.IndexSnapshotBatch
-			if protocol.DecodeMessage(payload, &m) != nil {
+			if protocol.DecodeAndValidateMessage(payload, &m) != nil {
 				continue
 			}
 			if !s.acceptsInboundIndex(m.ShareID) {
@@ -936,7 +936,7 @@ func (s *Session) readLoop() {
 			}
 		case protocol.MsgIndexSnapshotEnd:
 			var m protocol.IndexSnapshotEnd
-			if protocol.DecodeMessage(payload, &m) != nil {
+			if protocol.DecodeAndValidateMessage(payload, &m) != nil {
 				continue
 			}
 			if !s.acceptsInboundIndex(m.ShareID) {
@@ -961,7 +961,7 @@ func (s *Session) readLoop() {
 			}
 		case protocol.MsgIndexDeltaBatch:
 			var m protocol.IndexDeltaBatch
-			if protocol.DecodeMessage(payload, &m) != nil {
+			if protocol.DecodeAndValidateMessage(payload, &m) != nil {
 				continue
 			}
 			if !s.acceptsInboundIndex(m.ShareID) {
@@ -991,7 +991,7 @@ func (s *Session) readLoop() {
 			}
 		case protocol.MsgIndexAck:
 			var m protocol.IndexAck
-			if protocol.DecodeMessage(payload, &m) == nil && s.servesOutboundShare(m.ShareID) {
+			if protocol.DecodeAndValidateMessage(payload, &m) == nil && s.servesOutboundShare(m.ShareID) {
 				// Never let a forged acknowledgement skip data this node has not
 				// produced. A later request can safely repeat already-sent rows;
 				// accepting a cursor beyond our high-water mark loses them.
@@ -1002,7 +1002,7 @@ func (s *Session) readLoop() {
 			}
 		case protocol.MsgIndexUpdate:
 			var msg protocol.IndexUpdate
-			if err := protocol.DecodeMessage(payload, &msg); err != nil {
+			if err := protocol.DecodeAndValidateMessage(payload, &msg); err != nil {
 				s.logf("decode IndexUpdate: %v", err)
 				continue
 			}
@@ -1019,7 +1019,7 @@ func (s *Session) readLoop() {
 
 		case protocol.MsgFileRequest:
 			var req protocol.FileRequest
-			if err := protocol.DecodeMessage(payload, &req); err != nil {
+			if err := protocol.DecodeAndValidateMessage(payload, &req); err != nil {
 				s.logf("decode FileRequest: %v", err)
 				continue
 			}
@@ -1045,7 +1045,7 @@ func (s *Session) readLoop() {
 
 		case protocol.MsgError:
 			var e protocol.Error
-			if err := protocol.DecodeMessage(payload, &e); err != nil {
+			if err := protocol.DecodeAndValidateMessage(payload, &e); err != nil {
 				s.logf("decode Error: %v", err)
 				continue
 			}

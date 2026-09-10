@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"math/rand"
 	"reflect"
@@ -115,7 +116,7 @@ func TestFileInfoForwardCompatBlocksField(t *testing.T) {
 		MTimeNS: 42,
 		Mode:    0644,
 		SHA256:  bytes.Repeat([]byte{9}, 32),
-		Version: VersionVector{"aaaa1111": 1},
+		Version: VersionVector{"aaaaaaaaaaaaaaaa": 1},
 		Blocks:  []block{{Offset: 0, Size: 64 * 1024, SHA256: bytes.Repeat([]byte{7}, 16)}},
 	}
 
@@ -191,7 +192,7 @@ func TestFrameRoundTripAllMessageTypes(t *testing.T) {
 	}
 
 	idx := IndexUpdate{ShareID: "s1", Full: true, Files: []FileInfo{
-		{RelPath: "a/b.txt", Type: FileTypeFile, Size: 42, MTimeNS: 123, Mode: 0644, SHA256: bytes.Repeat([]byte{0x44}, 32), Version: VersionVector{"aaaa1111": 3}, Deleted: false},
+		{RelPath: "a/b.txt", Type: FileTypeFile, Size: 42, MTimeNS: 123, Mode: 0644, SHA256: bytes.Repeat([]byte{0x44}, 32), Version: VersionVector{"aaaaaaaaaaaaaaaa": 3}, Deleted: false},
 		{RelPath: "a", Type: FileTypeDir, Deleted: false},
 		{RelPath: "gone.txt", Deleted: true},
 	}}
@@ -199,15 +200,15 @@ func TestFrameRoundTripAllMessageTypes(t *testing.T) {
 	if got.ShareID != idx.ShareID || got.Full != idx.Full || len(got.Files) != len(idx.Files) {
 		t.Fatalf("IndexUpdate round-trip mismatch: got %+v, want %+v", got, idx)
 	}
-	if !bytes.Equal(got.Files[0].SHA256, idx.Files[0].SHA256) || got.Files[0].Version["aaaa1111"] != 3 {
+	if !bytes.Equal(got.Files[0].SHA256, idx.Files[0].SHA256) || got.Files[0].Version["aaaaaaaaaaaaaaaa"] != 3 {
 		t.Errorf("IndexUpdate.Files[0] round-trip mismatch: got %+v, want %+v", got.Files[0], idx.Files[0])
 	}
 	if !got.Files[2].Deleted {
 		t.Errorf("IndexUpdate.Files[2] tombstone lost Deleted=true: got %+v", got.Files[2])
 	}
 
-	freq := FileRequest{ShareID: "s1", RelPath: "a/b.txt", Version: VersionVector{"aaaa1111": 3}, Offset: 100}
-	if got := roundTripMessage(t, MsgFileRequest, freq); got.ShareID != freq.ShareID || got.RelPath != freq.RelPath || got.Offset != freq.Offset || got.Version["aaaa1111"] != 3 {
+	freq := FileRequest{ShareID: "s1", RelPath: "a/b.txt", Version: VersionVector{"aaaaaaaaaaaaaaaa": 3}, Offset: 100}
+	if got := roundTripMessage(t, MsgFileRequest, freq); got.ShareID != freq.ShareID || got.RelPath != freq.RelPath || got.Offset != freq.Offset || got.Version["aaaaaaaaaaaaaaaa"] != 3 {
 		t.Errorf("FileRequest round-trip mismatch: got %+v, want %+v", got, freq)
 	}
 
@@ -225,7 +226,7 @@ func TestFrameRoundTripAllMessageTypes(t *testing.T) {
 }
 
 func TestFrameRoundTripFileChunk(t *testing.T) {
-	hdr := FileChunkHeader{ShareID: "s1", RelPath: "a/b.txt", Version: VersionVector{"aaaa1111": 3}, Offset: 256, EOF: true}
+	hdr := FileChunkHeader{ShareID: "s1", RelPath: "a/b.txt", Version: VersionVector{"aaaaaaaaaaaaaaaa": 3}, Offset: 256, EOF: true}
 	data := bytes.Repeat([]byte{0xAB}, 1024)
 
 	var buf bytes.Buffer
@@ -248,6 +249,61 @@ func TestFrameRoundTripFileChunk(t *testing.T) {
 	}
 	if !bytes.Equal(gotData, data) {
 		t.Errorf("data mismatch: got %d bytes, want %d bytes", len(gotData), len(data))
+	}
+}
+
+func TestDecodeAndValidateRejectsInvalidWireSemantics(t *testing.T) {
+	validFile := FileInfo{RelPath: "a.txt", Type: FileTypeFile, Size: 1, Mode: 0o644, SHA256: bytes.Repeat([]byte{1}, 32), Version: VersionVector{"aaaaaaaaaaaaaaaa": 1}}
+	tooManyVersions := VersionVector{}
+	for i := 0; i <= maxVersionEntries; i++ {
+		tooManyVersions[fmt.Sprintf("%016x", i)] = 1
+	}
+	cases := []struct {
+		name     string
+		msg, out any
+	}{
+		{"negative size", IndexUpdate{ShareID: "s", Files: []FileInfo{{RelPath: "a", Type: FileTypeFile, Size: -1, SHA256: bytes.Repeat([]byte{1}, 32)}}}, &IndexUpdate{}},
+		{"invalid hash", IndexUpdate{ShareID: "s", Files: []FileInfo{{RelPath: "a", Type: FileTypeFile, SHA256: []byte{1}}}}, &IndexUpdate{}},
+		{"invalid type", IndexUpdate{ShareID: "s", Files: []FileInfo{{RelPath: "a", Type: "device"}}}, &IndexUpdate{}},
+		{"traversal path", IndexUpdate{ShareID: "s", Files: []FileInfo{{RelPath: "../a", Type: FileTypeDir}}}, &IndexUpdate{}},
+		{"negative offset", FileRequest{ShareID: "s", RelPath: "a", Offset: -1}, &FileRequest{}},
+		{"noncanonical version node", FileRequest{ShareID: "s", RelPath: "a", Version: VersionVector{"NODE": 1}}, &FileRequest{}},
+		{"excessive version", FileRequest{ShareID: "s", RelPath: "a", Version: tooManyVersions}, &FileRequest{}},
+		{"invalid access", AccessUpdate{ShareID: "s", Access: "root"}, &AccessUpdate{}},
+		{"invalid permission", ShareList{Shares: []ShareListEntry{{ShareID: "s", Name: "n", Permission: "admin", Access: AccessNone}}}, &ShareList{}},
+		{"overflowing delta range", IndexDeltaBatch{ShareID: "s", Epoch: "e", FromSeq: 1, ToSeq: ^uint64(0), Entries: []IndexDeltaEntry{{Seq: 1, File: validFile}}}, &IndexDeltaBatch{}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			payload, err := cbor.Marshal(tc.msg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := DecodeAndValidateMessage(payload, tc.out); err == nil {
+				t.Fatalf("accepted %+v", tc.msg)
+			}
+		})
+	}
+}
+
+func TestDecodeFileChunkRejectsOversizedRawData(t *testing.T) {
+	hdr, err := cbor.Marshal(FileChunkHeader{ShareID: "s", RelPath: "a", Version: VersionVector{"aaaaaaaaaaaaaaaa": 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := append(hdr, make([]byte, MaxFileChunkData+1)...)
+	if _, _, err := DecodeFileChunk(payload); err == nil {
+		t.Fatal("accepted oversized chunk data")
+	}
+}
+
+func TestHardenedDecoderRejectsDuplicateKeysAndIndefiniteCollections(t *testing.T) {
+	duplicateShareID := []byte{0xa2, 0x68, 's', 'h', 'a', 'r', 'e', '_', 'i', 'd', 0x61, 'a', 0x68, 's', 'h', 'a', 'r', 'e', '_', 'i', 'd', 0x61, 'b'}
+	if err := DecodeAndValidateMessage(duplicateShareID, &SubscribeRequest{}); err == nil {
+		t.Fatal("accepted duplicate map key")
+	}
+	if err := DecodeMessage([]byte{0x9f, 0x61, 'a', 0xff}, &[]string{}); err == nil {
+		t.Fatal("accepted indefinite-length array")
 	}
 }
 
@@ -489,9 +545,9 @@ func FuzzDecode(f *testing.F) {
 	seedMessage(f, MsgSubscribeRequest, SubscribeRequest{ShareID: "s1"})
 	seedMessage(f, MsgAccessUpdate, AccessUpdate{ShareID: "s1", Access: AccessGranted})
 	seedMessage(f, MsgIndexUpdate, IndexUpdate{ShareID: "s1", Full: true, Files: []FileInfo{
-		{RelPath: "a/b.txt", Type: FileTypeFile, Size: 42, MTimeNS: 123, Mode: 0644, SHA256: bytes.Repeat([]byte{4}, 32), Version: VersionVector{"aaaa1111": 3}},
+		{RelPath: "a/b.txt", Type: FileTypeFile, Size: 42, MTimeNS: 123, Mode: 0644, SHA256: bytes.Repeat([]byte{4}, 32), Version: VersionVector{"aaaaaaaaaaaaaaaa": 3}},
 	}})
-	seedMessage(f, MsgFileRequest, FileRequest{ShareID: "s1", RelPath: "a/b.txt", Version: VersionVector{"aaaa1111": 3}, Offset: 100})
+	seedMessage(f, MsgFileRequest, FileRequest{ShareID: "s1", RelPath: "a/b.txt", Version: VersionVector{"aaaaaaaaaaaaaaaa": 3}, Offset: 100})
 	seedMessage(f, MsgPing, Ping{})
 	seedMessage(f, MsgPong, Pong{})
 	seedMessage(f, MsgError, Error{Code: ErrCodeBadAuth, Msg: "nope"})
