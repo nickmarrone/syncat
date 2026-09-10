@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/nickmarrone/syncat/internal/api"
 	"github.com/nickmarrone/syncat/internal/config"
 )
 
@@ -49,8 +50,12 @@ func newAPIClient(paths *config.Paths) (*apiClient, error) {
 	if addr == "" {
 		addr = config.DefaultAPIAddr
 	}
+	normalized, err := api.NormalizeLoopbackAddress(addr)
+	if err != nil {
+		return nil, err
+	}
 	return &apiClient{
-		baseURL: "http://" + addr,
+		baseURL: "http://" + normalized.ClientAuthority,
 		token:   strings.TrimSpace(string(tokData)),
 		http:    &http.Client{Timeout: 15 * time.Second},
 	}, nil

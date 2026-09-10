@@ -41,6 +41,16 @@ import (
 // tries to stream gigabytes at us).
 const maxRequestBody = 1 << 20 // 1 MiB
 
+const (
+	HTTPReadHeaderTimeout = 5 * time.Second
+	HTTPIdleTimeout       = 60 * time.Second
+	HTTPMaxHeaderBytes    = 32 << 10
+)
+
+func NewHTTPServer(handler http.Handler) *http.Server {
+	return &http.Server{Handler: handler, ReadHeaderTimeout: HTTPReadHeaderTimeout, IdleTimeout: HTTPIdleTimeout, MaxHeaderBytes: HTTPMaxHeaderBytes}
+}
+
 // Server is the REST API described in SPEC.md §8: a thin HTTP layer over
 // one *core.Node. Construct with NewServer, get an http.Handler via
 // Handler, and serve it on a listener from ListenLoopback.
@@ -48,12 +58,11 @@ type Server struct {
 	node   *core.Node
 	token  string
 	logger *log.Logger
-	// selfAddr is the host:port this server is bound to (the actual
-	// listener address, not necessarily the configured one — e.g. if the
-	// configured port was 0). handleUIToken compares it against the
-	// request's Host header as a DNS-rebinding defense; see that
-	// handler's doc comment.
-	selfAddr string
+	// allowedAuthorities contains both the configured client-facing
+	// authority and the listener's resolved address. Keeping both permits
+	// localhost and IPv6 configurations without weakening the exact Host
+	// and Origin comparisons that prevent DNS rebinding.
+	allowedAuthorities map[string]struct{}
 
 	mux *http.ServeMux
 }
@@ -63,13 +72,43 @@ type Server struct {
 // listener.Addr().String()) for /ui-token's Host-header check. logger, if
 // nil, defaults to log.Default().
 func NewServer(node *core.Node, token, selfAddr string, logger *log.Logger) *Server {
+	return NewServerWithAuthorities(node, token, logger, selfAddr)
+}
+
+func NewServerWithAuthorities(node *core.Node, token string, logger *log.Logger, authorities ...string) *Server {
 	if logger == nil {
 		logger = log.Default()
 	}
-	s := &Server{node: node, token: token, selfAddr: selfAddr, logger: logger}
+	allowed := make(map[string]struct{}, len(authorities))
+	for _, authority := range authorities {
+		if authority != "" {
+			allowed[authority] = struct{}{}
+		}
+	}
+	s := &Server{node: node, token: token, allowedAuthorities: allowed, logger: logger}
 	s.mux = http.NewServeMux()
 	s.routes()
 	return s
+}
+
+type LoopbackAddress struct{ BindAddress, ClientAuthority string }
+
+func NormalizeLoopbackAddress(addr string) (LoopbackAddress, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return LoopbackAddress{}, fmt.Errorf("api: invalid listen address %q: %w", addr, err)
+	}
+	if port == "" {
+		return LoopbackAddress{}, fmt.Errorf("api: invalid listen address %q: port is empty", addr)
+	}
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	if !isLoopbackHost(host) {
+		return LoopbackAddress{}, fmt.Errorf("api: refusing non-loopback address %q", addr)
+	}
+	authority := net.JoinHostPort(host, port)
+	return LoopbackAddress{BindAddress: authority, ClientAuthority: authority}, nil
 }
 
 // Handler returns the http.Handler to serve — wraps the routed mux with
@@ -86,17 +125,11 @@ func (s *Server) Handler() http.Handler {
 // APIAddr shape ("127.0.0.1:8347") rather than defaulting to "all
 // interfaces" the way net.Listen normally would.
 func ListenLoopback(addr string) (net.Listener, error) {
-	host, port, err := net.SplitHostPort(addr)
+	normalized, err := NormalizeLoopbackAddress(addr)
 	if err != nil {
-		return nil, fmt.Errorf("api: invalid listen address %q: %w", addr, err)
+		return nil, err
 	}
-	if host == "" {
-		host = "127.0.0.1"
-	}
-	if !isLoopbackHost(host) {
-		return nil, fmt.Errorf("api: refusing to bind non-loopback address %q: syncat's API must stay on localhost", addr)
-	}
-	ln, err := net.Listen("tcp", net.JoinHostPort(host, port))
+	ln, err := net.Listen("tcp", normalized.BindAddress)
 	if err != nil {
 		return nil, fmt.Errorf("api: listen on %q: %w", addr, err)
 	}
@@ -212,13 +245,22 @@ func (s *Server) handleUIToken(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, "forbidden", "this endpoint is only served to localhost")
 		return
 	}
-	if r.Host != s.selfAddr {
+	if _, ok := s.allowedAuthorities[r.Host]; !ok {
 		writeError(w, http.StatusForbidden, "forbidden", "request Host does not match this server")
 		return
 	}
-	if origin := r.Header.Get("Origin"); origin != "" && origin != "http://"+s.selfAddr {
-		writeError(w, http.StatusForbidden, "forbidden", "request Origin does not match this server")
-		return
+	if origin := r.Header.Get("Origin"); origin != "" {
+		ok := false
+		for authority := range s.allowedAuthorities {
+			if origin == "http://"+authority {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			writeError(w, http.StatusForbidden, "forbidden", "request Origin does not match this server")
+			return
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"token": s.token})
 }
