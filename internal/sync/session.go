@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -202,9 +203,23 @@ type Session struct {
 	// (internal/core's peer manager) watches it so a disconnect is acted on
 	// when it happens rather than when the keepalive's dead timer next
 	// notices.
-	done      chan struct{}
-	closeOnce sync.Once
+	done        chan struct{}
+	lifecycleMu sync.Mutex
+	lifecycle   sessionLifecycle
 }
+
+type sessionLifecycle uint8
+
+const (
+	sessionNew sessionLifecycle = iota
+	sessionRunning
+	sessionClosed
+)
+
+var (
+	ErrSessionAlreadyStarted = errors.New("sync: session has already been started")
+	ErrSessionClosed         = errors.New("sync: session is closed")
+)
 
 // NewSession constructs a Session over conn. nodeID is this node's own
 // ShortID (used to bump version vectors on conflict resolution);
@@ -487,11 +502,24 @@ func (s *Session) servesOutboundShare(shareID string) bool {
 // for something other than driving a connection (see internal/sync's own
 // tests, which build one over a nil conn purely to reach its trash
 // helpers) never starts a goroutine.
-func (s *Session) Start(ctx context.Context) {
+func (s *Session) Start(ctx context.Context) error {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	switch s.lifecycle {
+	case sessionRunning:
+		return ErrSessionAlreadyStarted
+	case sessionClosed:
+		return ErrSessionClosed
+	}
 	s.ctx, s.cancel = context.WithCancel(ctx)
-	s.writer.Start()
+	if err := s.writer.Start(); err != nil {
+		s.cancel()
+		return err
+	}
+	s.lifecycle = sessionRunning
 	s.wg.Add(1)
 	go s.readLoop()
+	return nil
 }
 
 // Done returns a channel closed when the session's read loop has exited:
@@ -512,16 +540,24 @@ func (s *Session) Done() <-chan struct{} {
 // stops the writer, and waits for every goroutine Session started to
 // exit. Safe to call more than once.
 func (s *Session) Close() error {
-	s.closeOnce.Do(func() {
-		if s.cancel != nil {
-			s.cancel()
-		}
-		// Before the writer: closing the connection is what unblocks a
-		// write already in progress, and StreamWriter.Close waits for its
-		// goroutine to return.
+	s.lifecycleMu.Lock()
+	if s.lifecycle == sessionClosed {
+		s.lifecycleMu.Unlock()
+		s.wg.Wait()
+		return nil
+	}
+	s.lifecycle = sessionClosed
+	if s.cancel != nil {
+		s.cancel()
+	}
+	// Before the writer: closing the connection is what unblocks a
+	// write already in progress, and StreamWriter.Close waits for its
+	// goroutine to return.
+	if s.conn != nil {
 		_ = s.conn.Close()
-		_ = s.writer.Close()
-	})
+	}
+	_ = s.writer.Close()
+	s.lifecycleMu.Unlock()
 	s.wg.Wait()
 	return nil
 }

@@ -183,7 +183,9 @@ func connectSessionsWithIgnore(t *testing.T, a, b *testNode, dirA, dirB Directio
 	if err := tr.Start(ctx, func(conn net.Conn) {
 		sess1 = NewSession(conn, a.store, a.id, b.id, nil, logger)
 		sess1.AddShare(ShareConfig{ShareID: testShareID, Root: a.root, Direction: dirA, Ignore: ignoreA})
-		sess1.Start(ctx)
+		if err := sess1.Start(ctx); err != nil {
+			t.Errorf("start session 1: %v", err)
+		}
 		close(ready)
 	}); err != nil {
 		t.Fatalf("transport start: %v", err)
@@ -195,7 +197,9 @@ func connectSessionsWithIgnore(t *testing.T, a, b *testNode, dirA, dirB Directio
 	}
 	sess2 := NewSession(conn, b.store, b.id, a.id, nil, logger)
 	sess2.AddShare(ShareConfig{ShareID: testShareID, Root: b.root, Direction: dirB, Ignore: ignoreB})
-	sess2.Start(ctx)
+	if err := sess2.Start(ctx); err != nil {
+		t.Fatalf("start session 2: %v", err)
+	}
 
 	<-ready
 	t.Cleanup(func() {

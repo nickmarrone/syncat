@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"strings"
+	stdsync "sync"
 	"testing"
 	"time"
 
@@ -37,6 +38,67 @@ func TestSessionDoneClosesWhenPeerDisconnects(t *testing.T) {
 	case <-sa.Done():
 	case <-time.After(10 * time.Second):
 		t.Fatal("Done stayed open after the peer disconnected; the owner would wait out the 90s dead rule instead")
+	}
+}
+
+func TestSessionStartHasExplicitLifecycleErrors(t *testing.T) {
+	near, far := net.Pipe()
+	defer far.Close()
+	n := newTestNode(t, "n")
+	s := NewSession(near, n.store, n.id, "peer", nil, log.New(io.Discard, "", 0))
+	if err := s.Start(context.Background()); err != nil {
+		t.Fatalf("first Start = %v", err)
+	}
+	if err := s.Start(context.Background()); !errors.Is(err, ErrSessionAlreadyStarted) {
+		t.Fatalf("second Start = %v, want ErrSessionAlreadyStarted", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close = %v", err)
+	}
+	if err := s.Start(context.Background()); !errors.Is(err, ErrSessionClosed) {
+		t.Fatalf("Start after Close = %v, want ErrSessionClosed", err)
+	}
+}
+
+func TestSessionConcurrentStartsLaunchExactlyOnce(t *testing.T) {
+	near, far := net.Pipe()
+	defer far.Close()
+	n := newTestNode(t, "n")
+	s := NewSession(near, n.store, n.id, "peer", nil, log.New(io.Discard, "", 0))
+	defer s.Close()
+	const callers = 32
+	results := make(chan error, callers)
+	var wg stdsync.WaitGroup
+	for range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results <- s.Start(context.Background())
+		}()
+	}
+	wg.Wait()
+	close(results)
+	successes := 0
+	for err := range results {
+		if err == nil {
+			successes++
+		} else if !errors.Is(err, ErrSessionAlreadyStarted) {
+			t.Fatalf("Start = %v, want success or ErrSessionAlreadyStarted", err)
+		}
+	}
+	if successes != 1 {
+		t.Fatalf("successful starts = %d, want 1", successes)
+	}
+}
+
+func TestSessionCloseBeforeStartPreventsLaterStart(t *testing.T) {
+	n := newTestNode(t, "n")
+	s := NewSession(nil, n.store, n.id, "peer", nil, log.New(io.Discard, "", 0))
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close = %v", err)
+	}
+	if err := s.Start(context.Background()); !errors.Is(err, ErrSessionClosed) {
+		t.Fatalf("Start after Close = %v, want ErrSessionClosed", err)
 	}
 }
 
@@ -72,7 +134,9 @@ func silentPeerSession(t *testing.T, stall time.Duration) *Session {
 	s := NewSession(near, n.store, n.id, "peer", nil, log.New(io.Discard, "", 0))
 	s.testPullStallTimeout = stall
 	ctx, cancel := context.WithCancel(context.Background())
-	s.Start(ctx)
+	if err := s.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
 	t.Cleanup(func() {
 		cancel()
 		_ = s.Close()

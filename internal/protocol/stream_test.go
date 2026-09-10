@@ -3,6 +3,7 @@ package protocol
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"os"
 	"sync"
@@ -32,7 +33,9 @@ func startedWriter(t *testing.T, timeout time.Duration) (*StreamWriter, net.Conn
 	t.Helper()
 	near, far := net.Pipe()
 	sw := NewStreamWriter(near, timeout)
-	sw.Start()
+	if err := sw.Start(); err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(func() {
 		_ = near.Close()
 		_ = far.Close()
@@ -142,7 +145,9 @@ func TestStreamWriterBoundsControlBurstSoBulkProgresses(t *testing.T) {
 	sw := NewStreamWriterTo(gate)
 	order := make(chan MsgType, ctrlQueueDepth+4)
 	sw.SetWriteObserver(func(typ MsgType) { order <- typ })
-	sw.Start()
+	if err := sw.Start(); err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(func() { _ = sw.Close() })
 	if err := sw.WriteFrame(MsgFileChunk, []byte{0}); err != nil {
 		t.Fatal(err)
@@ -182,7 +187,9 @@ func TestStreamWriterBoundsControlBurstSoBulkProgresses(t *testing.T) {
 func TestStreamWriterWriteErrorIsTerminal(t *testing.T) {
 	near, far := net.Pipe()
 	sw := NewStreamWriter(near, time.Minute)
-	sw.Start()
+	if err := sw.Start(); err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(func() { _ = sw.Close() })
 
 	if err := far.Close(); err != nil {
@@ -240,6 +247,98 @@ func TestStreamWriterCloseWithoutStart(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Close hung on a writer that was never started")
+	}
+}
+
+func TestStreamWriterStartHasExplicitLifecycleErrors(t *testing.T) {
+	sw := NewStreamWriterTo(io.Discard)
+	if err := sw.Start(); err != nil {
+		t.Fatalf("first Start = %v", err)
+	}
+	if err := sw.Start(); !errors.Is(err, ErrWriterAlreadyStarted) {
+		t.Fatalf("second Start = %v, want ErrWriterAlreadyStarted", err)
+	}
+	if err := sw.Close(); err != nil {
+		t.Fatalf("Close = %v", err)
+	}
+	if err := sw.Start(); !errors.Is(err, ErrWriterClosed) {
+		t.Fatalf("Start after Close = %v, want ErrWriterClosed", err)
+	}
+}
+
+func TestStreamWriterConcurrentStartsLaunchExactlyOnce(t *testing.T) {
+	sw := NewStreamWriterTo(io.Discard)
+	defer sw.Close()
+	const callers = 32
+	results := make(chan error, callers)
+	var wg sync.WaitGroup
+	for range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results <- sw.Start()
+		}()
+	}
+	wg.Wait()
+	close(results)
+	successes := 0
+	for err := range results {
+		if err == nil {
+			successes++
+		} else if !errors.Is(err, ErrWriterAlreadyStarted) {
+			t.Fatalf("Start = %v, want success or ErrWriterAlreadyStarted", err)
+		}
+	}
+	if successes != 1 {
+		t.Fatalf("successful starts = %d, want 1", successes)
+	}
+}
+
+func TestStreamWriterConcurrentStartAndCloseAreOrdered(t *testing.T) {
+	for range 100 {
+		sw := NewStreamWriterTo(io.Discard)
+		startResult := make(chan error, 1)
+		closeResult := make(chan error, 1)
+		gate := make(chan struct{})
+		go func() { <-gate; startResult <- sw.Start() }()
+		go func() { <-gate; closeResult <- sw.Close() }()
+		close(gate)
+		startErr, closeErr := <-startResult, <-closeResult
+		if closeErr != nil {
+			t.Fatalf("Close = %v", closeErr)
+		}
+		if startErr != nil && !errors.Is(startErr, ErrWriterClosed) {
+			t.Fatalf("Start = %v, want success or ErrWriterClosed", startErr)
+		}
+		if err := sw.Start(); !errors.Is(err, ErrWriterClosed) {
+			t.Fatalf("Start after concurrent Close = %v, want ErrWriterClosed", err)
+		}
+	}
+}
+
+func TestStreamWriterConcurrentClosesBothWaitForWriter(t *testing.T) {
+	gateWriter := &firstWriteGate{entered: make(chan struct{}), release: make(chan struct{})}
+	sw := NewStreamWriterTo(gateWriter)
+	if err := sw.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := sw.WriteMessage(MsgPing, Ping{}); err != nil {
+		t.Fatal(err)
+	}
+	<-gateWriter.entered
+	closed := make(chan error, 2)
+	go func() { closed <- sw.Close() }()
+	go func() { closed <- sw.Close() }()
+	select {
+	case err := <-closed:
+		t.Fatalf("Close returned before the active write exited: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(gateWriter.release)
+	for range 2 {
+		if err := <-closed; err != nil {
+			t.Fatalf("Close = %v", err)
+		}
 	}
 }
 
