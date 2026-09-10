@@ -277,7 +277,7 @@ func (s *Session) SetTrash(tr *Trash) {
 // peer's configured name. Call before Start, like the other setters.
 func (s *Session) SetPeerLabel(label string) {
 	if label != "" {
-		s.peerLabel = label
+		s.peerLabel = protocol.SanitizeDiagnostic(label)
 	}
 }
 
@@ -1052,7 +1052,7 @@ func (s *Session) readLoop() {
 			if e.ShareID != "" || e.RelPath != "" {
 				s.routeChunk(e.ShareID, e.RelPath, pullChunk{err: &protocol.RemoteError{Code: e.Code, Msg: e.Msg}})
 			} else {
-				s.logf("peer error: %s: %s", e.Code, e.Msg)
+				s.logf("peer error: %s: %s", protocol.SanitizeDiagnostic(e.Code), protocol.SanitizeDiagnostic(e.Msg))
 			}
 
 		default:

@@ -3,6 +3,7 @@ package core
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -77,6 +78,26 @@ func newLoggingTestNode(t *testing.T, name string, clock Clock, tweak func(*conf
 }
 
 // --- connection lifecycle -------------------------------------------------
+
+func TestDialFailureRedactsAddressAndSanitizesStatusAndLogs(t *testing.T) {
+	const credential = "tc-distinctive-private-credential"
+	logs := &safeBuffer{}
+	pc := &peerConn{
+		node:      &Node{logger: log.New(logs, "", 0)},
+		name:      "peer\nforged-name",
+		peerShort: "01234567",
+		addr:      credential,
+	}
+	pc.noteDialFailure("dial", fmt.Errorf("cannot reach %s\nforged-error\x1b[31m", credential))
+
+	if strings.Contains(pc.lastErr, credential) || strings.ContainsAny(pc.lastErr, "\r\n\x1b") {
+		t.Fatalf("LastError was not sanitized: %q", pc.lastErr)
+	}
+	out := logs.String()
+	if strings.Contains(out, credential) || strings.ContainsAny(strings.TrimSuffix(out, "\n"), "\r\n\x1b") {
+		t.Fatalf("dial log was not sanitized: %q", out)
+	}
+}
 
 // TestConnectionLifecycleIsLogged is the gap this logging exists to close.
 // Every other line in peer.go is an error path, so a node whose peer flaps

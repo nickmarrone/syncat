@@ -373,6 +373,7 @@ func (pc *peerConn) offer(ctx context.Context, conn net.Conn, result *protocol.H
 		return offerLostDedup, nil
 	}
 
+	safeRemoteName := protocol.SanitizeDiagnostic(result.PeerName)
 	pc.mu.Lock()
 	if pc.session != nil {
 		pc.mu.Unlock()
@@ -423,7 +424,7 @@ func (pc *peerConn) offer(ctx context.Context, conn net.Conn, result *protocol.H
 	pc.state = ConnStateConnected
 	pc.connectedSince = node.clock.Now()
 	pc.lastConnectedAt = pc.connectedSince
-	pc.remoteName = result.PeerName
+	pc.remoteName = safeRemoteName
 	pc.lastErr = ""
 	pc.dedupLosses = 0  // a connection was adopted (either direction) — see noteDedupLoss
 	pc.dialFailures = 0 // ... and getting here means dialling works — see noteDialFailure
@@ -441,7 +442,7 @@ func (pc *peerConn) offer(ctx context.Context, conn net.Conn, result *protocol.H
 	if dialed {
 		direction = "dialed"
 	}
-	node.logger.Printf("core: peer %s (%s): connected (%s, remote name %q)", pc.name, pc.peerShort, direction, result.PeerName)
+	node.logger.Printf("core: peer %s (%s): connected (%s, remote name %q)", protocol.SanitizeDiagnostic(pc.name), pc.peerShort, direction, safeRemoteName)
 
 	node.sendShareList(sess, pc.peerKeyHex)
 	node.requestSubscriptions(sess, pc.peerKeyHex)
@@ -705,10 +706,12 @@ func (pc *peerConn) notePeerRedialed() {
 // dialing, authenticating, and losing SPEC.md §2.4's dedup rule while it
 // waits for the dial this node is failing to make.
 func (pc *peerConn) noteDialFailure(stage string, err error) {
+	diagnostic := protocol.RedactDiagnostic(err.Error(), pc.addr)
+	safeName := protocol.SanitizeDiagnostic(pc.name)
+	safeStage := protocol.SanitizeDiagnostic(stage)
 	pc.mu.Lock()
 	pc.dialFailures++
 	failures := pc.dialFailures
-	name := pc.name
 	// Never contradict an adopted connection. dialAttempt already declines
 	// to call this when supersededByAdoptedConn says a connection landed
 	// during the dial; this closes the remaining window, where adoption
@@ -717,12 +720,12 @@ func (pc *peerConn) noteDialFailure(stage string, err error) {
 	// hold a live session to is connected, whatever our own dial did.
 	if pc.session == nil {
 		pc.state = ConnStateBackingOff
-		pc.lastErr = err.Error()
+		pc.lastErr = diagnostic
 	}
 	pc.mu.Unlock()
 
 	if failures == 1 || failures%dialFailureLogEvery == 0 {
-		pc.node.logger.Printf("core: peer %s (%s): %s failed (%d in a row): %v", name, pc.peerShort, stage, failures, err)
+		pc.node.logger.Printf("core: peer %s (%s): %s failed (%d in a row): %s", safeName, pc.peerShort, safeStage, failures, diagnostic)
 	}
 }
 
