@@ -290,6 +290,14 @@ func TestCancelTransferCancelsActiveServe(t *testing.T) {
 	}
 }
 
+func TestSessionStatsCountStaleTransferFrames(t *testing.T) {
+	s := NewSession(nil, nil, "self", "peer", nil, log.New(io.Discard, "", 0))
+	s.routeChunk("11111111111111111111111111111111", pullChunk{})
+	if got := s.Stats().StaleTransferFrames; got != 1 {
+		t.Fatalf("stale transfer frames = %d, want 1", got)
+	}
+}
+
 // --- locally-modified warnings ----------------------------------------
 
 // newWarningSession builds a bare Session for exercising the warning

@@ -333,6 +333,9 @@ func TestStatusMarshals(t *testing.T) {
 	if body.Peers == nil || body.Shares == nil || body.Subscriptions == nil {
 		t.Error("Peers/Shares/Subscriptions should be present (possibly empty) arrays, not omitted")
 	}
+	if body.Network == nil || body.Network["totals"] == nil {
+		t.Fatalf("network telemetry missing from status: %+v", body.Network)
+	}
 }
 
 // --- peers -----------------------------------------------------------------

@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -83,11 +84,20 @@ type StreamWriter struct {
 	w       io.Writer
 	timeout time.Duration
 
-	urgent        chan queuedFrame
-	ctrl          chan queuedFrame
-	data          chan queuedFrame
-	observerMu    sync.Mutex
-	writeObserver func(MsgType)
+	urgent         chan queuedFrame
+	ctrl           chan queuedFrame
+	data           chan queuedFrame
+	observerMu     sync.Mutex
+	writeObserver  func(MsgType)
+	framesWritten  atomic.Uint64
+	urgentWritten  atomic.Uint64
+	controlWritten atomic.Uint64
+	bulkWritten    atomic.Uint64
+	bytesWritten   atomic.Uint64
+	writeFailures  atomic.Uint64
+	writeTimeouts  atomic.Uint64
+	lastWriteNS    atomic.Int64
+	maxWriteNS     atomic.Int64
 
 	stateMu    sync.Mutex
 	state      streamWriterState
@@ -112,6 +122,30 @@ type queuedFrame struct {
 	typ       MsgType
 	data      []byte
 	onWritten func()
+}
+
+// StreamWriterStats is a low-cardinality snapshot of one writer's bounded
+// queues and completed socket writes.
+type StreamWriterStats struct {
+	UrgentQueued, ControlQueued, BulkQueued       int
+	UrgentCapacity, ControlCapacity, BulkCapacity int
+	FramesWritten, UrgentFramesWritten            uint64
+	ControlFramesWritten, BulkFramesWritten       uint64
+	BytesWritten                                  uint64
+	WriteFailures, WriteTimeouts                  uint64
+	LastWriteDuration, MaxWriteDuration           time.Duration
+}
+
+// Stats returns a race-safe point-in-time writer snapshot.
+func (s *StreamWriter) Stats() StreamWriterStats {
+	return StreamWriterStats{
+		UrgentQueued: len(s.urgent), ControlQueued: len(s.ctrl), BulkQueued: len(s.data),
+		UrgentCapacity: cap(s.urgent), ControlCapacity: cap(s.ctrl), BulkCapacity: cap(s.data),
+		FramesWritten: s.framesWritten.Load(), UrgentFramesWritten: s.urgentWritten.Load(),
+		ControlFramesWritten: s.controlWritten.Load(), BulkFramesWritten: s.bulkWritten.Load(), BytesWritten: s.bytesWritten.Load(),
+		WriteFailures: s.writeFailures.Load(), WriteTimeouts: s.writeTimeouts.Load(),
+		LastWriteDuration: time.Duration(s.lastWriteNS.Load()), MaxWriteDuration: time.Duration(s.maxWriteNS.Load()),
+	}
 }
 
 // NewStreamWriter returns a StreamWriter writing frames to conn, arming
@@ -233,11 +267,17 @@ func (s *StreamWriter) WriteMessageOnWritten(typ MsgType, v any, onWritten func(
 // copied into the queued frame, so the caller may reuse its buffer as soon
 // as this returns.
 func (s *StreamWriter) WriteFileChunk(hdr FileChunkHeader, data []byte) error {
+	return s.WriteFileChunkOnWritten(hdr, data, nil)
+}
+
+// WriteFileChunkOnWritten is WriteFileChunk with a non-blocking callback
+// invoked after the complete frame reaches the connection.
+func (s *StreamWriter) WriteFileChunkOnWritten(hdr FileChunkHeader, data []byte, onWritten func()) error {
 	payload, err := encodeFileChunk(hdr, data)
 	if err != nil {
 		return err
 	}
-	return s.WriteFrame(MsgFileChunk, payload)
+	return s.writeFrameContext(context.Background(), MsgFileChunk, payload, onWritten)
 }
 
 // WriteFrame queues one frame of the given type with payload as its body.
@@ -378,28 +418,49 @@ func (s *StreamWriter) run() {
 // writeFrame writes one built frame, reporting whether the writer should
 // keep going. A failure is terminal (see fail).
 func (s *StreamWriter) writeFrame(frame queuedFrame) bool {
+	started := time.Now()
 	if s.w == nil {
+		s.writeFailures.Add(1)
 		s.fail(errors.New("protocol: stream writer: no underlying writer"))
 		return false
 	}
 	if s.conn != nil {
 		if err := s.conn.SetWriteDeadline(time.Now().Add(s.timeout)); err != nil {
+			s.writeFailures.Add(1)
 			s.fail(fmt.Errorf("protocol: stream writer: set write deadline: %w", err))
 			return false
 		}
 	}
 	// io.Copy gives a frame the stdlib's full-write/error checking rather
 	// than assuming one Writer.Write consumed the entire buffer.
-	_, err := io.Copy(s.w, bytes.NewReader(frame.data))
+	n, err := io.Copy(s.w, bytes.NewReader(frame.data))
+	duration := time.Since(started)
+	s.lastWriteNS.Store(int64(duration))
+	for old := s.maxWriteNS.Load(); int64(duration) > old && !s.maxWriteNS.CompareAndSwap(old, int64(duration)); old = s.maxWriteNS.Load() {
+	}
 	if s.conn != nil {
 		// Clear it again: the deadline is an absolute time, and leaving one
 		// armed would poison a connection that is merely idle.
 		_ = s.conn.SetWriteDeadline(time.Time{})
 	}
 	if err != nil {
+		s.writeFailures.Add(1)
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			s.writeTimeouts.Add(1)
+		}
 		s.fail(fmt.Errorf("protocol: stream writer: write frame: %w", err))
 		return false
 	}
+	s.framesWritten.Add(1)
+	if isUrgent(frame.typ) {
+		s.urgentWritten.Add(1)
+	} else if isBulk(frame.typ) {
+		s.bulkWritten.Add(1)
+	} else {
+		s.controlWritten.Add(1)
+	}
+	s.bytesWritten.Add(uint64(n))
 	s.observerMu.Lock()
 	observer := s.writeObserver
 	s.observerMu.Unlock()

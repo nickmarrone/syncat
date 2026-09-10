@@ -46,6 +46,7 @@ type PeerStatus struct {
 	// ConnectedSince is when the *current* connection (if State is
 	// ConnStateConnected) was established; zero otherwise.
 	ConnectedSince time.Time
+	Network        PeerNetworkStatus
 }
 
 // ShareAccessEntry is one peer's access state for a locally offered share.
@@ -149,6 +150,7 @@ type Status struct {
 	Subscriptions []SubscriptionStatus
 
 	RejectedConnections []RejectedConnection
+	Network             NetworkStatus
 }
 
 // Status builds a read-only snapshot of the entire node (see status.go's
@@ -184,10 +186,17 @@ func (n *Node) Status() Status {
 	peerConns := n.snapshotPeers()
 	byKey := make(map[string]*peerConn, len(peerConns))
 	peerStatuses := make([]PeerStatus, 0, len(peerConns))
+	network := NetworkStatus{
+		InboundHandshakesActive: len(n.inboundHandshakes),
+		RejectedHandshakes:      n.rejectedHandshakes.Load(),
+		RejectedOverload:        n.rejectedOverload.Load(),
+	}
 	var remoteShares []RemoteShareStatus
 	for _, pc := range peerConns {
 		byKey[pc.peerKeyHex] = pc
-		peerStatuses = append(peerStatuses, pc.snapshot())
+		peerStatus := pc.snapshot()
+		peerStatuses = append(peerStatuses, peerStatus)
+		network.Totals = addPeerNetworkStatus(network.Totals, peerStatus.Network)
 		remoteShares = append(remoteShares, pc.remoteShareStatuses()...)
 	}
 
@@ -224,6 +233,7 @@ func (n *Node) Status() Status {
 		Subscriptions: subs,
 
 		RejectedConnections: rejected,
+		Network:             network,
 	}
 }
 
@@ -238,12 +248,25 @@ func peerNameLocked(cfg *config.Config, peerKeyHex string) string {
 
 func (pc *peerConn) snapshot() PeerStatus {
 	pc.mu.Lock()
-	defer pc.mu.Unlock()
-	return PeerStatus{
+	status := PeerStatus{
 		PeerKey: pc.peerKeyHex, ShortID: pc.peerShort, Name: pc.name, RemoteName: pc.remoteName,
 		Enabled: pc.enabled, State: pc.state, LastError: pc.lastErr,
 		LastConnectedAt: pc.lastConnectedAt, ConnectedSince: pc.connectedSince,
 	}
+	counters, totals, sess := pc.network, pc.sessionTotals, pc.session
+	pc.mu.Unlock()
+	if sess != nil {
+		totals = addSessionStats(totals, sess.Stats(), true)
+	}
+	status.Network = PeerNetworkStatus{
+		DialAttempts: counters.dialAttempts, DialFailures: counters.dialFailures,
+		TransportFailures: counters.transportFailures, HandshakeFailures: counters.handshakeFailures,
+		Backoffs: counters.backoffs, TotalBackoff: time.Duration(counters.backoffNanos), LastBackoff: time.Duration(counters.lastBackoffNanos),
+		Connections: counters.connections, Reconnects: counters.reconnects, DedupLosses: counters.dedupLosses,
+		PingsSent: counters.pingsSent, PongsReceived: counters.pongsReceived, DeadConnections: counters.deadConnections,
+		LastPingRTT: time.Duration(counters.lastPingRTTNanos), Session: toSessionNetworkStatus(totals),
+	}
+	return status
 }
 
 func (pc *peerConn) remoteShareStatuses() []RemoteShareStatus {

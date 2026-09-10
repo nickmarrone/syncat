@@ -159,6 +159,13 @@ func TestStreamWriterPerFrameCallbackFiresAfterWrite(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("per-frame callback did not fire after write")
 	}
+	stats := sw.Stats()
+	if stats.FramesWritten != 1 || stats.ControlFramesWritten != 1 || stats.BytesWritten == 0 {
+		t.Fatalf("writer stats after Ping = %+v", stats)
+	}
+	if stats.UrgentCapacity != urgentQueueDepth || stats.ControlCapacity != ctrlQueueDepth || stats.BulkCapacity != dataQueueDepth {
+		t.Fatalf("writer queue capacities = %+v", stats)
+	}
 }
 
 func TestStreamWriterBoundsControlBurstSoBulkProgresses(t *testing.T) {
