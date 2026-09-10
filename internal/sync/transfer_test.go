@@ -116,3 +116,57 @@ func TestSymlinkServeEmitsVerifiedTargetAndEOF(t *testing.T) {
 	}
 	<-done
 }
+
+func TestTransferResponseEmitsExactlyOneTerminalOutcome(t *testing.T) {
+	n := newTestNode(t, "response-terminal")
+	near, far := net.Pipe()
+	s := NewSession(near, n.store, n.id, "peer", nil, log.New(io.Discard, "", 0))
+	if err := s.writer.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = near.Close()
+		_ = far.Close()
+		_ = s.writer.Close()
+	})
+	req := protocol.FileRequest{TransferID: "11111111111111111111111111111111", ShareID: testShareID, RelPath: "file"}
+	response := newTransferResponse(s, context.Background(), req)
+	response.setVersion(protocol.VersionVector{"0123456789abcdef": 1})
+	if err := response.send([]byte("body")); err != nil {
+		t.Fatal(err)
+	}
+	if err := response.finish(); err != nil {
+		t.Fatal(err)
+	}
+	response.fail(protocol.ErrCodeTransferFailed, "must not follow EOF")
+	if err := response.finish(); err == nil {
+		t.Fatal("second terminal outcome succeeded")
+	}
+	if err := response.send([]byte("late")); err == nil {
+		t.Fatal("data after terminal outcome succeeded")
+	}
+
+	reader := protocol.NewReader(far)
+	for i, wantEOF := range []bool{false, true} {
+		typ, payload, err := reader.ReadFrame()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if typ != protocol.MsgFileChunk {
+			t.Fatalf("frame %d type = %s, want FileChunk", i, typ)
+		}
+		hdr, _, err := protocol.DecodeFileChunk(payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if hdr.EOF != wantEOF {
+			t.Fatalf("frame %d EOF = %v, want %v", i, hdr.EOF, wantEOF)
+		}
+	}
+	if err := far.SetReadDeadline(time.Now().Add(30 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := reader.ReadFrame(); err == nil {
+		t.Fatal("received a second terminal frame")
+	}
+}

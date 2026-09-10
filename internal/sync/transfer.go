@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -288,26 +289,105 @@ func resetStallTimer(t *time.Timer, d time.Duration) {
 	t.Reset(d)
 }
 
+// transferResponse owns the immutable identity, byte offset, and exactly-one
+// terminal outcome for one served FileRequest. All regular-file, symlink, and
+// error paths use this sender so response construction cannot drift apart.
+type transferResponse struct {
+	s       *Session
+	ctx     context.Context
+	req     protocol.FileRequest
+	version protocol.VersionVector
+
+	mu       sync.Mutex
+	offset   int64
+	terminal bool
+}
+
+func newTransferResponse(s *Session, ctx context.Context, req protocol.FileRequest) *transferResponse {
+	return &transferResponse{s: s, ctx: ctx, req: req}
+}
+
+func (r *transferResponse) setVersion(version protocol.VersionVector) {
+	r.mu.Lock()
+	r.version = version
+	r.mu.Unlock()
+}
+
+func (r *transferResponse) send(data []byte) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.terminal {
+		return errors.New("sync: transfer response is already terminal")
+	}
+	n := len(data)
+	err := r.s.writer.WriteFileChunkContextOnWritten(r.ctx, protocol.FileChunkHeader{
+		TransferID: r.req.TransferID, ShareID: r.req.ShareID, RelPath: r.req.RelPath,
+		Version: r.version, Offset: r.offset,
+	}, data, func() { r.s.stats.bytesSent.Add(uint64(n)) })
+	if err != nil {
+		return err
+	}
+	r.offset += int64(n)
+	return nil
+}
+
+func (r *transferResponse) finish() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.terminal {
+		return errors.New("sync: transfer response is already terminal")
+	}
+	if err := r.s.writer.WriteFileChunkContext(r.ctx, protocol.FileChunkHeader{
+		TransferID: r.req.TransferID, ShareID: r.req.ShareID, RelPath: r.req.RelPath,
+		Version: r.version, Offset: r.offset, EOF: true,
+	}, nil); err != nil {
+		return err
+	}
+	r.terminal = true
+	return nil
+}
+
+func (r *transferResponse) fail(code, msg string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.terminal {
+		return
+	}
+	r.terminal = true
+	_ = r.s.writer.WriteMessage(protocol.MsgError, protocol.Error{
+		Code: code, Msg: msg, ShareID: r.req.ShareID, RelPath: r.req.RelPath,
+		TransferID: r.req.TransferID,
+	})
+}
+
+func (r *transferResponse) bytesSent() int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.offset
+}
+
 // handleFileRequest serves one incoming FileRequest from our own share
 // content after readLoop reserves a maxConcurrentServes slot. A file we no longer have, or
 // whose current version differs from what the requester asked for, gets
 // an Error reply (SPEC.md §4/§5) rather than a hung or truncated stream.
 func (s *Session) handleFileRequest(ctx context.Context, req protocol.FileRequest) {
 	s.stats.servesStarted.Add(1)
+	response := newTransferResponse(s, ctx, req)
 	if req.Offset != 0 {
-		s.sendFileError(req, protocol.ErrCodeUnsupportedOffset, "resume offsets are not supported")
+		response.fail(protocol.ErrCodeUnsupportedOffset, "resume offsets are not supported")
 		return
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	if !s.registerServe(req.TransferID, cancel) {
 		cancel()
-		s.sendFileError(req, protocol.ErrCodeTransferFailed, "duplicate transfer id")
+		response.fail(protocol.ErrCodeTransferFailed, "duplicate transfer id")
 		return
 	}
 	defer func() { s.unregisterServe(req.TransferID); cancel() }()
+	response.ctx = ctx
 	cfg, ok := s.getShare(req.ShareID)
 	if !ok || cfg.Direction.OutboundBlocked {
-		s.sendFileError(req, protocol.ErrCodeFileNotFound, "unknown share")
+		response.fail(protocol.ErrCodeFileNotFound, "unknown share")
 		return
 	}
 
@@ -319,19 +399,20 @@ func (s *Session) handleFileRequest(ctx context.Context, req protocol.FileReques
 		// error is deliberately the same one a genuinely missing file
 		// gets: what this node chooses not to share is its own business,
 		// not a distinct condition to advertise.
-		s.sendFileError(req, protocol.ErrCodeFileNotFound, "file not found")
+		response.fail(protocol.ErrCodeFileNotFound, "file not found")
 		return
 	}
 
 	row, err := s.store.GetFile(ctx, req.ShareID, req.RelPath)
 	if err != nil || row.Deleted {
-		s.sendFileError(req, protocol.ErrCodeFileNotFound, "file not found")
+		response.fail(protocol.ErrCodeFileNotFound, "file not found")
 		return
 	}
 	if !Equal(row.Version, req.Version) {
-		s.sendFileError(req, protocol.ErrCodeVersionChanged, "version has moved on")
+		response.fail(protocol.ErrCodeVersionChanged, "version has moved on")
 		return
 	}
+	response.setVersion(row.Version)
 
 	absPath, err := JoinSharePath(cfg.Root, req.RelPath)
 	if err != nil {
@@ -340,7 +421,7 @@ func (s *Session) handleFileRequest(ctx context.Context, req protocol.FileReques
 		// before it becomes an Action — see reconcile.go/path.go). Treat
 		// it the same as "not found" rather than ever touching the
 		// filesystem with it.
-		s.sendFileError(req, protocol.ErrCodeFileNotFound, "invalid path")
+		response.fail(protocol.ErrCodeFileNotFound, "invalid path")
 		return
 	}
 
@@ -353,7 +434,7 @@ func (s *Session) handleFileRequest(ctx context.Context, req protocol.FileReques
 	}
 
 	if row.Type == protocol.FileTypeSymlink {
-		if err := s.streamSymlink(ctx, absPath, req, row); err != nil {
+		if err := s.streamSymlink(ctx, absPath, row, response); err != nil {
 			if errors.Is(err, context.Canceled) {
 				return
 			}
@@ -361,19 +442,19 @@ func (s *Session) handleFileRequest(ctx context.Context, req protocol.FileReques
 			if errors.Is(err, errFileChangedDuringTransfer) {
 				code = protocol.ErrCodeVersionChanged
 			}
-			s.sendFileError(req, code, err.Error())
+			response.fail(code, err.Error())
 		}
 		return
 	}
 
 	f, err := os.Open(absPath)
 	if err != nil {
-		s.sendFileError(req, protocol.ErrCodeFileNotFound, "open: "+err.Error())
+		response.fail(protocol.ErrCodeFileNotFound, "open: "+err.Error())
 		return
 	}
 	defer f.Close()
 
-	if err := s.streamFile(ctx, f, req, row); err != nil {
+	if err := s.streamFile(ctx, f, row, response); err != nil {
 		if errors.Is(err, context.Canceled) {
 			return
 		}
@@ -381,7 +462,7 @@ func (s *Session) handleFileRequest(ctx context.Context, req protocol.FileReques
 		if errors.Is(err, errFileChangedDuringTransfer) {
 			code = protocol.ErrCodeVersionChanged
 		}
-		s.sendFileError(req, code, err.Error())
+		response.fail(code, err.Error())
 	}
 }
 
@@ -394,7 +475,7 @@ var errFileChangedDuringTransfer = errors.New("file changed during transfer")
 // trying to detect end-of-file on the same read that returned the last
 // data) keeps the read side's contract simple: EOF is only ever true, and
 // only needs handling, on a frame it already received.
-func (s *Session) streamFile(ctx context.Context, f *os.File, req protocol.FileRequest, row index.FileRow) error {
+func (s *Session) streamFile(ctx context.Context, f *os.File, row index.FileRow, response *transferResponse) error {
 	before, err := f.Stat()
 	if err != nil {
 		return fmt.Errorf("stat before read: %w", err)
@@ -414,9 +495,7 @@ func (s *Session) streamFile(ctx context.Context, f *os.File, req protocol.FileR
 		n, readErr := f.Read(buf)
 		if n > 0 {
 			_, _ = hasher.Write(buf[:n])
-			if err := s.writer.WriteFileChunkContextOnWritten(ctx, protocol.FileChunkHeader{
-				TransferID: req.TransferID, ShareID: req.ShareID, RelPath: req.RelPath, Version: row.Version, Offset: offset, EOF: false,
-			}, buf[:n], func() { s.stats.bytesSent.Add(uint64(n)) }); err != nil {
+			if err := response.send(buf[:n]); err != nil {
 				return fmt.Errorf("write chunk at offset %d: %w", offset, err)
 			}
 			offset += int64(n)
@@ -435,9 +514,10 @@ func (s *Session) streamFile(ctx context.Context, f *os.File, req protocol.FileR
 	if after.Size() != before.Size() || after.ModTime() != before.ModTime() || offset != row.Size || !bytes.Equal(hasher.Sum(nil), row.SHA256) {
 		return errFileChangedDuringTransfer
 	}
-	if err := s.writer.WriteFileChunkContext(ctx, protocol.FileChunkHeader{
-		TransferID: req.TransferID, ShareID: req.ShareID, RelPath: req.RelPath, Version: row.Version, Offset: offset, EOF: true,
-	}, nil); err != nil {
+	if response.bytesSent() != offset {
+		return errors.New("sync: transfer response offset diverged from file read")
+	}
+	if err := response.finish(); err != nil {
 		return fmt.Errorf("write eof chunk: %w", err)
 	}
 	return nil
@@ -448,7 +528,7 @@ func (s *Session) streamFile(ctx context.Context, f *os.File, req protocol.FileR
 // fully verified against the indexed size and hash before any frame is queued.
 // Lstat on both sides also detects replacement during the read without
 // following the link outside the share.
-func (s *Session) streamSymlink(ctx context.Context, absPath string, req protocol.FileRequest, row index.FileRow) error {
+func (s *Session) streamSymlink(ctx context.Context, absPath string, row index.FileRow, response *transferResponse) error {
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -474,24 +554,13 @@ func (s *Session) streamSymlink(ctx context.Context, absPath string, req protoco
 	if !os.SameFile(before, after) || before.Size() != after.Size() || before.ModTime() != after.ModTime() || int64(len(data)) != row.Size || !bytes.Equal(sum[:], row.SHA256) {
 		return errFileChangedDuringTransfer
 	}
-	if err := s.writer.WriteFileChunkContextOnWritten(ctx, protocol.FileChunkHeader{
-		TransferID: req.TransferID, ShareID: req.ShareID, RelPath: req.RelPath, Version: row.Version, Offset: 0, EOF: false,
-	}, data, func() { s.stats.bytesSent.Add(uint64(len(data))) }); err != nil {
+	if err := response.send(data); err != nil {
 		return fmt.Errorf("write symlink target: %w", err)
 	}
-	if err := s.writer.WriteFileChunkContext(ctx, protocol.FileChunkHeader{
-		TransferID: req.TransferID, ShareID: req.ShareID, RelPath: req.RelPath, Version: row.Version, Offset: int64(len(data)), EOF: true,
-	}, nil); err != nil {
+	if err := response.finish(); err != nil {
 		return fmt.Errorf("write symlink eof: %w", err)
 	}
 	return nil
-}
-
-func (s *Session) sendFileError(req protocol.FileRequest, code, msg string) {
-	_ = s.writer.WriteMessage(protocol.MsgError, protocol.Error{
-		Code: code, Msg: msg, ShareID: req.ShareID, RelPath: req.RelPath,
-		TransferID: req.TransferID,
-	})
 }
 
 func (s *Session) registerServe(id string, cancel context.CancelFunc) bool {
