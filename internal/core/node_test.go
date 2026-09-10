@@ -442,7 +442,11 @@ func TestApprovalRequiredFailsClosed(t *testing.T) {
 		t.Fatalf("offerer access = %+v, want one pending request", shares)
 	}
 
-	if err := nodeA.SetShareAccess(shareID, nodeB.PeerKey(), protocol.AccessGranted); err != nil {
+	approvals := nodeA.Approvals()
+	if len(approvals) != 1 || approvals[0].Kind != ApprovalShare || approvals[0].ShareID != shareID || approvals[0].PeerKey != nodeB.PeerKey() {
+		t.Fatalf("share approvals = %+v, want one pending request", approvals)
+	}
+	if err := nodeA.DecideApproval(approvals[0].ID, "grant"); err != nil {
 		t.Fatalf("approve share: %v", err)
 	}
 	waitFor(t, 5*time.Second, func() bool {
@@ -509,11 +513,10 @@ func TestDedupConvergence(t *testing.T) {
 	}
 }
 
-// TestUnknownPeerRejected has nodeB dial nodeA without nodeA ever
-// configuring nodeB as a peer. nodeA's handshake rejects the unknown key
-// (SPEC.md §2.3's pending-peer queue is deferred — see the package doc
-// comment) and records it as observable via Status().RejectedConnections.
-func TestUnknownPeerRejected(t *testing.T) {
+// TestUnknownPeerQueuedAndApproved has B dial A before A knows B. A retains
+// the validated Hello token, rejects that connection, and later establishes
+// normal peering from the approval alone.
+func TestUnknownPeerQueuedAndApproved(t *testing.T) {
 	nodeA := newTestNode(t, "unknownA")
 	nodeB := newTestNode(t, "unknownB")
 
@@ -522,7 +525,7 @@ func TestUnknownPeerRejected(t *testing.T) {
 		t.Fatalf("nodeB AddPeer: %v", err)
 	}
 
-	waitFor(t, 5*time.Second, func() bool { return len(nodeA.Status().RejectedConnections) > 0 })
+	waitFor(t, 5*time.Second, func() bool { return len(nodeA.Approvals()) == 1 && len(nodeA.Status().RejectedConnections) > 0 })
 
 	rej := nodeA.Status().RejectedConnections[0]
 	if rej.PeerKey != nodeB.PeerKey() {
@@ -530,6 +533,28 @@ func TestUnknownPeerRejected(t *testing.T) {
 	}
 	if len(nodeA.Status().Peers) != 0 {
 		t.Fatalf("nodeA should have no configured peers, got %d", len(nodeA.Status().Peers))
+	}
+	approval := nodeA.Approvals()[0]
+	if approval.Kind != ApprovalPeer || approval.PeerKey != nodeB.PeerKey() || approval.PeerName != "unknownB" {
+		t.Fatalf("pending peer = %+v", approval)
+	}
+	persisted, err := config.Load(nodeA.paths.ConfigFile())
+	if err != nil {
+		t.Fatalf("load config with pending peer: %v", err)
+	}
+	persistedKey := ""
+	if len(persisted.PendingPeers) == 1 {
+		persistedKey, _ = pendingPeerKey(persisted.PendingPeers[0])
+	}
+	if len(persisted.PendingPeers) != 1 || persistedKey != nodeB.PeerKey() {
+		t.Fatalf("persisted pending peer count/key = %d/%q", len(persisted.PendingPeers), persistedKey)
+	}
+	if err := nodeA.ApprovePendingPeer(approval.ID); err != nil {
+		t.Fatalf("approve pending peer: %v", err)
+	}
+	waitFor(t, 5*time.Second, func() bool { return peerConnected(nodeA) && peerConnected(nodeB) })
+	if len(nodeA.Approvals()) != 0 {
+		t.Fatalf("approval remained after peer activation: %+v", nodeA.Approvals())
 	}
 }
 

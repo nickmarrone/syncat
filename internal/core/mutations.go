@@ -34,6 +34,7 @@ func cloneConfig(cfg *config.Config) *config.Config {
 	out := *cfg
 	out.GlobalIgnores = append([]string(nil), cfg.GlobalIgnores...)
 	out.Peers = append([]config.Peer(nil), cfg.Peers...)
+	out.PendingPeers = append([]config.PendingPeer(nil), cfg.PendingPeers...)
 	out.Shares = make([]config.Share, len(cfg.Shares))
 	for i, s := range cfg.Shares {
 		out.Shares[i] = s
@@ -116,22 +117,34 @@ func (n *Node) AddPeer(name, token string) (string, error) {
 		if findPeerIndex(cfg, peerKeyHex) >= 0 {
 			return mutationErrorf(MutationConflict, "peer %s is already configured", peerKeyHex)
 		}
+		for i := len(cfg.PendingPeers) - 1; i >= 0; i-- {
+			if key, ok := pendingPeerKey(cfg.PendingPeers[i]); ok && key == peerKeyHex {
+				cfg.PendingPeers = append(cfg.PendingPeers[:i], cfg.PendingPeers[i+1:]...)
+			}
+		}
 		cfg.Peers = append(cfg.Peers, p)
 		return nil
 	}); err != nil {
 		return "", fmt.Errorf("core: add peer: %w", err)
 	}
 
+	if err := n.activatePeer(p, peerKeyHex); err != nil {
+		return "", fmt.Errorf("core: add peer: %w", err)
+	}
+	return peerKeyHex, nil
+}
+
+func (n *Node) activatePeer(p config.Peer, peerKeyHex string) error {
 	pc, err := newPeerConn(n, p)
 	if err != nil {
-		return "", fmt.Errorf("core: add peer: %w", err)
+		return err
 	}
 	n.peersMu.Lock()
 	n.peers[peerKeyHex] = pc
 	n.peersMu.Unlock()
 	n.goTracked(pc.runSupervisor)
-	n.debugf("core: added peer %q (%s)", name, pc.peerShort)
-	return peerKeyHex, nil
+	n.debugf("core: added peer %q (%s)", p.Name, pc.peerShort)
+	return nil
 }
 
 // RemovePeer removes a configured peer and every trace of it from the rest

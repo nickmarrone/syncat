@@ -14,14 +14,7 @@
 // holds the retention sweep that bounds index.Store's change journal.
 // status.go defines the read-only snapshot the API and UI render.
 //
-// Known MVP gaps, called out where they bite rather than left implicit:
-//   - SPEC.md §2.3's pending-peer approval queue is deferred: an unknown
-//     inbound key is rejected outright (see onAccept/handleAccept), though
-//     the rejection is recorded (RejectedConnection) so the API and UI can
-//     surface it.
-//   - SPEC.md §6's standalone approvals API/CLI queue is deferred. Protected
-//     share requests do fail closed and appear as pending in the share access
-//     list, where the existing share API/UI can grant or deny them.
+// Known MVP gap, called out where it bites rather than left implicit:
 //   - Once granted, a share/subscription can only be "neutered" on an
 //     already-open connection (both Direction flags set, see
 //     peerConn.neuterShare in peer.go and its callers in mutations.go and
@@ -578,9 +571,8 @@ func (n *Node) onAccept(conn net.Conn) {
 }
 
 // handleAccept authenticates one inbound connection and, on success, hands
-// it to the matching peerConn's dedup/adopt logic (SPEC.md §2.4). An
-// unknown or disabled peer key is rejected and recorded (SPEC.md §2.3's
-// pending-peer queue is deferred — see the package doc comment).
+// it to the matching peerConn's dedup/adopt logic (SPEC.md §2.4). A valid
+// unknown peer Hello is persisted for explicit approval before rejection.
 func (n *Node) handleAccept(conn net.Conn) {
 	var sawPub ed25519.PublicKey
 	var peerSlot string
@@ -606,6 +598,7 @@ func (n *Node) handleAccept(conn net.Conn) {
 			peerSlot = key
 			return true
 		},
+		OnUnknownPeer: n.recordPendingPeer,
 	})
 	if err != nil {
 		n.rejectedHandshakes.Add(1)

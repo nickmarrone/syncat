@@ -29,7 +29,7 @@ var commands = []command{
 	{name: "share", usage: "syncat share add PATH --name N [--perm ro|rw] [--approval] | ls | rm ID | set ID [...]", summary: "manage local shares (ID: name, id, or id prefix)", run: cmdShare},
 	{name: "remote", usage: "syncat remote ls", summary: "list peers' offered shares", run: cmdRemote},
 	{name: "subscription", usage: "syncat subscription add PEER SHARE LOCALPATH [--mode mirror|receive] | ls | rm PEER SHARE | pause PEER SHARE | resume PEER SHARE", summary: "manage subscriptions to peers' shares (PEER/SHARE: name, id, or id prefix)", run: cmdSubscription},
-	{name: "approvals", usage: "syncat approvals [grant|deny ID]", summary: "manage pending approvals (not implemented — SPEC.md §2.3 is deferred)", run: cmdApprovals},
+	{name: "approvals", usage: "syncat approvals [grant|deny ID]", summary: "manage pending peer and share approvals", run: cmdApprovals},
 	{name: "trash", usage: "syncat trash ls SHARE | restore SHARE PATH", summary: "browse/restore trashed files (SHARE: name, id, or id prefix)", run: cmdTrash},
 	{name: "config", usage: "syncat config set FIELD VALUE", summary: "set a top-level config field (e.g. debug, api_addr)", run: cmdConfig},
 	{name: "version", usage: "syncat version", summary: "print the syncat version", run: cmdVersion},

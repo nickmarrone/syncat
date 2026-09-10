@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // Deviation from SPEC.md §3: the spec describes config.toml, but §10's
@@ -54,6 +55,7 @@ type Config struct {
 	Debug                 bool
 	GlobalIgnores         []string
 	Peers                 []Peer
+	PendingPeers          []PendingPeer
 	Shares                []Share
 	Subscriptions         []Subscription
 }
@@ -63,6 +65,16 @@ type Peer struct {
 	Name    string
 	Token   string
 	Enabled bool
+}
+
+// PendingPeer is a validated unknown inbound Hello retained for explicit
+// approval. Token is stored alongside configured peer tokens in the same
+// mode-0600 config so approval can establish peering without another paste.
+type PendingPeer struct {
+	Name      string
+	Token     string
+	FirstSeen time.Time
+	LastSeen  time.Time
 }
 
 // Share is a local directory this node offers.
@@ -199,6 +211,7 @@ type configDoc struct {
 	Debug                 bool              `json:"debug"`
 	GlobalIgnores         []string          `json:"global_ignores,omitempty"`
 	Peers                 []peerDoc         `json:"peers,omitempty"`
+	PendingPeers          []pendingPeerDoc  `json:"pending_peers,omitempty"`
 	Shares                []shareDoc        `json:"shares,omitempty"`
 	Subscriptions         []subscriptionDoc `json:"subscriptions,omitempty"`
 }
@@ -209,6 +222,13 @@ type peerDoc struct {
 	Name    string `json:"name"`
 	Token   string `json:"token"`
 	Enabled *bool  `json:"enabled,omitempty"`
+}
+
+type pendingPeerDoc struct {
+	Name      string    `json:"name"`
+	Token     string    `json:"token"`
+	FirstSeen time.Time `json:"first_seen"`
+	LastSeen  time.Time `json:"last_seen"`
 }
 
 type shareDoc struct {
@@ -265,6 +285,9 @@ func configToDoc(cfg *Config) *configDoc {
 		enabled := p.Enabled
 		doc.Peers = append(doc.Peers, peerDoc{Name: p.Name, Token: p.Token, Enabled: &enabled})
 	}
+	for _, p := range cfg.PendingPeers {
+		doc.PendingPeers = append(doc.PendingPeers, pendingPeerDoc(p))
+	}
 	for _, s := range cfg.Shares {
 		doc.Shares = append(doc.Shares, shareDoc{
 			ID:               s.ID,
@@ -296,6 +319,9 @@ func docToConfig(doc *configDoc) *Config {
 			enabled = *p.Enabled
 		}
 		cfg.Peers = append(cfg.Peers, Peer{Name: p.Name, Token: p.Token, Enabled: enabled})
+	}
+	for _, p := range doc.PendingPeers {
+		cfg.PendingPeers = append(cfg.PendingPeers, PendingPeer(p))
 	}
 	for _, s := range doc.Shares {
 		cfg.Shares = append(cfg.Shares, Share{
