@@ -143,6 +143,8 @@ type Node struct {
 	// the handshake timeout simultaneously. Admission is non-blocking so the
 	// transport callback never accumulates its own queue of waiting clients.
 	inboundHandshakes  chan struct{}
+	inboundPeerMu      sync.Mutex
+	inboundPeerCounts  map[string]int
 	rejectedHandshakes atomic.Uint64
 	rejectedOverload   atomic.Uint64
 }
@@ -152,6 +154,7 @@ type Node struct {
 const maxRejectedConnections = 50
 
 const maxInboundHandshakes = 32
+const maxInboundHandshakesPerPeer = 4
 
 // Open loads (or accepts, via Options) config and identity, opens the
 // index store, starts the transport, share watchers, trash janitor, and
@@ -200,6 +203,7 @@ func Open(ctx context.Context, opts Options) (*Node, error) {
 		cancel:            cancel,
 		startTime:         in.clock.Now(),
 		inboundHandshakes: make(chan struct{}, maxInboundHandshakes),
+		inboundPeerCounts: make(map[string]int),
 	}
 	n.trash = syncsvc.NewTrash(opts.Paths.TrashDir(), asSyncClock(in.clock))
 	n.janitor = syncsvc.NewJanitor(n.trash, time.Duration(in.cfg.TrashRetentionDays)*24*time.Hour, asJanitorClock(in.clock), 0, n.onTrashSweep)
@@ -579,13 +583,28 @@ func (n *Node) onAccept(conn net.Conn) {
 // pending-peer queue is deferred — see the package doc comment).
 func (n *Node) handleAccept(conn net.Conn) {
 	var sawPub ed25519.PublicKey
+	var peerSlot string
+	defer func() {
+		if peerSlot != "" {
+			n.releasePeerHandshake(peerSlot)
+		}
+	}()
 	result, err := protocol.AcceptHandshake(n.ctx, conn, protocol.HandshakeConfig{
 		IdentityKey: n.identity.Private,
 		NodeName:    n.nodeName(),
 		Token:       n.localToken(),
 		IsKnownPeer: func(pub ed25519.PublicKey) bool {
 			sawPub = append(ed25519.PublicKey(nil), pub...)
-			return n.isKnownPeer(pub)
+			if !n.isKnownPeer(pub) {
+				return false
+			}
+			key := hex.EncodeToString(pub)
+			if !n.acquirePeerHandshake(key) {
+				n.rejectedOverload.Add(1)
+				return false
+			}
+			peerSlot = key
+			return true
 		},
 	})
 	if err != nil {
@@ -610,6 +629,26 @@ func (n *Node) handleAccept(conn net.Conn) {
 	if _, err := pc.offer(n.ctx, conn, result, false); err != nil {
 		n.logger.Printf("core: accept from %s: %v", pc.name, err)
 	}
+}
+
+func (n *Node) acquirePeerHandshake(peerKey string) bool {
+	n.inboundPeerMu.Lock()
+	defer n.inboundPeerMu.Unlock()
+	if n.inboundPeerCounts[peerKey] >= maxInboundHandshakesPerPeer {
+		return false
+	}
+	n.inboundPeerCounts[peerKey]++
+	return true
+}
+
+func (n *Node) releasePeerHandshake(peerKey string) {
+	n.inboundPeerMu.Lock()
+	defer n.inboundPeerMu.Unlock()
+	if n.inboundPeerCounts[peerKey] <= 1 {
+		delete(n.inboundPeerCounts, peerKey)
+		return
+	}
+	n.inboundPeerCounts[peerKey]--
 }
 
 func (n *Node) isKnownPeer(pub ed25519.PublicKey) bool {

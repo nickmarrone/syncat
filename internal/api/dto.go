@@ -150,7 +150,8 @@ func toWriterNetworkDTO(w core.WriterNetworkStatus) map[string]any {
 
 func toSessionNetworkDTO(s core.SessionNetworkStatus) map[string]any {
 	return map[string]any{
-		"index_workers_active": s.IndexWorkersActive, "serve_workers_active": s.ServeWorkersActive, "pulls_active": s.PullsActive,
+		"index_workers_active": s.IndexWorkersActive, "index_queue_depth": s.IndexQueueDepth, "index_queue_capacity": s.IndexQueueCapacity,
+		"serve_workers_active": s.ServeWorkersActive, "pulls_active": s.PullsActive,
 		"protocol_violations": s.ProtocolViolations, "rejected_share_operations": s.RejectedShareOperations,
 		"rejected_work": s.RejectedWork, "stale_transfer_frames": s.StaleTransferFrames,
 		"pulls_started": s.PullsStarted, "serves_started": s.ServesStarted,
@@ -158,7 +159,8 @@ func toSessionNetworkDTO(s core.SessionNetworkStatus) map[string]any {
 		"transfer_stalls": s.TransferStalls, "transfer_cancellations": s.TransferCancellations, "hash_failures": s.HashFailures,
 		"snapshots_sent": s.SnapshotsSent, "snapshot_entries_sent": s.SnapshotEntriesSent,
 		"delta_batches_sent": s.DeltaBatchesSent, "delta_entries_sent": s.DeltaEntriesSent, "reconciliations": s.Reconciliations,
-		"writer": toWriterNetworkDTO(s.Writer),
+		"reconciliations_coalesced": s.ReconciliationsCoalesced,
+		"writer":                    toWriterNetworkDTO(s.Writer),
 	}
 }
 

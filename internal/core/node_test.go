@@ -378,6 +378,27 @@ func TestInboundHandshakeLimitRejectsExcessConnection(t *testing.T) {
 	}
 }
 
+func TestInboundHandshakeLimitIsFairPerPeer(t *testing.T) {
+	n := &Node{inboundPeerCounts: make(map[string]int)}
+	for i := 0; i < maxInboundHandshakesPerPeer; i++ {
+		if !n.acquirePeerHandshake("peer-a") {
+			t.Fatalf("peer A handshake %d was rejected before its limit", i)
+		}
+	}
+	if n.acquirePeerHandshake("peer-a") {
+		t.Fatal("peer A exceeded its per-peer handshake limit")
+	}
+	if !n.acquirePeerHandshake("peer-b") {
+		t.Fatal("peer A exhausted peer B's independent handshake budget")
+	}
+	for i := 0; i < maxInboundHandshakesPerPeer; i++ {
+		n.releasePeerHandshake("peer-a")
+	}
+	if !n.acquirePeerHandshake("peer-a") {
+		t.Fatal("released peer handshake capacity was not reusable")
+	}
+}
+
 // TestApprovalRequiredFailsClosed verifies that requesting a protected share
 // records a pending decision without provisioning or syncing it, and that an
 // explicit grant activates the already-open connection.

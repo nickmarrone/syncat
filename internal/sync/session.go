@@ -38,6 +38,10 @@ const maxConcurrentServes = 4
 // creates waiters and memory pressure without increasing useful throughput.
 const maxConcurrentIndexJobs = 4
 
+// maxPendingIndexKeys bounds distinct share/operation pairs waiting for an
+// index worker. Repeated work for the same key is replaced in place.
+const maxPendingIndexKeys = 64
+
 // --- the session: one authenticated peer connection --------------------
 
 // ShareConfig is one share this Session keeps in sync with the peer at the
@@ -165,20 +169,27 @@ type Session struct {
 	// on the read loop independently).
 	reconcileMu sync.Mutex
 
-	pullMu      sync.Mutex
-	pullSem     chan struct{}
-	pullTbl     map[transferKey]*pullEntry
-	serveSem    chan struct{}
-	indexSem    chan struct{}
-	serveMu     sync.Mutex
-	serveCancel map[string]context.CancelFunc
+	pullMu       sync.Mutex
+	pullSem      chan struct{}
+	pullTbl      map[transferKey]*pullEntry
+	serveSem     chan struct{}
+	indexSem     chan struct{}
+	indexMu      sync.Mutex
+	indexJobs    chan string
+	indexPending map[string]func()
+	indexRunning map[string]bool
+	serveMu      sync.Mutex
+	serveCancel  map[string]context.CancelFunc
 
 	// pullActive/pullPeak instrument concurrent-pull behavior for tests
 	// (see integration_test.go's interleaving test); always zero-cost in
 	// production beyond a couple of atomic ops.
-	pullActive int32
-	pullPeak   int32
-	stats      sessionCounters
+	pullActive      int32
+	pullPeak        int32
+	stats           sessionCounters
+	staleLogMu      sync.Mutex
+	lastStaleLog    time.Time
+	staleSuppressed uint64
 
 	// testServeDelay, if non-zero, is slept before serving each
 	// FileRequest. It exists solely so a test can make transfers slow
@@ -230,26 +241,33 @@ type sessionCounters struct {
 	transferCancellations, hashFailures                       atomic.Uint64
 	snapshotsSent, snapshotEntriesSent                        atomic.Uint64
 	deltaBatchesSent, deltaEntriesSent, reconciliations       atomic.Uint64
+	reconciliationsCoalesced                                  atomic.Uint64
 }
 
 // SessionStats is a low-cardinality snapshot suitable for status and metrics.
 // Counters contain no share IDs, paths, or peer-provided labels.
 type SessionStats struct {
-	IndexWorkersActive, ServeWorkersActive, PullsActive int
-	ProtocolViolations, RejectedShareOperations         uint64
-	RejectedWork, StaleTransferFrames                   uint64
-	PullsStarted, ServesStarted                         uint64
-	BytesReceived, BytesSent                            uint64
-	TransferStalls, TransferCancellations, HashFailures uint64
-	SnapshotsSent, SnapshotEntriesSent                  uint64
-	DeltaBatchesSent, DeltaEntriesSent, Reconciliations uint64
-	Writer                                              protocol.StreamWriterStats
+	IndexWorkersActive, IndexQueueDepth, IndexQueueCapacity int
+	ServeWorkersActive, PullsActive                         int
+	ProtocolViolations, RejectedShareOperations             uint64
+	RejectedWork, StaleTransferFrames                       uint64
+	PullsStarted, ServesStarted                             uint64
+	BytesReceived, BytesSent                                uint64
+	TransferStalls, TransferCancellations, HashFailures     uint64
+	SnapshotsSent, SnapshotEntriesSent                      uint64
+	DeltaBatchesSent, DeltaEntriesSent, Reconciliations     uint64
+	ReconciliationsCoalesced                                uint64
+	Writer                                                  protocol.StreamWriterStats
 }
 
 // Stats returns a race-safe point-in-time session snapshot.
 func (s *Session) Stats() SessionStats {
+	s.indexMu.Lock()
+	indexQueueDepth := len(s.indexPending)
+	s.indexMu.Unlock()
 	return SessionStats{
-		IndexWorkersActive: len(s.indexSem), ServeWorkersActive: len(s.serveSem), PullsActive: len(s.pullSem),
+		IndexWorkersActive: len(s.indexSem), IndexQueueDepth: indexQueueDepth, IndexQueueCapacity: maxPendingIndexKeys,
+		ServeWorkersActive: len(s.serveSem), PullsActive: len(s.pullSem),
 		ProtocolViolations: s.stats.protocolViolations.Load(), RejectedShareOperations: s.stats.rejectedShareOperations.Load(),
 		RejectedWork: s.stats.rejectedWork.Load(), StaleTransferFrames: s.stats.staleTransferFrames.Load(),
 		PullsStarted: s.stats.pullsStarted.Load(), ServesStarted: s.stats.servesStarted.Load(),
@@ -257,7 +275,8 @@ func (s *Session) Stats() SessionStats {
 		TransferStalls: s.stats.transferStalls.Load(), TransferCancellations: s.stats.transferCancellations.Load(), HashFailures: s.stats.hashFailures.Load(),
 		SnapshotsSent: s.stats.snapshotsSent.Load(), SnapshotEntriesSent: s.stats.snapshotEntriesSent.Load(),
 		DeltaBatchesSent: s.stats.deltaBatchesSent.Load(), DeltaEntriesSent: s.stats.deltaEntriesSent.Load(), Reconciliations: s.stats.reconciliations.Load(),
-		Writer: s.writer.Stats(),
+		ReconciliationsCoalesced: s.stats.reconciliationsCoalesced.Load(),
+		Writer:                   s.writer.Stats(),
 	}
 }
 
@@ -309,25 +328,28 @@ func NewSession(conn net.Conn, store *index.Store, nodeID, peerID string, clock 
 		logger = log.Default()
 	}
 	return &Session{
-		conn:        conn,
-		reader:      protocol.NewReader(conn),
-		writer:      protocol.NewStreamWriter(conn, 0),
-		store:       store,
-		nodeID:      nodeID,
-		peerID:      peerID,
-		peerLabel:   peerID,
-		clock:       clock,
-		logger:      logger,
-		warnIndex:   make(map[string]int),
-		shares:      make(map[string]*ShareConfig),
-		snapshots:   make(map[string]protocol.IndexSnapshotBegin),
-		sentIndex:   make(map[string]sentIndexState),
-		pullSem:     make(chan struct{}, maxConcurrentPulls),
-		pullTbl:     make(map[transferKey]*pullEntry),
-		serveSem:    make(chan struct{}, maxConcurrentServes),
-		indexSem:    make(chan struct{}, maxConcurrentIndexJobs),
-		serveCancel: make(map[string]context.CancelFunc),
-		done:        make(chan struct{}),
+		conn:         conn,
+		reader:       protocol.NewReader(conn),
+		writer:       protocol.NewStreamWriter(conn, 0),
+		store:        store,
+		nodeID:       nodeID,
+		peerID:       peerID,
+		peerLabel:    peerID,
+		clock:        clock,
+		logger:       logger,
+		warnIndex:    make(map[string]int),
+		shares:       make(map[string]*ShareConfig),
+		snapshots:    make(map[string]protocol.IndexSnapshotBegin),
+		sentIndex:    make(map[string]sentIndexState),
+		pullSem:      make(chan struct{}, maxConcurrentPulls),
+		pullTbl:      make(map[transferKey]*pullEntry),
+		serveSem:     make(chan struct{}, maxConcurrentServes),
+		indexSem:     make(chan struct{}, maxConcurrentIndexJobs),
+		indexJobs:    make(chan string, maxPendingIndexKeys),
+		indexPending: make(map[string]func()),
+		indexRunning: make(map[string]bool),
+		serveCancel:  make(map[string]context.CancelFunc),
+		done:         make(chan struct{}),
 	}
 }
 
@@ -346,6 +368,72 @@ func (s *Session) startBounded(sem chan struct{}, fn func()) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+// enqueueIndex schedules one coalescible index operation. At most one job for
+// a key runs at once; while it runs, repeated notifications replace one
+// pending follow-up instead of creating waiters or disconnecting the peer.
+func (s *Session) enqueueIndex(key string, fn func()) bool {
+	s.indexMu.Lock()
+	defer s.indexMu.Unlock()
+	if _, exists := s.indexPending[key]; exists {
+		s.indexPending[key] = fn
+		s.stats.reconciliationsCoalesced.Add(1)
+		return true
+	}
+	if len(s.indexPending) >= maxPendingIndexKeys {
+		return false
+	}
+	s.indexPending[key] = fn
+	if s.indexRunning[key] {
+		return true
+	}
+	select {
+	case s.indexJobs <- key:
+		return true
+	case <-s.ctx.Done():
+		delete(s.indexPending, key)
+		return false
+	default:
+		delete(s.indexPending, key)
+		return false
+	}
+}
+
+func (s *Session) runIndexWorker() {
+	defer s.wg.Done()
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case key := <-s.indexJobs:
+			s.indexMu.Lock()
+			fn, ok := s.indexPending[key]
+			if ok {
+				delete(s.indexPending, key)
+				s.indexRunning[key] = true
+			}
+			s.indexMu.Unlock()
+			if !ok {
+				continue
+			}
+
+			select {
+			case s.indexSem <- struct{}{}:
+				fn()
+				<-s.indexSem
+			case <-s.ctx.Done():
+				return
+			}
+
+			s.indexMu.Lock()
+			delete(s.indexRunning, key)
+			if _, pending := s.indexPending[key]; pending {
+				s.indexJobs <- key // capacity is reserved by maxPendingIndexKeys
+			}
+			s.indexMu.Unlock()
+		}
 	}
 }
 
@@ -631,6 +719,10 @@ func (s *Session) Start(ctx context.Context) error {
 		return err
 	}
 	s.lifecycle = sessionRunning
+	s.wg.Add(maxConcurrentIndexJobs)
+	for range maxConcurrentIndexJobs {
+		go s.runIndexWorker()
+	}
 	s.wg.Add(1)
 	go s.readLoop()
 	return nil
@@ -1046,13 +1138,13 @@ func (s *Session) readLoop() {
 				s.logf("dropping index request for inactive or outbound-blocked share %s", m.ShareID)
 				continue
 			}
-			if !s.startBounded(s.indexSem, func() {
+			if !s.enqueueIndex("sync\x00"+m.ShareID, func() {
 				if err := s.answerSyncRequest(s.ctx, m); err != nil {
 					s.logf("answer index sync: %v", err)
 				}
 			}) {
 				s.rejectWork()
-				s.logf("closing overloaded session: index workers are full")
+				s.logf("closing overloaded session: index queue is full")
 				_ = s.conn.Close()
 				return
 			}
@@ -1119,11 +1211,11 @@ func (s *Session) readLoop() {
 			c, _ := s.store.Cursor(s.ctx, s.peerID, m.ShareID, "incoming")
 			if ok && b.SnapshotID == m.SnapshotID && c.SnapshotBatch == m.BatchCount && s.store.CommitSnapshot(s.ctx, s.peerID, m.ShareID, m.SnapshotID, b.Epoch, b.HighSeq) == nil {
 				_ = s.writer.WriteMessage(protocol.MsgIndexAck, protocol.IndexAck{ShareID: m.ShareID, Epoch: b.Epoch, AppliedSeq: b.HighSeq, SnapshotID: m.SnapshotID})
-				if !s.startBounded(s.indexSem, func() {
+				if !s.enqueueIndex("reconcile\x00"+m.ShareID, func() {
 					s.reconcilePeerShare(s.ctx, m.ShareID)
 				}) {
 					s.rejectWork()
-					s.logf("closing overloaded session: index workers are full")
+					s.logf("closing overloaded session: index queue is full")
 					_ = s.conn.Close()
 					return
 				}
@@ -1148,11 +1240,11 @@ func (s *Session) readLoop() {
 			}
 			if valid && s.store.ApplyPeerDelta(s.ctx, s.peerID, m.ShareID, m.Epoch, m.FromSeq, m.ToSeq, rr) == nil {
 				_ = s.writer.WriteMessage(protocol.MsgIndexAck, protocol.IndexAck{ShareID: m.ShareID, Epoch: m.Epoch, AppliedSeq: m.ToSeq})
-				if !s.startBounded(s.indexSem, func() {
-					s.handleIndexUpdate(s.ctx, protocol.IndexUpdate{ShareID: m.ShareID, Files: rowsToInfos(rr)})
+				if !s.enqueueIndex("reconcile\x00"+m.ShareID, func() {
+					s.reconcilePeerShare(s.ctx, m.ShareID)
 				}) {
 					s.rejectWork()
-					s.logf("closing overloaded session: index workers are full")
+					s.logf("closing overloaded session: index queue is full")
 					_ = s.conn.Close()
 					return
 				}
@@ -1243,34 +1335,8 @@ func (s *Session) readLoop() {
 }
 
 func (s *Session) reconcilePeerShare(ctx context.Context, shareID string) {
-	s.stats.reconciliations.Add(1)
-	s.reconcileMu.Lock()
-	defer s.reconcileMu.Unlock()
-	rows, err := s.store.ListPeerFiles(ctx, s.peerID, shareID)
-	if err != nil {
-		return
-	}
-	// CommitSnapshot has already installed the mirror; feed reconciliation
-	// without re-entering the peer-state persistence path.
-	cfg, ok := s.getShare(shareID)
-	if !ok || cfg.Direction.InboundBlocked {
-		return
-	}
-	local, err := s.store.ListShare(ctx, shareID, true)
-	if err != nil {
-		return
-	}
-	actions := Reconcile(rowsToInfos(local), rowsToInfos(rows), s.nodeID, cfg.Direction, s.clock, cfg.Ignore)
-	var changed atomic.Bool
-	s.runActionWorkers(ctx, cfg, actions, func(_ Action, rows []index.FileRow) {
-		if len(rows) > 0 {
-			changed.Store(true)
-		}
-	})
-	if changed.Load() && !cfg.Direction.OutboundBlocked {
-		// Reconciliation results are journaled by applyAndPersist; publish
-		// them so conflict copies converge on every peer.
-		_ = s.answerSyncRequest(ctx, protocol.IndexSyncRequest{ShareID: shareID})
+	if err := s.ReconcileShare(ctx, shareID); err != nil {
+		s.logf("reconcile peer share %s: %v", shareID, err)
 	}
 }
 
