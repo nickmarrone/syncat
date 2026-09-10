@@ -450,16 +450,9 @@ func writeMutationError(w http.ResponseWriter, err error) {
 // mutationError classifies an error returned by one of core.Node's
 // mutation methods into an HTTP status code and stable error code.
 //
-// internal/core's mutation API returns plain wrapped errors (fmt.Errorf),
-// not typed/sentinel errors distinguishing "bad input" from "unknown id"
-// from "conflicts with existing state" — see the deviation note in the
-// package doc comment. Every message it produces is deterministic,
-// synchronous validation output (never a leaked stack trace or raw
-// syscall error), so it's safe to return verbatim to an already
-// token-authenticated caller; classification here is purely a
-// pattern-match on the wording those methods are documented to use, kept
-// in one place so a future core change to typed errors only touches this
-// function.
+// Core attaches a stable kind to failures whose HTTP status differs from the
+// default caller-fixable validation error. Human-readable wording is never
+// part of classification.
 func mutationError(err error) (status int, code, message string) {
 	if err == nil {
 		return http.StatusOK, "", ""
@@ -469,37 +462,15 @@ func mutationError(err error) (status int, code, message string) {
 	}
 
 	msg := err.Error()
-	switch {
-	// "no share matches" is internal/core's matchRef phrasing for a share
-	// ref that names nothing. Every path that produces it is addressing a
-	// share by URL — /api/shares/{id} and /api/shares/{id}/trash — so it is
-	// the addressed resource being absent, i.e. a 404, exactly like the
-	// "is not configured" lookups it now runs ahead of.
-	//
-	// Its peer counterpart ("no peer matches") is deliberately absent here.
-	// A peer ref only ever reaches core from a request *body*
-	// (POST /api/subscriptions), which is caller-fixable input and stays a
-	// 400. DELETE /api/peers/{id} never produces it: RemovePeer resolves
-	// best-effort and falls through to findPeerIndex's own "is not
-	// configured", which this same case already maps to 404.
-	case containsAny(msg, "is not configured", "is not a local share", "no trashed entry", "has no active watch", "no share matches"):
-		return http.StatusNotFound, "not_found", msg
-	case containsAny(msg, "already configured", "already exists", "overlaps"):
-		return http.StatusConflict, "conflict", msg
-	default:
-		// Every other error core's mutation methods produce is input
-		// validation (invalid permission/mode, non-absolute path, empty
-		// required field, malformed token, ...) — 400 is the honest
-		// default rather than 500, since these are all caller-fixable.
-		return http.StatusBadRequest, "bad_request", msg
-	}
-}
-
-func containsAny(s string, substrs ...string) bool {
-	for _, sub := range substrs {
-		if strings.Contains(s, sub) {
-			return true
+	if kind, ok := core.ClassifyMutationError(err); ok {
+		switch kind {
+		case core.MutationNotFound:
+			return http.StatusNotFound, "not_found", msg
+		case core.MutationConflict:
+			return http.StatusConflict, "conflict", msg
+		case core.MutationInvalid:
+			return http.StatusBadRequest, "bad_request", msg
 		}
 	}
-	return false
+	return http.StatusBadRequest, "bad_request", msg
 }
