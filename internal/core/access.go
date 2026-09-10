@@ -148,7 +148,7 @@ func (n *Node) finishAccessUpdate(ctx context.Context, sess *syncsvc.Session, sh
 
 func (n *Node) sendShareList(sess *syncsvc.Session, peerKeyHex string) {
 	entries := n.buildShareList(peerKeyHex)
-	if err := sess.Writer().WriteMessage(protocol.MsgShareList, protocol.ShareList{Shares: entries}); err != nil {
+	if err := sess.Writer().WriteLatestMessage("share-list", protocol.MsgShareList, protocol.ShareList{Shares: entries}); err != nil {
 		n.logger.Printf("core: send share list to %s: %v", peerKeyHex, err)
 	}
 }

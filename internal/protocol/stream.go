@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-// --- the session writer: one goroutine, three lanes --------------------
+// --- the session writer: one goroutine, prioritized lanes --------------
 
 // DefaultWriteTimeout bounds one frame's write on a live session. It is
 // deliberately generous: a full 1 MiB FileChunk still only needs ~17 KB/s
@@ -23,18 +23,18 @@ import (
 // connection had a deadline of any kind.
 const DefaultWriteTimeout = 60 * time.Second
 
-// Queue depths for [StreamWriter]'s urgent, control, and data lanes.
+// Queue depths for [StreamWriter]'s urgent, control, latest-state control,
+// and data lanes.
 //
 // The data lane is deliberately shallow: it exists to keep the socket fed
 // while a transfer reads its next chunk off disk, not to buffer a transfer.
 // Blocking there is the backpressure that stops a serving goroutine from
 // racing ahead of the network.
 //
-// The control lane is sized to hold every control frame a healthy session
-// could plausibly have outstanding at once (a ShareList, one
-// SubscribeRequest or AccessUpdate per share, a Ping, and a transfer error
-// per in-flight pull), because enqueueing there must never block — see
-// [StreamWriter.enqueue].
+// The ordinary and latest-state control lanes are each bounded. Latest-state
+// keys replace their pending frame in place, while ordered control events
+// retain FIFO behavior and cancellable backpressure — see
+// [StreamWriter.enqueue] and [StreamWriter.enqueueLatest].
 const (
 	urgentQueueDepth = 8
 	ctrlQueueDepth   = 64
@@ -57,8 +57,9 @@ var ErrWriterAlreadyStarted = errors.New("protocol: stream writer has already be
 
 // StreamWriter serializes every frame written to one live session
 // connection onto a single goroutine, fed by reserved urgent, ordinary
-// control, and shallow bulk queues. It replaces sharing a [Writer] directly across every
-// goroutine that writes to a session.
+// control, replaceable latest-state control, and shallow bulk queues. It
+// replaces sharing a [Writer] directly across every goroutine that writes to
+// a session.
 //
 // The point is that no caller ever waits on a bulk write. With a shared
 // [Writer], a 1 MiB FileChunk to a peer that has stopped reading holds the
@@ -67,10 +68,9 @@ var ErrWriterAlreadyStarted = errors.New("protocol: stream writer has already be
 // sends inline when it sees a Ping. A blocked read loop stops draining the
 // socket, which is exactly what makes the *peer's* writes stall, so two
 // nodes each transferring a large file could deadlock outright with
-// nothing to break the tie. Draining the control lane to empty before
-// touching the data lane means a Ping, Pong, AccessUpdate or
-// transfer-scoped Error is never queued behind file bytes, and the read
-// loop's inline writes can't block at all.
+// nothing to break the tie. Prioritizing control work while bounding its
+// burst means a Ping, Pong, AccessUpdate or transfer-scoped Error is never
+// queued behind a stream of file bytes, while bulk still progresses.
 //
 // A write failure is terminal for the whole session: StreamWriter records
 // it (see [StreamWriter.Err]), closes the connection — which EOFs the read
@@ -86,7 +86,11 @@ type StreamWriter struct {
 
 	urgent         chan queuedFrame
 	ctrl           chan queuedFrame
+	latest         chan string
 	data           chan queuedFrame
+	latestMu       sync.Mutex
+	latestFrames   map[string]queuedFrame
+	latestReplaced atomic.Uint64
 	observerMu     sync.Mutex
 	writeObserver  func(MsgType)
 	framesWritten  atomic.Uint64
@@ -127,21 +131,26 @@ type queuedFrame struct {
 // StreamWriterStats is a low-cardinality snapshot of one writer's bounded
 // queues and completed socket writes.
 type StreamWriterStats struct {
-	UrgentQueued, ControlQueued, BulkQueued       int
-	UrgentCapacity, ControlCapacity, BulkCapacity int
-	FramesWritten, UrgentFramesWritten            uint64
-	ControlFramesWritten, BulkFramesWritten       uint64
-	BytesWritten                                  uint64
-	WriteFailures, WriteTimeouts                  uint64
-	LastWriteDuration, MaxWriteDuration           time.Duration
+	UrgentQueued, ControlQueued, LatestQueued, BulkQueued         int
+	UrgentCapacity, ControlCapacity, LatestCapacity, BulkCapacity int
+	LatestReplaced                                                uint64
+	FramesWritten, UrgentFramesWritten                            uint64
+	ControlFramesWritten, BulkFramesWritten                       uint64
+	BytesWritten                                                  uint64
+	WriteFailures, WriteTimeouts                                  uint64
+	LastWriteDuration, MaxWriteDuration                           time.Duration
 }
 
 // Stats returns a race-safe point-in-time writer snapshot.
 func (s *StreamWriter) Stats() StreamWriterStats {
+	s.latestMu.Lock()
+	latestQueued := len(s.latestFrames)
+	s.latestMu.Unlock()
 	return StreamWriterStats{
-		UrgentQueued: len(s.urgent), ControlQueued: len(s.ctrl), BulkQueued: len(s.data),
-		UrgentCapacity: cap(s.urgent), ControlCapacity: cap(s.ctrl), BulkCapacity: cap(s.data),
-		FramesWritten: s.framesWritten.Load(), UrgentFramesWritten: s.urgentWritten.Load(),
+		UrgentQueued: len(s.urgent), ControlQueued: len(s.ctrl), LatestQueued: latestQueued, BulkQueued: len(s.data),
+		UrgentCapacity: cap(s.urgent), ControlCapacity: cap(s.ctrl), LatestCapacity: cap(s.latest), BulkCapacity: cap(s.data),
+		LatestReplaced: s.latestReplaced.Load(),
+		FramesWritten:  s.framesWritten.Load(), UrgentFramesWritten: s.urgentWritten.Load(),
 		ControlFramesWritten: s.controlWritten.Load(), BulkFramesWritten: s.bulkWritten.Load(), BytesWritten: s.bytesWritten.Load(),
 		WriteFailures: s.writeFailures.Load(), WriteTimeouts: s.writeTimeouts.Load(),
 		LastWriteDuration: time.Duration(s.lastWriteNS.Load()), MaxWriteDuration: time.Duration(s.maxWriteNS.Load()),
@@ -158,13 +167,15 @@ func NewStreamWriter(conn net.Conn, timeout time.Duration) *StreamWriter {
 		timeout = DefaultWriteTimeout
 	}
 	s := &StreamWriter{
-		conn:    conn,
-		timeout: timeout,
-		urgent:  make(chan queuedFrame, urgentQueueDepth),
-		ctrl:    make(chan queuedFrame, ctrlQueueDepth),
-		data:    make(chan queuedFrame, dataQueueDepth),
-		stop:    make(chan struct{}),
-		done:    make(chan struct{}),
+		conn:         conn,
+		timeout:      timeout,
+		urgent:       make(chan queuedFrame, urgentQueueDepth),
+		ctrl:         make(chan queuedFrame, ctrlQueueDepth),
+		latest:       make(chan string, ctrlQueueDepth),
+		data:         make(chan queuedFrame, dataQueueDepth),
+		latestFrames: make(map[string]queuedFrame),
+		stop:         make(chan struct{}),
+		done:         make(chan struct{}),
 	}
 	if conn != nil {
 		s.w = conn
@@ -249,6 +260,34 @@ func (s *StreamWriter) WriteMessageContext(ctx context.Context, typ MsgType, v a
 	return s.writeFrameContext(ctx, typ, payload, nil)
 }
 
+// WriteLatestMessageContext queues replaceable control state. If another
+// frame with the same key is still pending, it is replaced in place so a slow
+// connection receives the newest state without accumulating obsolete frames.
+// Callers must use a key only for idempotent state announcements; ordered
+// protocol events and bulk frames must use WriteMessageContext instead.
+func (s *StreamWriter) WriteLatestMessageContext(ctx context.Context, key string, typ MsgType, v any) error {
+	if key == "" {
+		return errors.New("protocol: latest-message key is empty")
+	}
+	if isBulk(typ) || isUrgent(typ) {
+		return fmt.Errorf("protocol: %s cannot use the latest-state lane", typ)
+	}
+	payload, err := encodeMessage(typ, v)
+	if err != nil {
+		return err
+	}
+	frame, err := encodeFrame(typ, payload)
+	if err != nil {
+		return err
+	}
+	return s.enqueueLatest(ctx, key, queuedFrame{typ: typ, data: frame})
+}
+
+// WriteLatestMessage is WriteLatestMessageContext with no caller deadline.
+func (s *StreamWriter) WriteLatestMessage(key string, typ MsgType, v any) error {
+	return s.WriteLatestMessageContext(context.Background(), key, typ, v)
+}
+
 // WriteMessageOnWritten queues a message and invokes onWritten on the writer
 // goroutine only after the complete frame reaches the underlying connection.
 // The callback must not block. It is intended for protocol state which must
@@ -267,17 +306,29 @@ func (s *StreamWriter) WriteMessageOnWritten(typ MsgType, v any, onWritten func(
 // copied into the queued frame, so the caller may reuse its buffer as soon
 // as this returns.
 func (s *StreamWriter) WriteFileChunk(hdr FileChunkHeader, data []byte) error {
-	return s.WriteFileChunkOnWritten(hdr, data, nil)
+	return s.WriteFileChunkContextOnWritten(context.Background(), hdr, data, nil)
 }
 
 // WriteFileChunkOnWritten is WriteFileChunk with a non-blocking callback
 // invoked after the complete frame reaches the connection.
 func (s *StreamWriter) WriteFileChunkOnWritten(hdr FileChunkHeader, data []byte, onWritten func()) error {
+	return s.WriteFileChunkContextOnWritten(context.Background(), hdr, data, onWritten)
+}
+
+// WriteFileChunkContext queues a file chunk with cancellable bulk-lane
+// backpressure.
+func (s *StreamWriter) WriteFileChunkContext(ctx context.Context, hdr FileChunkHeader, data []byte) error {
+	return s.WriteFileChunkContextOnWritten(ctx, hdr, data, nil)
+}
+
+// WriteFileChunkContextOnWritten combines cancellable enqueueing with a
+// callback after the complete frame has reached the connection.
+func (s *StreamWriter) WriteFileChunkContextOnWritten(ctx context.Context, hdr FileChunkHeader, data []byte, onWritten func()) error {
 	payload, err := encodeFileChunk(hdr, data)
 	if err != nil {
 		return err
 	}
-	return s.writeFrameContext(context.Background(), MsgFileChunk, payload, onWritten)
+	return s.writeFrameContext(ctx, MsgFileChunk, payload, onWritten)
 }
 
 // WriteFrame queues one frame of the given type with payload as its body.
@@ -356,6 +407,51 @@ func (s *StreamWriter) enqueue(ctx context.Context, q queuedFrame) error {
 	}
 }
 
+func (s *StreamWriter) enqueueLatest(ctx context.Context, key string, q queuedFrame) error {
+	if err := s.Err(); err != nil {
+		return err
+	}
+	s.stateMu.Lock()
+	state := s.state
+	s.stateMu.Unlock()
+	if state == streamWriterNew {
+		return ErrWriterNotStarted
+	}
+	if state == streamWriterClosed {
+		return s.errOrClosed()
+	}
+
+	s.latestMu.Lock()
+	if _, exists := s.latestFrames[key]; exists {
+		s.latestFrames[key] = q
+		s.latestReplaced.Add(1)
+		s.latestMu.Unlock()
+		return nil
+	}
+	s.latestFrames[key] = q
+	select {
+	case s.latest <- key:
+		s.latestMu.Unlock()
+		return nil
+	case <-ctx.Done():
+		delete(s.latestFrames, key)
+		s.latestMu.Unlock()
+		return ctx.Err()
+	case <-s.stop:
+		delete(s.latestFrames, key)
+		s.latestMu.Unlock()
+		return s.errOrClosed()
+	}
+}
+
+func (s *StreamWriter) popLatest(key string) (queuedFrame, bool) {
+	s.latestMu.Lock()
+	defer s.latestMu.Unlock()
+	frame, ok := s.latestFrames[key]
+	delete(s.latestFrames, key)
+	return frame, ok
+}
+
 func isUrgent(typ MsgType) bool { return typ == MsgPong || typ == MsgError }
 
 // isBulk reports whether typ is a bulk frame, i.e. one big enough that
@@ -368,8 +464,8 @@ func isBulk(typ MsgType) bool {
 	return typ == MsgFileChunk || typ == MsgIndexUpdate || typ == MsgIndexSnapshotBegin || typ == MsgIndexSnapshotBatch || typ == MsgIndexSnapshotEnd || typ == MsgIndexDeltaBatch
 }
 
-// run is the single writer goroutine: drain ctrl to empty, then take one
-// frame from either lane, repeat.
+// run is the single writer goroutine: prioritize liveness, bound consecutive
+// control work so bulk progresses, and serialize every selected frame.
 func (s *StreamWriter) run() {
 	defer close(s.done)
 	burst := 0
@@ -404,6 +500,14 @@ func (s *StreamWriter) run() {
 				return
 			}
 			burst++
+		case key := <-s.latest:
+			frame, ok := s.popLatest(key)
+			if ok {
+				if !s.writeFrame(frame) {
+					return
+				}
+				burst++
+			}
 		case frame := <-s.data:
 			if !s.writeFrame(frame) {
 				return

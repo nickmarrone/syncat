@@ -115,6 +115,62 @@ func TestStreamWriterControlBackpressureIsCancelable(t *testing.T) {
 	}
 }
 
+func TestStreamWriterFileChunkBackpressureIsCancelable(t *testing.T) {
+	sw, _ := startedWriter(t, time.Minute)
+	blockWriter(t, sw)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	err := sw.WriteFileChunkContext(ctx, FileChunkHeader{ShareID: "s", RelPath: "f"}, []byte("blocked"))
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("full bulk queue error = %v, want context deadline", err)
+	}
+	if sw.Err() != nil {
+		t.Fatalf("canceled bulk enqueue poisoned connection: %v", sw.Err())
+	}
+}
+
+func TestStreamWriterLatestStateReplacesPendingFrame(t *testing.T) {
+	sw, far := startedWriter(t, time.Minute)
+	if err := sw.WriteMessage(MsgPing, Ping{}); err != nil {
+		t.Fatal(err)
+	}
+	// Wait until the unread Ping is in the writer's hand, leaving both state
+	// announcements pending and therefore eligible for replacement.
+	deadline := time.Now().Add(time.Second)
+	for sw.Stats().ControlQueued != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("writer did not begin the blocking Ping")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	for seq := uint64(1); seq <= 2; seq++ {
+		if err := sw.WriteLatestMessage("ack\x00s", MsgIndexAck, IndexAck{ShareID: "s", Epoch: "e", AppliedSeq: seq}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	fr := NewReader(far)
+	if typ, _, err := fr.ReadFrame(); err != nil || typ != MsgPing {
+		t.Fatalf("first frame = %s, %v; want Ping", typ, err)
+	}
+	typ, payload, err := fr.ReadFrame()
+	if err != nil || typ != MsgIndexAck {
+		t.Fatalf("second frame = %s, %v; want IndexAck", typ, err)
+	}
+	var ack IndexAck
+	if err := DecodeMessage(payload, &ack); err != nil {
+		t.Fatal(err)
+	}
+	if ack.AppliedSeq != 2 {
+		t.Fatalf("written ack sequence = %d, want latest 2", ack.AppliedSeq)
+	}
+	stats := sw.Stats()
+	if stats.LatestReplaced != 1 || stats.LatestQueued != 0 {
+		t.Fatalf("latest-state stats = %+v", stats)
+	}
+}
+
 func TestStreamWriterObserverFiresAfterWriteNotEnqueue(t *testing.T) {
 	sw, far := startedWriter(t, time.Minute)
 	written := make(chan MsgType, 1)
@@ -163,7 +219,7 @@ func TestStreamWriterPerFrameCallbackFiresAfterWrite(t *testing.T) {
 	if stats.FramesWritten != 1 || stats.ControlFramesWritten != 1 || stats.BytesWritten == 0 {
 		t.Fatalf("writer stats after Ping = %+v", stats)
 	}
-	if stats.UrgentCapacity != urgentQueueDepth || stats.ControlCapacity != ctrlQueueDepth || stats.BulkCapacity != dataQueueDepth {
+	if stats.UrgentCapacity != urgentQueueDepth || stats.ControlCapacity != ctrlQueueDepth || stats.LatestCapacity != ctrlQueueDepth || stats.BulkCapacity != dataQueueDepth {
 		t.Fatalf("writer queue capacities = %+v", stats)
 	}
 }

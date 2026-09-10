@@ -801,7 +801,7 @@ func (s *Session) SyncShare(ctx context.Context, shareID string) error {
 	if err != nil {
 		return err
 	}
-	if err := s.writer.WriteMessage(protocol.MsgIndexSyncRequest, protocol.IndexSyncRequest{ShareID: shareID, Epoch: c.Epoch, AppliedSeq: c.AppliedSeq, SnapshotID: c.SnapshotID, SnapshotBatch: c.SnapshotBatch}); err != nil {
+	if err := s.writer.WriteLatestMessageContext(ctx, "index-sync\x00"+shareID, protocol.MsgIndexSyncRequest, protocol.IndexSyncRequest{ShareID: shareID, Epoch: c.Epoch, AppliedSeq: c.AppliedSeq, SnapshotID: c.SnapshotID, SnapshotBatch: c.SnapshotBatch}); err != nil {
 		return err
 	}
 	return nil
@@ -1182,7 +1182,7 @@ func (s *Session) readLoop() {
 				continue
 			}
 			if m.Batch != c.SnapshotBatch {
-				_ = s.writer.WriteMessage(protocol.MsgIndexSyncRequest, protocol.IndexSyncRequest{ShareID: m.ShareID, Epoch: c.Epoch, AppliedSeq: c.AppliedSeq, SnapshotID: c.SnapshotID, SnapshotBatch: c.SnapshotBatch})
+				_ = s.writer.WriteLatestMessageContext(s.ctx, "index-sync\x00"+m.ShareID, protocol.MsgIndexSyncRequest, protocol.IndexSyncRequest{ShareID: m.ShareID, Epoch: c.Epoch, AppliedSeq: c.AppliedSeq, SnapshotID: c.SnapshotID, SnapshotBatch: c.SnapshotBatch})
 				continue
 			}
 			rr := make([]index.FileRow, len(m.Files))
@@ -1210,7 +1210,7 @@ func (s *Session) readLoop() {
 			s.snapshotMu.Unlock()
 			c, _ := s.store.Cursor(s.ctx, s.peerID, m.ShareID, "incoming")
 			if ok && b.SnapshotID == m.SnapshotID && c.SnapshotBatch == m.BatchCount && s.store.CommitSnapshot(s.ctx, s.peerID, m.ShareID, m.SnapshotID, b.Epoch, b.HighSeq) == nil {
-				_ = s.writer.WriteMessage(protocol.MsgIndexAck, protocol.IndexAck{ShareID: m.ShareID, Epoch: b.Epoch, AppliedSeq: b.HighSeq, SnapshotID: m.SnapshotID})
+				_ = s.writer.WriteLatestMessageContext(s.ctx, "index-ack\x00"+m.ShareID, protocol.MsgIndexAck, protocol.IndexAck{ShareID: m.ShareID, Epoch: b.Epoch, AppliedSeq: b.HighSeq, SnapshotID: m.SnapshotID})
 				if !s.enqueueIndex("reconcile\x00"+m.ShareID, func() {
 					s.reconcilePeerShare(s.ctx, m.ShareID)
 				}) {
@@ -1239,7 +1239,7 @@ func (s *Session) readLoop() {
 				rr[i] = index.FileRowFromInfo(m.ShareID, e.File, time.Now())
 			}
 			if valid && s.store.ApplyPeerDelta(s.ctx, s.peerID, m.ShareID, m.Epoch, m.FromSeq, m.ToSeq, rr) == nil {
-				_ = s.writer.WriteMessage(protocol.MsgIndexAck, protocol.IndexAck{ShareID: m.ShareID, Epoch: m.Epoch, AppliedSeq: m.ToSeq})
+				_ = s.writer.WriteLatestMessageContext(s.ctx, "index-ack\x00"+m.ShareID, protocol.MsgIndexAck, protocol.IndexAck{ShareID: m.ShareID, Epoch: m.Epoch, AppliedSeq: m.ToSeq})
 				if !s.enqueueIndex("reconcile\x00"+m.ShareID, func() {
 					s.reconcilePeerShare(s.ctx, m.ShareID)
 				}) {
@@ -1250,7 +1250,7 @@ func (s *Session) readLoop() {
 				}
 			} else {
 				c, _ := s.store.Cursor(s.ctx, s.peerID, m.ShareID, "incoming")
-				_ = s.writer.WriteMessage(protocol.MsgIndexSyncRequest, protocol.IndexSyncRequest{ShareID: m.ShareID, Epoch: c.Epoch, AppliedSeq: c.AppliedSeq})
+				_ = s.writer.WriteLatestMessageContext(s.ctx, "index-sync\x00"+m.ShareID, protocol.MsgIndexSyncRequest, protocol.IndexSyncRequest{ShareID: m.ShareID, Epoch: c.Epoch, AppliedSeq: c.AppliedSeq})
 			}
 		case protocol.MsgIndexAck:
 			var m protocol.IndexAck

@@ -10,13 +10,14 @@ import (
 // WriterNetworkStatus exposes bounded queue gauges and cumulative write
 // outcomes without identifying individual messages or payloads.
 type WriterNetworkStatus struct {
-	UrgentQueued, ControlQueued, BulkQueued       int
-	UrgentCapacity, ControlCapacity, BulkCapacity int
-	FramesWritten, UrgentFramesWritten            uint64
-	ControlFramesWritten, BulkFramesWritten       uint64
-	BytesWritten                                  uint64
-	WriteFailures, WriteTimeouts                  uint64
-	LastWriteDuration, MaxWriteDuration           time.Duration
+	UrgentQueued, ControlQueued, LatestQueued, BulkQueued         int
+	UrgentCapacity, ControlCapacity, LatestCapacity, BulkCapacity int
+	LatestReplaced                                                uint64
+	FramesWritten, UrgentFramesWritten                            uint64
+	ControlFramesWritten, BulkFramesWritten                       uint64
+	BytesWritten                                                  uint64
+	WriteFailures, WriteTimeouts                                  uint64
+	LastWriteDuration, MaxWriteDuration                           time.Duration
 }
 
 // SessionNetworkStatus is the cumulative and live work performed by one
@@ -64,6 +65,7 @@ func addWriterStats(a, b protocol.StreamWriterStats, live bool) protocol.StreamW
 	a.BytesWritten += b.BytesWritten
 	a.WriteFailures += b.WriteFailures
 	a.WriteTimeouts += b.WriteTimeouts
+	a.LatestReplaced += b.LatestReplaced
 	if b.LastWriteDuration != 0 {
 		a.LastWriteDuration = b.LastWriteDuration
 	}
@@ -71,8 +73,8 @@ func addWriterStats(a, b protocol.StreamWriterStats, live bool) protocol.StreamW
 		a.MaxWriteDuration = b.MaxWriteDuration
 	}
 	if live {
-		a.UrgentQueued, a.ControlQueued, a.BulkQueued = b.UrgentQueued, b.ControlQueued, b.BulkQueued
-		a.UrgentCapacity, a.ControlCapacity, a.BulkCapacity = b.UrgentCapacity, b.ControlCapacity, b.BulkCapacity
+		a.UrgentQueued, a.ControlQueued, a.LatestQueued, a.BulkQueued = b.UrgentQueued, b.ControlQueued, b.LatestQueued, b.BulkQueued
+		a.UrgentCapacity, a.ControlCapacity, a.LatestCapacity, a.BulkCapacity = b.UrgentCapacity, b.ControlCapacity, b.LatestCapacity, b.BulkCapacity
 	}
 	return a
 }
@@ -117,9 +119,10 @@ func toSessionNetworkStatus(s syncsvc.SessionStats) SessionNetworkStatus {
 		DeltaBatchesSent: s.DeltaBatchesSent, DeltaEntriesSent: s.DeltaEntriesSent, Reconciliations: s.Reconciliations,
 		ReconciliationsCoalesced: s.ReconciliationsCoalesced,
 		Writer: WriterNetworkStatus{
-			UrgentQueued: w.UrgentQueued, ControlQueued: w.ControlQueued, BulkQueued: w.BulkQueued,
-			UrgentCapacity: w.UrgentCapacity, ControlCapacity: w.ControlCapacity, BulkCapacity: w.BulkCapacity,
-			FramesWritten: w.FramesWritten, UrgentFramesWritten: w.UrgentFramesWritten,
+			UrgentQueued: w.UrgentQueued, ControlQueued: w.ControlQueued, LatestQueued: w.LatestQueued, BulkQueued: w.BulkQueued,
+			UrgentCapacity: w.UrgentCapacity, ControlCapacity: w.ControlCapacity, LatestCapacity: w.LatestCapacity, BulkCapacity: w.BulkCapacity,
+			LatestReplaced: w.LatestReplaced,
+			FramesWritten:  w.FramesWritten, UrgentFramesWritten: w.UrgentFramesWritten,
 			ControlFramesWritten: w.ControlFramesWritten, BulkFramesWritten: w.BulkFramesWritten,
 			BytesWritten: w.BytesWritten, WriteFailures: w.WriteFailures, WriteTimeouts: w.WriteTimeouts,
 			LastWriteDuration: w.LastWriteDuration, MaxWriteDuration: w.MaxWriteDuration,
@@ -175,9 +178,11 @@ func addSessionNetworkStatus(a, b SessionNetworkStatus) SessionNetworkStatus {
 	a.ReconciliationsCoalesced += b.ReconciliationsCoalesced
 	a.Writer.UrgentQueued += b.Writer.UrgentQueued
 	a.Writer.ControlQueued += b.Writer.ControlQueued
+	a.Writer.LatestQueued += b.Writer.LatestQueued
 	a.Writer.BulkQueued += b.Writer.BulkQueued
 	a.Writer.UrgentCapacity += b.Writer.UrgentCapacity
 	a.Writer.ControlCapacity += b.Writer.ControlCapacity
+	a.Writer.LatestCapacity += b.Writer.LatestCapacity
 	a.Writer.BulkCapacity += b.Writer.BulkCapacity
 	a.Writer.FramesWritten += b.Writer.FramesWritten
 	a.Writer.UrgentFramesWritten += b.Writer.UrgentFramesWritten
@@ -186,6 +191,7 @@ func addSessionNetworkStatus(a, b SessionNetworkStatus) SessionNetworkStatus {
 	a.Writer.BytesWritten += b.Writer.BytesWritten
 	a.Writer.WriteFailures += b.Writer.WriteFailures
 	a.Writer.WriteTimeouts += b.Writer.WriteTimeouts
+	a.Writer.LatestReplaced += b.Writer.LatestReplaced
 	if b.Writer.LastWriteDuration != 0 {
 		a.Writer.LastWriteDuration = b.Writer.LastWriteDuration
 	}

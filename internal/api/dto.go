@@ -139,9 +139,10 @@ func toPeerDTO(p core.PeerStatus) peerDTO {
 
 func toWriterNetworkDTO(w core.WriterNetworkStatus) map[string]any {
 	return map[string]any{
-		"urgent_queued": w.UrgentQueued, "control_queued": w.ControlQueued, "bulk_queued": w.BulkQueued,
-		"urgent_capacity": w.UrgentCapacity, "control_capacity": w.ControlCapacity, "bulk_capacity": w.BulkCapacity,
-		"frames_written": w.FramesWritten, "urgent_frames_written": w.UrgentFramesWritten,
+		"urgent_queued": w.UrgentQueued, "control_queued": w.ControlQueued, "latest_queued": w.LatestQueued, "bulk_queued": w.BulkQueued,
+		"urgent_capacity": w.UrgentCapacity, "control_capacity": w.ControlCapacity, "latest_capacity": w.LatestCapacity, "bulk_capacity": w.BulkCapacity,
+		"latest_replaced": w.LatestReplaced,
+		"frames_written":  w.FramesWritten, "urgent_frames_written": w.UrgentFramesWritten,
 		"control_frames_written": w.ControlFramesWritten, "bulk_frames_written": w.BulkFramesWritten,
 		"bytes_written": w.BytesWritten, "write_failures": w.WriteFailures, "write_timeouts": w.WriteTimeouts,
 		"last_write_seconds": w.LastWriteDuration.Seconds(), "max_write_seconds": w.MaxWriteDuration.Seconds(),
