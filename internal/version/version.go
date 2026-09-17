@@ -18,18 +18,18 @@ import (
 // `proto_version` in the handshake (internal/protocol), the `sc1` token
 // prefix (SPEC.md §2), and the index's `PRAGMA user_version`
 // (internal/index). Bumping this number says nothing about any of them.
-const Version = "0.3"
+const Version = "0.4.0"
 
 // String returns [Version] with the commit it was built from appended as
-// semver build metadata — "0.3+979daad", or "0.3+979daad.dirty" when the
-// working tree had uncommitted changes.
+// semver build metadata, with a `.dirty` suffix when the working tree had
+// uncommitted changes.
 //
 // The commit comes from the Go toolchain, which stamps it into the binary
 // automatically when building from a git checkout, so there is nothing to
 // pass at build time and no linker flags to keep in sync. It is genuinely
 // absent from some builds, though — `go run`, `go test`, and
 // `-buildvcs=false` all produce binaries with no VCS stamp — so a bare
-// "0.3" is a normal result here, not a failure to report.
+// release version is a normal result here, not a failure to report.
 var String = sync.OnceValue(func() string {
 	info, ok := debug.ReadBuildInfo()
 	if !ok {
