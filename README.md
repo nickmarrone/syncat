@@ -1,174 +1,303 @@
 # syncat
 
-syncat synchronizes directories between trusted peers. It uses
-[tailcat](https://github.com/tailscale/tailcat) for encrypted peer-to-peer
-connections.
+syncat keeps directories synchronized between trusted peers. It is a single
+binary that uses [tailcat](https://github.com/tailscale/tailcat) for encrypted
+peer-to-peer connections. It needs no Tailscale account, server, control plane,
+root access, or inbound firewall port.
 
-syncat does not need a Tailscale account, a control plane, root access, a
-server, or a peer directory. You add a peer with its token. The peers connect
-directly when possible. They use a Tailscale DERP relay when they cannot make a
-direct connection.
+You add peers by exchanging tokens. They connect directly when possible and
+use a Tailscale DERP relay when a direct path is unavailable.
 
-`syncat daemon` runs one node. The node keeps its identity, connects to its
-configured peers, watches directories, synchronizes changes, and provides a
-REST API and web UI on `127.0.0.1`. Other `syncat` commands use that API.
+Run it on your own computers or with a small group of people you trust. It is
+not a public file-sharing service: a peer with access to a read-write share can
+change its contents.
 
-Use syncat for your own computers or a small group of trusted people. Do not
-use it as a public file-sharing service.
+`syncat daemon` maintains a node identity, connects to configured peers,
+watches directories, and serves the local web UI. The other CLI commands
+configure or inspect that daemon.
 
-## Build and start
+## Install and start
 
-You need Go 1.27.1 or later. The build does not use cgo.
+Building from this checkout requires Go 1.27.1 or newer; the build does not
+use cgo.
 
 ```bash
 CGO_ENABLED=0 go build -o syncat ./cmd/syncat
-./syncat init --name my-laptop
-./syncat daemon &
+install -Dm755 syncat ~/.local/bin/syncat
+
+syncat init --name my-laptop
+syncat daemon
 ```
 
-Open `http://127.0.0.1:8347` to use the web UI. Run `./syncat -h` to see the
-CLI commands.
+Ensure `~/.local/bin` is on your `PATH`, or invoke the installed binary by its
+full path.
 
-## Version
+The daemon stays in the foreground, logs to standard error, and stops cleanly
+on `SIGINT` and `SIGTERM`. Open <http://127.0.0.1:8347> in a browser to use
+the web UI. Keep the daemon running while using daemon-backed CLI commands.
 
-This source tree reports product version `0.3`. Run `syncat version` or
-`syncat --version` to get the version of a binary. `GET /api/status` returns
-the same value in `version`. The web UI gets this value from the daemon.
+Run `syncat -h` for command usage and `syncat version` (or
+`syncat --version`) for the binary version.
 
-A build from a Git checkout can add the commit ID. For example, it can report
-`0.3+c64ce12`. A dirty checkout adds `.dirty`.
+## First sync: connect two nodes
 
-The product version is not a protocol or data format version. syncat also has:
+Every node has a secret connection token. Pairing is mutual: each node must
+add the other node's token before normal synchronization begins. Exchange
+tokens through an encrypted channel or in person.
 
-- `proto_version` in the peer handshake.
-- The `sc1` prefix in a node token.
-- SQLite `PRAGMA user_version` for the index database.
-
-## Connect two nodes
-
-This example runs two nodes on one computer. It uses separate config and data
-directories.
+This example runs Alice and Bob on one computer, using separate state
+directories and local web UI ports. On separate machines, omit the
+`--config`, `--data`, and alternate `--api` options.
 
 ```bash
-# Terminal 1: alice
-./syncat --config ~/.alice-cfg --data ~/.alice-data init --name alice
-./syncat --config ~/.alice-cfg --data ~/.alice-data daemon --api 127.0.0.1:18347 &
-
-# Terminal 2: bob
-./syncat --config ~/.bob-cfg --data ~/.bob-data init --name bob
-./syncat --config ~/.bob-cfg --data ~/.bob-data daemon --api 127.0.0.1:18348 &
-
-# Get and exchange tokens. Add each peer on both nodes.
-ALICE_TOKEN=$(./syncat --config ~/.alice-cfg --data ~/.alice-data token)
-BOB_TOKEN=$(./syncat --config ~/.bob-cfg --data ~/.bob-data token)
-./syncat --config ~/.bob-cfg --data ~/.bob-data peer add "$ALICE_TOKEN" --name alice
-./syncat --config ~/.alice-cfg --data ~/.alice-data peer add "$BOB_TOKEN" --name bob
-
-# Check the connection.
-./syncat --config ~/.alice-cfg --data ~/.alice-data status --watch
-
-# Add a share on alice. Subscribe on bob.
-./syncat --config ~/.alice-cfg --data ~/.alice-data share add ~/Documents --name docs --perm rw
-./syncat --config ~/.bob-cfg --data ~/.bob-data remote ls
-./syncat --config ~/.bob-cfg --data ~/.bob-data subscription add <alice-name-or-id> <share-name-or-id> ~/docs-from-alice --mode mirror
+# Terminal 1: Alice
+syncat --config ~/.alice-cfg --data ~/.alice-data init --name alice
+syncat --config ~/.alice-cfg --data ~/.alice-data daemon --api 127.0.0.1:18347
 ```
 
-`--api` changes the listen address of that daemon process. The CLI reads
-`api_addr` from `config.json`. Use the same `--config` and `--data` values for
-each command that controls a test node.
+```bash
+# Terminal 2: Bob
+syncat --config ~/.bob-cfg --data ~/.bob-data init --name bob
+syncat --config ~/.bob-cfg --data ~/.bob-data daemon --api 127.0.0.1:18348
+```
 
-In this example, a file in Alice's `~/Documents` appears in Bob's
-`~/docs-from-alice`. The `read-write` share and `mirror` subscription also let
-Bob send changes to Alice.
+In another terminal, get and exchange the tokens, then add the peer on both
+nodes:
 
-## Approvals
+```bash
+ALICE_TOKEN=$(syncat --config ~/.alice-cfg --data ~/.alice-data token)
+BOB_TOKEN=$(syncat --config ~/.bob-cfg --data ~/.bob-data token)
 
-An unknown node can send a valid handshake. syncat rejects that connection but
-stores its name and token as a pending peer. The operator can then approve or
-deny it.
+syncat --config ~/.alice-cfg --data ~/.alice-data peer add "$BOB_TOKEN" --name bob
+syncat --config ~/.bob-cfg --data ~/.bob-data peer add "$ALICE_TOKEN" --name alice
+
+syncat --config ~/.alice-cfg --data ~/.alice-data status --watch
+```
+
+After the peers connect, Alice offers a directory and Bob subscribes to it:
+
+```bash
+syncat --config ~/.alice-cfg --data ~/.alice-data \
+  share add ~/Documents --name docs --perm rw
+
+syncat --config ~/.bob-cfg --data ~/.bob-data remote ls
+syncat --config ~/.bob-cfg --data ~/.bob-data \
+  subscription add alice docs ~/docs-from-alice --mode mirror
+```
+
+The peer and share arguments accept a display name, a full ID, or a unique ID
+prefix. `remote ls` shows the names and IDs available to subscribe to. A file
+created in Alice's `~/Documents` now appears in Bob's `~/docs-from-alice`.
+
+`--api` applies only to that daemon process. The CLI otherwise reads
+`api_addr` from its `config.json`, so always use the same `--config` and
+`--data` pair when managing a test node.
+
+## How syncat behaves
+
+### Shares and subscriptions
+
+A **share** is a local directory you offer. A **subscription** is a local
+directory that receives a peer's share. Their permission and mode determine
+which side may send changes:
+
+| Share permission | Subscription mode | Result |
+| --- | --- | --- |
+| `read-write` (`rw`) | `mirror` | Two-way synchronization. |
+| `read-write` (`rw`) | `receive-only` (`receive`) | The subscriber receives changes but never sends them back. |
+| `read-only` (`ro`) | either mode | The share owner is the source of truth; subscriber changes are not sent. |
+
+Use a read-only share whenever the other person should not change your source
+directory. A receive-only subscription is useful for a backup or a local copy
+that must not publish edits. Local edits in a receive-only copy are reported
+as warnings and can be replaced by a later source update.
+
+Subscription and share paths must not overlap: a directory received from a
+peer cannot be offered back as a new local share. Removing a share or a
+subscription stops synchronization but deliberately leaves existing files on
+disk.
+
+### Approvals and access
+
+Adding both tokens is normally all that pairing requires. If an unknown node
+contacts this node with a valid token, syncat records it as a pending peer
+instead of accepting it. Review it with:
 
 ```bash
 syncat approvals
 syncat approvals grant peer-<peer-key>
 syncat approvals deny peer-<peer-key>
+# Equivalent peer-only approval:
+syncat peer approve peer-<peer-key>
 ```
 
-`syncat peer ls` also lists pending peers. `syncat peer approve <id>` approves
-one pending peer.
-
-Use `--approval` when you add a share to require approval for subscriptions.
-The request remains pending until you grant or deny it.
+Add `--approval` when creating a sensitive share to require a separate access
+decision for each subscription request:
 
 ```bash
 syncat share add ~/Documents --name docs --perm rw --approval
+syncat approvals
 syncat approvals grant share-<share-id>-<peer-key>
 ```
 
-The peer and share queues are stored in `config.json`. They remain after a
-restart. Each queue has a size limit.
+You can later grant, deny, or revoke a peer's access from the web UI. Revoking
+access stops future synchronization; it does not remove the peer's existing
+local copy.
 
-## Reset a node
+### Deletes, conflicts, and trash
 
-`syncat init` is safe to run again. It does not replace existing state.
-Use `syncat init --reset` only when you want a new node.
-
-```console
-$ syncat init --reset --name my-laptop
-This will PERMANENTLY delete:
-  /home/u/.config/syncat/config.json
-  /home/u/.config/syncat/api.token
-  /home/u/.local/share/syncat/keys
-  /home/u/.local/share/syncat/db
-  /home/u/.local/share/syncat/trash
-
-Your files are left in place:
-  /home/u/Documents
-
-Type RESET to confirm:
-```
-
-The reset deletes configuration, API credentials, identity keys, tailcat keys,
-the index, and the trash. It does not delete a share directory or a local copy
-of a subscription.
-
-The new node has a new identity and token. Add it again on every peer. Restore
-files from the trash before you reset the node.
-
-Stop the daemon before you reset. The command refuses to run when another
-process listens on `api_addr`. Use `--yes` only in a script that must skip the
-confirmation prompt.
-
-For a system service, run the reset as the service user:
+When syncat applies a remote delete or overwrites an existing local file, it
+first moves the replaced content to its per-share trash. Local deletions made
+by you are not put in that trash. List and restore remote changes with:
 
 ```bash
-sudo systemctl stop syncat.service
-sudo -u syncat /usr/local/bin/syncat --config /etc/syncat --data /var/lib/syncat init --reset
-sudo systemctl start syncat.service
+syncat trash ls docs
+syncat trash restore docs path/inside/the/share.txt
 ```
 
-## Run as a systemd service
+Restoring creates a new local change, so it can synchronize to peers. Trash
+entries are retained for 30 days by default.
 
-`syncat daemon` is a foreground process. It logs to standard error and stops
-cleanly on `SIGINT` and `SIGTERM`.
+If peers edit the same file while disconnected, syncat keeps both versions.
+One becomes the ordinary filename and the other is stored alongside it as a
+file named like `report.sync-conflict-YYYYMMDD-HHMMSS-<node-id>.txt`.
 
-Use a user service when possible. syncat normally stores config and data in
-the user's XDG directories. A user service uses the correct home directory and
-file owner.
+syncat watches directories and also rescans them periodically. It does not
+follow or synchronize symbolic links in this release.
 
-Build and install the binary outside the checkout:
+### Ignore files
+
+Put a `.syncatignore` file at a share root to exclude paths from that share.
+It uses familiar gitignore-style rules, including comments, `!` negation,
+anchored paths, directory rules, `*`, `?`, character classes, and `**`.
+
+```gitignore
+# Ignore editor and build output
+*.swp
+/build/
+node_modules/
+
+# Keep this generated file
+!build/keep.txt
+```
+
+Only the root `.syncatignore` is used; nested ignore files are not read. The
+ignore file itself is never synchronized, so each node can choose its own
+rules. Ignoring a path stops it from being advertised or received; it does not
+delete existing copies on peers.
+
+## Use the web UI
+
+Open the daemon's configured local address (normally
+<http://127.0.0.1:8347>). The UI polls the local daemon every two seconds and
+has two views.
+
+- **Dashboard** lets you rename the node, copy its token, add a peer, inspect
+  connection errors and available remote shares, subscribe to a remote share,
+  and remove a peer. Expand a peer to see its relationships and connection
+  details.
+- **Shares** lets you add, rename, change the permission or approval setting,
+  and remove local shares. It also provides per-peer Grant/Deny/Revoke
+  controls, pause/remove controls for subscriptions, and a trash browser with
+  Restore actions.
+
+Use the CLI for configuration settings and detailed status output; the web UI
+does not have a Settings page in this release.
+
+## CLI reference
+
+Global options go before the command:
+
+```text
+syncat [--config DIR] [--data DIR] COMMAND [ARGS...]
+```
+
+`--config` and `--data` choose alternative state directories. They are useful
+for test nodes and are required consistently for every command that manages
+one of those nodes.
+
+| Command | What it does |
+| --- | --- |
+| `init [--name NAME]` | Create missing configuration, keys, and API credentials. It is safe to run again. |
+| `init --reset [--yes] [--name NAME]` | Delete this node's state and create a new identity after confirmation. |
+| `daemon [--api ADDR]` | Run the node and local web UI. The address must be loopback. |
+| `token` | Print this node's secret connection token. |
+| `status [--watch] [--json]` | Show node, peer, share, subscription, and warning status; `--watch` refreshes every two seconds. |
+| `peer add TOKEN [--name NAME]` | Add a peer's token. Pairing must be completed on both peers. |
+| `peer ls [--json]` | List configured and pending peers. |
+| `peer rm ID` | Remove a peer and stop its synchronization. |
+| `peer approve ID` | Accept a pending peer. |
+| `share add PATH --name NAME [--perm ro\|rw] [--approval]` | Offer a directory. |
+| `share ls [--json]` | List local shares and peer access. |
+| `share set ID [--name NAME] [--perm ro\|rw] [--approval\|--no-approval]` | Change share metadata or its approval requirement. |
+| `share rm ID` | Stop offering a directory without deleting its files. |
+| `remote ls [--json]` | List shares offered by configured peers and their access status. |
+| `subscription add PEER SHARE LOCALPATH [--mode mirror\|receive]` | Receive a peer's share into a local directory. |
+| `subscription ls [--json]` | List subscriptions, connection state, access, and warnings. |
+| `subscription pause PEER SHARE` / `resume PEER SHARE` | Temporarily stop or restart a subscription. |
+| `subscription rm PEER SHARE` | Stop a subscription; local files remain. |
+| `approvals` | List pending peer and share-access requests. |
+| `approvals grant ID` / `deny ID` | Decide a pending peer or share-access request. |
+| `trash ls SHARE [--json]` | List files syncat placed in a share's trash. |
+| `trash restore SHARE PATH` | Restore a share-relative trashed path. |
+| `config set FIELD VALUE` | Change a supported scalar configuration value. |
+| `version` | Print the syncat version. |
+
+Commands that talk to the daemon are `peer`, `status`, `share`, `remote`,
+`subscription`, `approvals`, and `trash`. Start `syncat daemon` first. `init`,
+`token`, `config`, and `version` work without a running daemon.
+
+## Configuration and state
+
+By default, syncat follows the XDG base-directory convention:
+
+```text
+$XDG_CONFIG_HOME/syncat/ or ~/.config/syncat/
+  config.json                 # node name, settings, peers, shares, subscriptions
+  api.token                   # local API credential
+
+$XDG_DATA_HOME/syncat/ or ~/.local/share/syncat/
+  keys/identity.key
+  keys/tailcat.key
+  db/index.db
+  trash/
+```
+
+The generated configuration and key files contain secrets. syncat creates its
+directories with mode `0700` and its credentials with mode `0600`.
+
+Stop the daemon, use `config set` for these scalar fields, then start it again
+so the new setting is loaded:
 
 ```bash
-CGO_ENABLED=0 go build -o syncat ./cmd/syncat
-install -Dm755 syncat ~/.local/bin/syncat
-~/.local/bin/syncat init --name my-laptop
+syncat config set node_name work-laptop
+syncat config set api_addr 127.0.0.1:9347
+syncat config set trash_retention_days 14
+syncat config set rescan_interval_seconds 120
+syncat config set debug true
 ```
 
-Create `~/.config/systemd/user/syncat.service`:
+`global_ignores` is an optional JSON array in `config.json` for patterns that
+apply to every share. Stop the daemon before editing `config.json` directly,
+then restart it. Prefer a share-root `.syncatignore` when the rule applies to
+only one directory.
+
+## Reset, service operation, and upgrades
+
+`syncat init` is idempotent. Use `syncat init --reset` only when you intend to
+make a completely new node. Stop the daemon first. Reset deletes `config.json`,
+the local API credential, keys, index, and trash, but leaves share directories
+and subscription copies in place. It changes the node identity and token, so
+remove the old peer and pair the new one again on every other node. Restore any
+needed trash files before resetting. For a system-wide service, stop it and
+run reset as its dedicated service account; see the next section.
+
+For a user-level systemd service, install and initialize the binary, then
+create `~/.config/systemd/user/syncat.service`:
 
 ```ini
 [Unit]
 Description=syncat peer-to-peer directory sync
-Documentation=https://github.com/nickmarrone/syncat
 After=network-online.target
 Wants=network-online.target
 
@@ -185,185 +314,110 @@ PrivateTmp=yes
 WantedBy=default.target
 ```
 
-Start the service:
-
 ```bash
 systemctl --user daemon-reload
 systemctl --user enable --now syncat.service
-systemctl --user status syncat.service
 journalctl --user -u syncat.service -f
-loginctl enable-linger "$USER"
 ```
 
-Do not put `--api` in `ExecStart`. Set `api_addr` with `syncat config set`
-and restart the service instead. Do not use `ProtectHome=yes`. syncat must be
-able to read and write its share directories.
+Do not use `ProtectHome=yes`: the service must access the directories it
+synchronizes.
 
-syncat needs no inbound firewall port. tailcat creates outbound connections.
-Port 4197 is inside the encrypted tunnel, not a host port.
+### Run as a system-wide service
 
-## Upgrade
-
-Build, install, and restart the service:
+Use a dedicated, unprivileged account when syncat runs without a logged-in
+user. The example below stores configuration in `/etc/syncat`, node state in
+`/var/lib/syncat`, and shares data from directories that the `syncat` account
+can read and write. Adjust the account-creation command for distributions
+whose `useradd` options differ.
 
 ```bash
-git pull
 CGO_ENABLED=0 go build -o syncat ./cmd/syncat
-install -Dm755 syncat ~/.local/bin/syncat
-systemctl --user restart syncat.service
-journalctl --user -u syncat.service -n 30
+sudo install -Dm755 syncat /usr/local/bin/syncat
+
+sudo useradd --system --home-dir /var/lib/syncat --create-home \
+  --shell /usr/sbin/nologin syncat
+sudo install -d -o syncat -g syncat -m 0700 /etc/syncat /var/lib/syncat
+
+# Grant this account access to every directory you plan to share.
+sudo install -d -o syncat -g syncat -m 0700 /srv/syncat
+
+sudo -u syncat /usr/local/bin/syncat \
+  --config /etc/syncat --data /var/lib/syncat init --name fileserver
 ```
 
-Replace the binary file. Do not write through the file that the daemon is
-running. `install` replaces the file safely.
+Create `/etc/systemd/system/syncat.service`:
 
-The SQLite index migrates forward when the daemon starts. There are no down
-migrations. Before you roll back across a database change, stop the daemon and
-copy `index.db`, `index.db-wal`, and `index.db-shm` from the data directory.
+```ini
+[Unit]
+Description=syncat peer-to-peer directory sync
+Documentation=https://github.com/nickmarrone/syncat
+After=network-online.target
+Wants=network-online.target
 
-Missing fields in `config.json` get default values. An old binary can ignore a
-new field and remove it at its next config write. Do not use an old binary to
-change config after you upgrade.
+[Service]
+Type=simple
+User=syncat
+Group=syncat
+ExecStart=/usr/local/bin/syncat --config /etc/syncat --data /var/lib/syncat daemon
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+NoNewPrivileges=yes
+PrivateTmp=yes
 
-This build uses protocol version 3. It requires version 3 from peers. A v2
-peer cannot connect to a v3 peer. Upgrade all connected nodes in one change.
+[Install]
+WantedBy=multi-user.target
+```
 
-tailcat 0.6.0 changed the data in node tokens. Nodes that use an older tailcat
-address cannot connect to this build. Make new tokens and add the peers again
-when you move from a pre-0.6.0 build.
+Start and inspect the service:
 
-## Security and data handling
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now syncat.service
+sudo systemctl status syncat.service
+sudo journalctl -u syncat.service -f
+```
 
-Use syncat only with peers that you trust. A peer can send file changes after
-you grant access to a read-write share.
+Use the same account and explicit state paths for every administrative command:
+```bash
+sudo -u syncat /usr/local/bin/syncat \
+  --config /etc/syncat --data /var/lib/syncat status
 
-### Data at rest
+sudo systemctl stop syncat.service
+sudo -u syncat /usr/local/bin/syncat \
+  --config /etc/syncat --data /var/lib/syncat init --reset
+sudo systemctl start syncat.service
+```
 
-syncat does not encrypt its stored data. It uses file permissions as the local
-access control. Configuration files and key files have mode `0600`. Their
-directories have mode `0700` when syncat creates them.
+Do not initialize or reset this service as `root`: doing so can recreate its
+state as root-owned and prevent the `syncat` daemon from starting. Do not add
+`ProtectHome=yes` if any configured share or subscription path is under a home
+directory. Set `api_addr` with `config set` while the service is stopped, then
+restart it; do not put `--api` in `ExecStart`.
 
-The following files contain secrets:
+To upgrade, build and install a replacement binary, then restart the service
+or daemon. The index migrates forward when the daemon starts; back up
+`index.db`, `index.db-wal`, and `index.db-shm` before rolling back across a
+database change. Upgrade all connected nodes together when a release changes
+the protocol or token compatibility requirements.
 
-- `config.json` contains the node tokens for configured and pending peers.
-- `api.token` contains the REST API token.
-- `identity.key` contains the Ed25519 private identity key.
-- `tailcat.key` contains the tailcat private key and WireGuard pre-shared key.
+## Security and current limits
 
-Hexadecimal, JSON, CBOR, and base64 are encodings. They are not encryption.
-The SQLite index and the syncat trash are also not encrypted by syncat.
+Treat every node token as a secret. It contains the information needed to
+reach the encrypted transport, so do not put it in logs, issue trackers, or
+unencrypted backups. The application still requires the peer's configured
+identity before granting a sync session.
 
-Use full-disk encryption on each node. Also encrypt backups that contain
-syncat state or synchronized files. Full-disk encryption can protect a
-powered-off device. It does not protect an unlocked device or a running
-compromised process.
+syncat does not encrypt its configuration, keys, index, trash, or synchronized
+files at rest. Use full-disk encryption and protect backups. Use read-only
+shares and approval-required shares to limit access, and remove a compromised
+peer from every remaining node before resetting it.
 
-Application-level encryption can protect an offline copy or an exposed backup.
-It is useful only when the decryption key is separate from the encrypted data.
-It cannot protect credentials after an attacker controls the running daemon.
-
-### Node tokens and tailcat access
-
-Keep each `sc1` node token secret. The token contains a tailcat address and a
-WireGuard pre-shared key. A person who has the token can enter the tailcat
-transport and connect to the syncat service on TCP port 4197.
-
-The token alone does not authorize a syncat session. The application handshake
-also verifies the configured Ed25519 identity. An unknown identity enters the
-pending-peer queue, and syncat closes the connection.
-
-The token still gives access to code that runs before authorization. This code
-includes tailcat, the TCP framing code, and the syncat handshake. A token holder
-can also use connection attempts to consume CPU and memory.
-
-The current tailcat configuration exposes only TCP port 4197. It does not
-enable UDP or network forwarding. It does not provide shell access or a route
-to the host network or local network.
-
-If an attacker gets the complete syncat state, the attacker also gets
-`identity.key`. The attacker can then impersonate the node to peers that still
-trust that identity. The attacker can use shares that have an existing grant.
-The attacker can also request shares that do not require approval.
-
-### Protect a node
-
-- Exchange node tokens through an encrypted channel or in person.
-- Do not put tokens in logs, issue reports, or unencrypted backups.
-- On a server, run syncat as a dedicated, unprivileged account.
-- Permit the syncat account to access only the directories that it must
-  synchronize.
-- Check that syncat files have mode `0600` and syncat directories have mode
-  `0700`.
-- Require approval for sensitive shares.
-- Use read-only shares when a peer does not need to send changes.
-- Power off a portable device before you leave it in an untrusted location. A
-  suspended device can keep disk keys in memory.
-
-The API listens only on loopback. API requests need `X-Syncat-Token`. This
-control protects the API from remote network clients. It does not protect the
-API from a process that already runs as the syncat user.
-
-syncat validates every peer path before it accesses the file system. A remote
-delete moves a local file to the syncat trash. A local delete does not move the
-file to the trash. The scanner does not synchronize symbolic links in this
-release.
-
-### Respond to a compromised node
-
-Complete these steps if an attacker can read the syncat state of a node:
-
-1. Disconnect the compromised machine from the network. Stop the syncat
-   daemon.
-2. Run `syncat peer rm ID` on every peer to remove the old node. Do this before
-   you reset the compromised node. A reset on one node does not revoke its old
-   identity on other nodes.
-3. Reinstall the operating system or restore a known-good system image.
-4. Run `syncat init --reset` on the compromised node. This command creates a
-   new identity and a new tailcat token.
-5. Add the rebuilt node to each peer again.
-
-The compromised state also contains the node tokens of its peers. Removing the
-compromised Ed25519 identity prevents an authorized syncat session. It does not
-invalidate the copied tailcat tokens. A copied token can still reach TCP port
-4197 on the node that issued the token.
-
-To invalidate a copied tailcat token, rotate the tailcat identity of the node
-that issued the token. The current supported rotation procedure is
-`syncat init --reset`. This procedure also deletes that node's syncat
-configuration, index, and trash. It changes the node identity and affects all
-of its peer relationships. It does not delete share directories or local
-subscription copies. Save required files from the trash before the reset. Add
-all peers again after the reset.
-
-## Known limits
-
-- Only the `.syncatignore` file at the root of a share provides rules.
-- Transfer resume is not available. A failed transfer starts at byte zero.
-- Status has cumulative transport telemetry. It does not provide progress for
-  each transfer.
-- Deleted-file tombstones remain in the index.
-- The web UI polls the API. `GET /api/events` is not available.
-- The web UI has no Settings page.
-- syncat does not provide block-level delta transfer or mobile bindings.
-
-## Transport and protocol
-
-The protocol uses one framed connection for each peer. The writer has four
-bounded queues: urgent messages, ordered control messages, replaceable current
-state messages, and bulk file data. A write deadline stops a blocked peer from
-holding the connection forever.
-
-Index synchronization uses acknowledged snapshots or journal deltas. syncat
-coalesces repeated index work for one share. Transfers have IDs. A cancel
-message stops a live transfer and releases blocked work.
-
-`GET /api/status` and `syncat status --json` report low-cardinality network
-data. The data includes connection state, queues, transfers, writer results,
-and rejected protocol work.
-
-Section 11 of [SPEC.md](SPEC.md) records future security and transfer work.
-Other protocol work includes buffered frame I/O, `testing/synctest` for time
-tests, and one stream for each file transfer.
+Current limits include no transfer resume, no per-transfer progress display,
+no mobile bindings, no block-level delta transfer, no settings page, and no
+event stream. See [MANUAL-TESTS.md](MANUAL-TESTS.md) for real-world test
+coverage and [ARCHITECTURE.md](ARCHITECTURE.md) for implementation details.
 
 ## Development
 
@@ -372,34 +426,6 @@ CGO_ENABLED=0 go build ./...
 go vet ./...
 go test -count=1 ./...
 go test -race ./...
-go test -fuzz=FuzzDecode ./internal/protocol
 scripts/e2e.sh
 scripts/run-net-tests.sh
-scripts/run-net-tests.sh --soak
 ```
-
-`modernc.org/sqlite` is pure Go. This keeps the core packages free of cgo.
-
-`scripts/e2e.sh` starts two real daemons and tests synchronization, deletes,
-trash, and conflicts. `scripts/run-net-tests.sh` tests network failures. It
-tests peer restarts, offline changes, peer removal, permission changes, and
-three-node propagation. The soak tests also test long idle connections and
-large relay transfers.
-
-## Project layout
-
-There are ten source packages and 46 production Go source files. See
-[ARCHITECTURE.md](ARCHITECTURE.md) for package and data-flow details.
-
-| Package | Main contents |
-|---|---|
-| `cmd/syncat/` | CLI commands and REST client |
-| `internal/api/` | REST routes, authentication, handlers, and DTOs |
-| `internal/config/` | Config, keys, tokens, and XDG paths |
-| `internal/core/` | Node, peers, approvals, mutations, and status |
-| `internal/index/` | SQLite index, scanner, ignore rules, and watcher |
-| `internal/protocol/` | Wire messages, handshake, writer, and keepalive |
-| `internal/sync/` | Reconciliation, sessions, dispatch, transfer, apply, and trash |
-| `internal/transport/` | tailcat and test transports |
-| `internal/webui/` | Embedded web UI |
-| `internal/version/` | Product version |
