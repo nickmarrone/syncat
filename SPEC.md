@@ -91,8 +91,9 @@ sc1<base64url(CBOR{
 
 Prefix `sc1` versions the token format. `syncat token` prints it; the UI shows it with
 a copy button. Treat it as a secret: the `tc` address embeds a WireGuard pre-shared
-key, and possession lets someone *attempt* to connect (they still land in the
-pending-approval list below).
+key. A token holder can enter the tailcat transport and connect to TCP port 4197.
+The syncat handshake then requires a configured Ed25519 identity. An unknown identity
+enters the pending-approval list, and syncat closes the connection.
 
 The `tc` address is not version-negotiated. Its contents changed in tailcat 0.3.0
 (disco key) and 0.6.0 (pre-shared key), and nodes on either side of those changes
@@ -346,7 +347,75 @@ gitignore matcher; none of the Go ones carry a tagged release, so
 `.syncatignore` matching is implemented in-tree instead and the budget spends
 nothing on it.)
 
-## 11. Block-level delta transfer (v2 — design now, build later)
+## 11. Future work
+
+### Security
+
+The following tasks reduce the effect of a copied token or copied node state. These
+tasks are not part of the current implementation.
+
+#### Transport authorization and revocation
+
+- Give each outbound peer relationship a stable tailcat client identity. Do not reuse
+  the tailcat server key as a client key. Do not reuse one client key in independent
+  tailcat clients because their DERP registrations can conflict.
+- Persist the expected transport client key with each approved peer. Configure
+  `tailcat.Server.AllowedClients` before the server accepts normal traffic.
+- Extend the tailcat allowlist so an empty list can deny all clients. The current
+  empty list permits all clients.
+- Add a bounded pairing mode for a new transport client. Enable this mode only after a
+  local user starts pairing. Require application authentication and approval before
+  the program adds the transport client key to the allowlist.
+- Extend tailcat or the transport wrapper so syncat can get the authenticated client
+  key from an accepted connection. The same interface must remove a client key and
+  close its connections when the user removes a peer.
+- Bind the signed syncat handshake to the tailcat connection and its authenticated
+  client key. Reject a handshake that an intermediary relays through another tailcat
+  connection.
+- Add per-client pre-shared keys or another per-peer transport credential to tailcat.
+  Use a different credential for each peer so the user can revoke one peer.
+- Add a command that rotates the tailcat server key and pre-shared key without deleting
+  the configuration, index, or trash. Reject the old tailcat address after rotation.
+  Require a new token exchange with every peer.
+
+#### Pre-authentication resource limits
+
+- Put a limit on tailcat client records. Remove inactive client records after a fixed
+  interval.
+- Rate-limit new transport client keys and failed application handshakes. Keep a limit
+  for each client key and a total limit for the node.
+- Keep TCP port 4197 as the only accepted tailcat port. Keep UDP and forwarding
+  disabled unless a later feature has a reviewed requirement for them.
+- Add tests that create many ephemeral client keys. Verify that client state, memory,
+  CPU work, pending approvals, and log output stay within fixed limits.
+- Add a relay test with a modified peer token and two tailcat connections. Verify that
+  channel binding rejects the relayed application handshake.
+
+#### Credential storage
+
+- Remove peer tokens and pending-peer tokens from the configuration file. Store
+  them with `identity.key`, `tailcat.key`, and future transport client private
+  keys in a versioned encrypted credential store.
+- Use envelope encryption. Encrypt the credential data with a random 256-bit data key
+  and XChaCha20-Poly1305. Use a new random nonce for each atomic write.
+- Add a credential-key provider interface. One provider derives a wrapping key from an
+  interactive passphrase with Argon2id. Other providers use an operating-system
+  credential service or a TPM for unattended operation.
+- Do not store the wrapping key with the encrypted credential store. Do not derive the
+  key from a hostname, machine identifier, API token, or constant in the program.
+- Generate a new REST API token at each daemon start. Store it in the platform runtime
+  directory instead of persistent configuration storage.
+- Make plaintext-to-encrypted migration atomic and restart-safe. Verify the encrypted
+  store before removal of plaintext files. Warn the user that old backups and file
+  system snapshots can retain plaintext credentials.
+- Define backup, recovery, key rotation, and lost-key behavior before implementation.
+  State that encrypted storage protects offline data. It does not protect credentials
+  after an attacker controls the running daemon.
+- Add tests for a wrong passphrase, a missing key provider, modified ciphertext, an
+  interrupted write, migration restart, credential rotation, and stable node identity
+  after a restart.
+
+### Block-level delta transfer (v2 — design now, build later)
 
 Written up so v1 choices don't paint us into a corner:
 
