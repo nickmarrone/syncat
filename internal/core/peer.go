@@ -177,7 +177,7 @@ type peerConn struct {
 	sessCancel    context.CancelFunc // ends the current session; see notePeerRedialed
 	session       *syncsvc.Session
 	conn          net.Conn
-	activeShares  map[string]bool // shareIDs currently added on session, for propagateShare
+	activeShares  map[string]bool // shareIDs syncing on session; written only by the share-set methods
 	connDone      chan struct{}   // closed when the current connection ends
 	network       peerNetworkCounters
 	sessionTotals syncsvc.SessionStats
@@ -837,15 +837,6 @@ func (pc *peerConn) disable(reason string) {
 	pc.mu.Unlock()
 }
 
-func (pc *peerConn) markShareActive(shareID string) {
-	pc.mu.Lock()
-	if pc.activeShares == nil {
-		pc.activeShares = map[string]bool{}
-	}
-	pc.activeShares[shareID] = true
-	pc.mu.Unlock()
-}
-
 // currentSession returns the session for this peer's active connection,
 // or nil if it is not connected right now.
 func (pc *peerConn) currentSession() *syncsvc.Session {
@@ -853,6 +844,42 @@ func (pc *peerConn) currentSession() *syncsvc.Session {
 	s := pc.session
 	pc.mu.Unlock()
 	return s
+}
+
+// --- share set ---
+//
+// A share is "active" on this peer when its live Session syncs it. That is
+// two pieces of state: the Session's own share table (sess.AddShare) and
+// activeShares, which propagation and status read. The methods below are the
+// only writers of either, and each changes both under pc.mu, so no reader
+// sees one updated without the other and a grant cannot interleave with a
+// neuter. Session.AddShare takes only its own leaf lock, so calling it with
+// pc.mu held is safe.
+
+// grantShare makes shareID sync on sess with the given root and direction,
+// and counts it active for propagation. sess is passed explicitly because
+// the read-loop callers (provisionShareForRequest, provisionAccessUpdate)
+// must provision the session whose frame they are handling. If that session
+// has since been replaced, the share is still added to it (harmless; it is
+// shutting down), but it is not marked active on the replacement.
+func (pc *peerConn) grantShare(sess *syncsvc.Session, shareID, root string, dir syncsvc.Direction) {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+	sess.AddShare(syncsvc.ShareConfig{ShareID: shareID, Root: root, Direction: dir, Ignore: pc.node.shareIgnoreFunc(shareID)})
+	if pc.session == sess && pc.activeShares != nil {
+		pc.activeShares[shareID] = true
+	}
+}
+
+// reconfigureShare replaces root and direction for shareID on the current
+// session, but only if the share is already active there. It never grants.
+func (pc *peerConn) reconfigureShare(shareID, root string, dir syncsvc.Direction) {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+	if pc.session == nil || !pc.activeShares[shareID] {
+		return
+	}
+	pc.session.AddShare(syncsvc.ShareConfig{ShareID: shareID, Root: root, Direction: dir, Ignore: pc.node.shareIgnoreFunc(shareID)})
 }
 
 // neuterShare blocks a share on this peer's current session, if any (both
@@ -863,14 +890,22 @@ func (pc *peerConn) currentSession() *syncsvc.Session {
 // Root here is safe.
 func (pc *peerConn) neuterShare(shareID string) {
 	pc.mu.Lock()
-	sess := pc.session
-	if pc.activeShares != nil {
-		delete(pc.activeShares, shareID)
+	defer pc.mu.Unlock()
+	delete(pc.activeShares, shareID)
+	if pc.session != nil {
+		pc.session.AddShare(syncsvc.ShareConfig{ShareID: shareID, Direction: syncsvc.Direction{InboundBlocked: true, OutboundBlocked: true}})
 	}
-	pc.mu.Unlock()
-	if sess != nil {
-		sess.AddShare(syncsvc.ShareConfig{ShareID: shareID, Direction: syncsvc.Direction{InboundBlocked: true, OutboundBlocked: true}})
+}
+
+// activeSession returns the current session if shareID is active on it,
+// or nil.
+func (pc *peerConn) activeSession(shareID string) *syncsvc.Session {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+	if !pc.activeShares[shareID] {
+		return nil
 	}
+	return pc.session
 }
 
 func (pc *peerConn) setRemoteShares(entries []protocol.ShareListEntry) {

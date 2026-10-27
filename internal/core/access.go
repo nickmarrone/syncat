@@ -59,8 +59,7 @@ func (n *Node) provisionShareForRequest(pc *peerConn, sess *syncsvc.Session, sha
 	if access != protocol.AccessGranted {
 		return share, access, true
 	}
-	sess.AddShare(syncsvc.ShareConfig{ShareID: shareID, Root: share.Path, Direction: syncsvc.DirectionFor(share.Permission, ""), Ignore: n.shareIgnoreFunc(shareID)})
-	pc.markShareActive(shareID)
+	pc.grantShare(sess, shareID, share.Path, syncsvc.DirectionFor(share.Permission, ""))
 	return share, access, true
 }
 
@@ -109,9 +108,7 @@ func (n *Node) provisionAccessUpdate(pc *peerConn, sess *syncsvc.Session, msg pr
 		if subCopy.Paused {
 			return false
 		}
-		direction := syncsvc.DirectionFor("", subCopy.Mode)
-		sess.AddShare(syncsvc.ShareConfig{ShareID: msg.ShareID, Root: subCopy.LocalPath, Direction: direction, Ignore: n.shareIgnoreFunc(msg.ShareID)})
-		pc.markShareActive(msg.ShareID)
+		pc.grantShare(sess, msg.ShareID, subCopy.LocalPath, syncsvc.DirectionFor("", subCopy.Mode))
 		return true
 
 	case protocol.AccessDenied, protocol.AccessRevoked:

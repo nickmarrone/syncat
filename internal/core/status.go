@@ -290,7 +290,7 @@ func (pc *peerConn) remoteShareStatuses() []RemoteShareStatus {
 func (pc *peerConn) subscriptionState(shareID string) (access string, connected bool, warnings []WarningStatus, shareName string) {
 	pc.mu.Lock()
 	access = pc.subAccess[shareID]
-	connected = pc.activeShares != nil && pc.activeShares[shareID]
+	connected = pc.activeShares[shareID]
 	for _, e := range pc.remoteShares {
 		if e.ShareID == shareID {
 			shareName = e.Name

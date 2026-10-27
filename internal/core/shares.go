@@ -304,11 +304,8 @@ func (n *Node) propagateShareExcept(ctx context.Context, shareID string, except 
 		if pc == except {
 			continue
 		}
-		pc.mu.Lock()
-		sess := pc.session
-		active := pc.activeShares != nil && pc.activeShares[shareID]
-		pc.mu.Unlock()
-		if sess == nil || !active {
+		sess := pc.activeSession(shareID)
+		if sess == nil {
 			continue
 		}
 		if err := sess.SyncShare(ctx, shareID); err != nil {

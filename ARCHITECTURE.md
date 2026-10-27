@@ -557,6 +557,9 @@ flowchart LR
 - A removed or revoked share cannot be removed from a live session. Core
   "neuters" it by setting both direction flags. A new connection never adds it
   again.
+- `peerConn.grantShare`, `reconfigureShare`, and `neuterShare` are the only
+  code that changes which shares a session syncs. Each one updates the
+  session's share table and `activeShares` together under `pc.mu`.
 - Inbound admission is limited to 32 concurrent handshakes and 4 for each
   known peer.
 

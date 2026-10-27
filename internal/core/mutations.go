@@ -349,13 +349,7 @@ func (n *Node) SetSharePermission(shareRef, permission string) error {
 	}
 	direction := syncsvc.DirectionFor(permission, "")
 	for _, pc := range n.snapshotPeers() {
-		pc.mu.Lock()
-		sess := pc.session
-		active := pc.activeShares != nil && pc.activeShares[shareID]
-		pc.mu.Unlock()
-		if sess != nil && active {
-			sess.AddShare(syncsvc.ShareConfig{ShareID: shareID, Root: root, Direction: direction, Ignore: n.shareIgnoreFunc(shareID)})
-		}
+		pc.reconfigureShare(shareID, root, direction)
 	}
 	n.broadcastShareList()
 	n.debugf("core: share %s permission set to %s", shareID, permission)
@@ -440,8 +434,7 @@ func (n *Node) SetShareAccess(shareRef, peerRef, access string) error {
 	// particular, a grant must make the share available before the peer can
 	// react to AccessUpdate, while every non-grant must fail closed first.
 	if access == protocol.AccessGranted {
-		sess.AddShare(syncsvc.ShareConfig{ShareID: shareID, Root: share.Path, Direction: syncsvc.DirectionFor(share.Permission, ""), Ignore: n.shareIgnoreFunc(shareID)})
-		pc.markShareActive(shareID)
+		pc.grantShare(sess, shareID, share.Path, syncsvc.DirectionFor(share.Permission, ""))
 	} else {
 		pc.neuterShare(shareID)
 	}
