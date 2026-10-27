@@ -122,7 +122,7 @@ type Session struct {
 
 	// The hooks from SessionOptions. Each may be nil. They are fixed at
 	// construction, so the read loop reads them without a lock.
-	onControl func(typ protocol.MsgType, payload []byte)
+	onControl func(s *Session, typ protocol.MsgType, payload []byte) ControlResult
 	onFrame   func(typ protocol.MsgType)
 	onApplied func(shareID string)
 
@@ -272,20 +272,9 @@ func (s *Session) Stats() SessionStats {
 	}
 }
 
-func (s *Session) protocolViolation() { s.stats.protocolViolations.Add(1) }
-
-// RecordProtocolViolation lets the core control-message dispatcher account
-// for invalid post-handshake frames handled outside Session's data-plane table.
-func (s *Session) RecordProtocolViolation() { s.protocolViolation() }
-
-func (s *Session) rejectShareOperation() {
-	s.stats.rejectedShareOperations.Add(1)
-}
-
-// RecordRejectedShareOperation accounts for a control-plane share request
-// rejected before it becomes active on this session.
-func (s *Session) RecordRejectedShareOperation() { s.rejectShareOperation() }
-func (s *Session) rejectWork()                   { s.stats.rejectedWork.Add(1) }
+func (s *Session) protocolViolation()    { s.stats.protocolViolations.Add(1) }
+func (s *Session) rejectShareOperation() { s.stats.rejectedShareOperations.Add(1) }
+func (s *Session) rejectWork()           { s.stats.rejectedWork.Add(1) }
 
 func (s *Session) decodeWire(payload []byte, dst any) bool {
 	if err := protocol.DecodeAndValidateMessage(payload, dst); err != nil {
@@ -338,12 +327,13 @@ type SessionOptions struct {
 
 	// OnControl is called, synchronously from the read loop, for every frame
 	// type this Session does not handle itself: Hello, Auth, ShareList,
-	// SubscribeRequest, AccessUpdate (see readLoop).
-	// internal/core uses it to drive the peering flow (SPEC.md §2, §4, §6)
-	// on the connection Session reads exclusively. It runs on the read loop
-	// goroutine like every other dispatch here, so it should not block for
-	// long. Start a goroutine for anything that does I/O.
-	OnControl func(typ protocol.MsgType, payload []byte)
+	// SubscribeRequest, AccessUpdate (see readLoop). s is the Session that
+	// read the frame. internal/core uses it to drive the peering flow
+	// (SPEC.md §2, §6) on the connection Session reads exclusively. It runs
+	// on the read loop goroutine like every other dispatch here, so it
+	// should not block for long. Start a goroutine for anything that does
+	// I/O. The ControlResult it returns is counted in SessionStats.
+	OnControl func(s *Session, typ protocol.MsgType, payload []byte) ControlResult
 
 	// OnFrame is called once per frame read, of any type, before dispatch.
 	// It observes; it cannot change how the frame is handled.
@@ -370,6 +360,21 @@ type SessionOptions struct {
 	// while reconcileMu is held for that share.
 	OnApplied func(shareID string)
 }
+
+// ControlResult is what SessionOptions.OnControl reports about one frame.
+// Session counts the failures in SessionStats.
+type ControlResult uint8
+
+const (
+	// ControlHandled means the frame was valid and acted on.
+	ControlHandled ControlResult = iota
+	// ControlProtocolViolation means the frame did not decode, or its type
+	// is not allowed after the handshake. It counts in ProtocolViolations.
+	ControlProtocolViolation
+	// ControlRejected means a valid share request named a share this node
+	// will not provision. It counts in RejectedShareOperations.
+	ControlRejected
+)
 
 // NewSession constructs a Session over conn. nodeID is this node's own
 // ShortID, used to bump version vectors on conflict resolution. peerID is
@@ -1198,7 +1203,12 @@ func (s *Session) readLoop(stopKeepalive context.CancelFunc) {
 		// Handshake/share-list/access messages are owned by the
 		// core control plane. Session remains the connection's sole reader.
 		if s.onControl != nil {
-			s.onControl(typ, payload)
+			switch s.onControl(s, typ, payload) {
+			case ControlProtocolViolation:
+				s.protocolViolation()
+			case ControlRejected:
+				s.rejectShareOperation()
+			}
 		}
 	}
 }

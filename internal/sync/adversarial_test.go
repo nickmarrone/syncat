@@ -96,7 +96,7 @@ func seedDispatchFileChunk(f *testing.F, hdr protocol.FileChunkHeader, data []by
 	f.Add(uint8(protocol.MsgFileChunk), append([]byte(nil), frame.Bytes()[5:]...))
 }
 
-func decodeControlForFuzz(typ protocol.MsgType, payload []byte) {
+func decodeControlForFuzz(_ *Session, typ protocol.MsgType, payload []byte) ControlResult {
 	switch typ {
 	case protocol.MsgShareList:
 		var m protocol.ShareList
@@ -106,12 +106,6 @@ func decodeControlForFuzz(typ protocol.MsgType, payload []byte) {
 		_ = protocol.DecodeAndValidateMessage(payload, &m)
 	case protocol.MsgAccessUpdate:
 		var m protocol.AccessUpdate
-		_ = protocol.DecodeAndValidateMessage(payload, &m)
-	case protocol.MsgPing:
-		var m protocol.Ping
-		_ = protocol.DecodeAndValidateMessage(payload, &m)
-	case protocol.MsgPong:
-		var m protocol.Pong
 		_ = protocol.DecodeAndValidateMessage(payload, &m)
 	case protocol.MsgHello:
 		var m protocol.Hello
@@ -123,4 +117,5 @@ func decodeControlForFuzz(typ protocol.MsgType, payload []byte) {
 		var m protocol.Finished
 		_ = protocol.DecodeAndValidateMessage(payload, &m)
 	}
+	return ControlHandled
 }

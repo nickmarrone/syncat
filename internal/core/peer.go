@@ -411,10 +411,7 @@ func (pc *peerConn) offer(ctx context.Context, conn net.Conn, result *protocol.H
 
 	node := pc.node
 	sessCtx, cancel := context.WithCancel(pc.ctx)
-	// sess is captured by OnControl before it is assigned. That is safe:
-	// the read loop, the only caller, starts in sess.Start below.
-	var sess *syncsvc.Session
-	sess = syncsvc.NewSession(conn, node.store, node.identity.ShortID(), pc.peerShort, syncsvc.SessionOptions{
+	sess := syncsvc.NewSession(conn, node.store, node.identity.ShortID(), pc.peerShort, syncsvc.SessionOptions{
 		Clock:  asProtocolClock(node.clock),
 		Logger: node.logger,
 		// So sync's lines say "peer laptop" like core's, not a bare hex
@@ -422,8 +419,8 @@ func (pc *peerConn) offer(ctx context.Context, conn net.Conn, result *protocol.H
 		PeerLabel: pc.name,
 		Debug:     node.debugEnabled(),
 		Trash:     node.trash,
-		OnControl: func(typ protocol.MsgType, payload []byte) {
-			pc.handleControl(sessCtx, sess, typ, payload)
+		OnControl: func(sess *syncsvc.Session, typ protocol.MsgType, payload []byte) syncsvc.ControlResult {
+			return pc.handleControl(sessCtx, sess, typ, payload)
 		},
 		// SPEC.md §5's fan-out: a change this peer sent us has to reach the
 		// share's *other* peers, and this session is the only thing that
@@ -555,28 +552,27 @@ func (pc *peerConn) runConnection(sessCtx context.Context, cancel context.Cancel
 
 // handleControl dispatches one frame Session's own read loop doesn't
 // handle (see syncsvc.SessionOptions.OnControl): ShareList,
-// SubscribeRequest, and AccessUpdate. Runs synchronously on
+// SubscribeRequest, and AccessUpdate, and reports the outcome for sess
+// to count. Runs synchronously on
 // the session's read-loop goroutine; anything that does I/O (config
 // persistence, a store-backed rescan) is handed off via node.goTracked so
 // the read loop is never blocked by it.
-func (pc *peerConn) handleControl(ctx context.Context, sess *syncsvc.Session, typ protocol.MsgType, payload []byte) {
+func (pc *peerConn) handleControl(ctx context.Context, sess *syncsvc.Session, typ protocol.MsgType, payload []byte) syncsvc.ControlResult {
 	node := pc.node
 	switch typ {
 	case protocol.MsgShareList:
 		var msg protocol.ShareList
 		if err := protocol.DecodeAndValidateMessage(payload, &msg); err != nil {
-			sess.RecordProtocolViolation()
 			node.logger.Printf("core: peer %s: decode ShareList: %v", pc.name, err)
-			return
+			return syncsvc.ControlProtocolViolation
 		}
 		pc.setRemoteShares(msg.Shares)
 
 	case protocol.MsgSubscribeRequest:
 		var msg protocol.SubscribeRequest
 		if err := protocol.DecodeAndValidateMessage(payload, &msg); err != nil {
-			sess.RecordProtocolViolation()
 			node.logger.Printf("core: peer %s: decode SubscribeRequest: %v", pc.name, err)
-			return
+			return syncsvc.ControlProtocolViolation
 		}
 		// provisionShareForRequest's sess.AddShare must happen here, on
 		// the read-loop goroutine, not inside the goTracked closure below.
@@ -584,17 +580,15 @@ func (pc *peerConn) handleControl(ctx context.Context, sess *syncsvc.Session, ty
 		// happens-before ordering that the async work here relies on.
 		share, access, ok := node.provisionShareForRequest(pc, sess, msg.ShareID)
 		if !ok {
-			sess.RecordRejectedShareOperation()
-			return
+			return syncsvc.ControlRejected
 		}
 		node.goTracked(func() { node.finishSubscribeRequest(pc, share, access) })
 
 	case protocol.MsgAccessUpdate:
 		var msg protocol.AccessUpdate
 		if err := protocol.DecodeAndValidateMessage(payload, &msg); err != nil {
-			sess.RecordProtocolViolation()
 			node.logger.Printf("core: peer %s: decode AccessUpdate: %v", pc.name, err)
-			return
+			return syncsvc.ControlProtocolViolation
 		}
 		if needsFinish := node.provisionAccessUpdate(pc, sess, msg); needsFinish {
 			node.goTracked(func() { node.finishAccessUpdate(ctx, sess, msg.ShareID) })
@@ -603,8 +597,9 @@ func (pc *peerConn) handleControl(ctx context.Context, sess *syncsvc.Session, ty
 	default:
 		// Hello/Auth: shouldn't arrive post-handshake from a well-behaved
 		// peer; count and ignore defensively rather than treating it as fatal.
-		sess.RecordProtocolViolation()
+		return syncsvc.ControlProtocolViolation
 	}
+	return syncsvc.ControlHandled
 }
 
 // setState moves the peer to s unless a connection is currently adopted.

@@ -32,10 +32,11 @@ func TestUnauthorizedSnapshotAndAckDoNotCreateState(t *testing.T) {
 	a, b := newTestNode(t, "admissionA"), newTestNode(t, "admissionB")
 	processed := make(chan struct{}, 1)
 	sa, _ := connectSessionsWithOptions(t, a, b, Direction{}, Direction{}, SessionOptions{}, SessionOptions{
-		OnControl: func(typ protocol.MsgType, _ []byte) {
+		OnControl: func(_ *Session, typ protocol.MsgType, _ []byte) ControlResult {
 			if typ == protocol.MsgShareList {
 				processed <- struct{}{}
 			}
+			return ControlHandled
 		},
 	})
 	const unknown = "advertised-but-ungranted"
@@ -124,4 +125,32 @@ func TestIndexAckRequiresMatchingSnapshot(t *testing.T) {
 	if !s.acceptIndexAck(protocol.IndexAck{ShareID: "share", Epoch: "epoch", AppliedSeq: 9, SnapshotID: "snapshot-good"}) {
 		t.Fatal("ack for the transmitted snapshot was rejected")
 	}
+}
+
+// TestControlResultsAreCounted checks that Session, not its owner, counts
+// what OnControl reports, so the owner never reaches back into the Session
+// to bump a counter.
+func TestControlResultsAreCounted(t *testing.T) {
+	a, b := newTestNode(t, "controlA"), newTestNode(t, "controlB")
+	sa, sb := connectSessionsWithOptions(t, a, b, Direction{}, Direction{}, SessionOptions{}, SessionOptions{
+		OnControl: func(_ *Session, typ protocol.MsgType, _ []byte) ControlResult {
+			switch typ {
+			case protocol.MsgShareList:
+				return ControlProtocolViolation
+			case protocol.MsgSubscribeRequest:
+				return ControlRejected
+			}
+			return ControlHandled
+		},
+	})
+	if err := sa.writer.WriteMessage(protocol.MsgShareList, protocol.ShareList{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := sa.writer.WriteMessage(protocol.MsgSubscribeRequest, protocol.SubscribeRequest{ShareID: testShareID}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		st := sb.Stats()
+		return st.ProtocolViolations == 1 && st.RejectedShareOperations == 1
+	})
 }
