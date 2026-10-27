@@ -45,7 +45,7 @@ func TestSessionStartHasExplicitLifecycleErrors(t *testing.T) {
 	near, far := net.Pipe()
 	defer far.Close()
 	n := newTestNode(t, "n")
-	s := NewSession(near, n.store, n.id, "peer", nil, log.New(io.Discard, "", 0))
+	s := NewSession(near, n.store, n.id, "peer", SessionOptions{Logger: log.New(io.Discard, "", 0)})
 	if err := s.Start(context.Background()); err != nil {
 		t.Fatalf("first Start = %v", err)
 	}
@@ -64,7 +64,7 @@ func TestSessionConcurrentStartsLaunchExactlyOnce(t *testing.T) {
 	near, far := net.Pipe()
 	defer far.Close()
 	n := newTestNode(t, "n")
-	s := NewSession(near, n.store, n.id, "peer", nil, log.New(io.Discard, "", 0))
+	s := NewSession(near, n.store, n.id, "peer", SessionOptions{Logger: log.New(io.Discard, "", 0)})
 	defer s.Close()
 	const callers = 32
 	results := make(chan error, callers)
@@ -93,7 +93,7 @@ func TestSessionConcurrentStartsLaunchExactlyOnce(t *testing.T) {
 
 func TestSessionCloseBeforeStartPreventsLaterStart(t *testing.T) {
 	n := newTestNode(t, "n")
-	s := NewSession(nil, n.store, n.id, "peer", nil, log.New(io.Discard, "", 0))
+	s := NewSession(nil, n.store, n.id, "peer", SessionOptions{Logger: log.New(io.Discard, "", 0)})
 	if err := s.Close(); err != nil {
 		t.Fatalf("Close = %v", err)
 	}
@@ -131,7 +131,7 @@ func silentPeerSession(t *testing.T, stall time.Duration) *Session {
 	go func() { _, _ = io.Copy(io.Discard, far) }()
 
 	n := newTestNode(t, "n")
-	s := NewSession(near, n.store, n.id, "peer", nil, log.New(io.Discard, "", 0))
+	s := NewSession(near, n.store, n.id, "peer", SessionOptions{Logger: log.New(io.Discard, "", 0)})
 	s.testPullStallTimeout = stall
 	ctx, cancel := context.WithCancel(context.Background())
 	if err := s.Start(ctx); err != nil {
@@ -232,7 +232,7 @@ func TestPullFileWriterNotStartedBeforeStart(t *testing.T) {
 	t.Cleanup(func() { _ = near.Close(); _ = far.Close() })
 
 	n := newTestNode(t, "n")
-	s := NewSession(near, n.store, n.id, "peer", nil, log.New(io.Discard, "", 0))
+	s := NewSession(near, n.store, n.id, "peer", SessionOptions{Logger: log.New(io.Discard, "", 0)})
 
 	var buf bytes.Buffer
 	_, err := s.pullFile(context.Background(), testShareID, "a.txt", nil, -1, &buf)
@@ -293,7 +293,7 @@ func TestCancelTransferCancelsActiveServe(t *testing.T) {
 func TestSessionStatsCountStaleTransferFrames(t *testing.T) {
 	now := time.Now()
 	var logs bytes.Buffer
-	s := NewSession(nil, nil, "self", "peer", func() time.Time { return now }, log.New(&logs, "", 0))
+	s := NewSession(nil, nil, "self", "peer", SessionOptions{Clock: func() time.Time { return now }, Logger: log.New(&logs, "", 0)})
 	for range 100 {
 		s.routeChunk("11111111111111111111111111111111", pullChunk{})
 	}
@@ -318,7 +318,7 @@ func TestSessionStatsCountStaleTransferFrames(t *testing.T) {
 // is fine, the same trick session_test's trash helpers use.
 func newWarningSession(t *testing.T) *Session {
 	t.Helper()
-	return NewSession(nil, nil, "self", "peerid", nil, log.New(io.Discard, "", 0))
+	return NewSession(nil, nil, "self", "peerid", SessionOptions{Logger: log.New(io.Discard, "", 0)})
 }
 
 func warningPaths(s *Session) []string {

@@ -501,7 +501,7 @@ func (s *Session) replaceWithTrashHook(ctx context.Context, shareID, relpath, de
 // If s.trash is nil (no Trash configured, e.g. a test exercising apply
 // logic that doesn't care about trash, or trash deliberately disabled),
 // this is a no-op, matching this hook's pre-Phase-6 behavior. Once a Trash
-// is set via SetTrash, every call site above gets real trash-can behavior
+// is set via SessionOptions.Trash, every call site above gets real trash-can behavior
 // with no further change to this file: the hook always runs strictly
 // before its caller's destructive step, and an error here aborts that
 // step rather than proceeding to destroy data.

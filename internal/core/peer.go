@@ -413,28 +413,33 @@ func (pc *peerConn) offer(ctx context.Context, conn net.Conn, result *protocol.H
 
 	node := pc.node
 	sessCtx, cancel := context.WithCancel(pc.ctx)
-	sess := syncsvc.NewSession(conn, node.store, node.identity.ShortID(), pc.peerShort, asSyncClock(node.clock), node.logger)
-	sess.SetTrash(node.trash)
-	// So sync's lines say "peer laptop" like core's, not a bare hex ShortID
-	// the reader has to look up in `syncat peer ls`.
-	sess.SetPeerLabel(pc.name)
-	sess.SetDebug(node.debugEnabled())
-
 	ka := protocol.NewKeepalive(asProtocolClock(node.clock), 0, 0)
+	// sess is captured by OnControl before it is assigned. That is safe:
+	// the read loop, the only caller, starts in sess.Start below.
+	var sess *syncsvc.Session
+	sess = syncsvc.NewSession(conn, node.store, node.identity.ShortID(), pc.peerShort, syncsvc.SessionOptions{
+		Clock:  asSyncClock(node.clock),
+		Logger: node.logger,
+		// So sync's lines say "peer laptop" like core's, not a bare hex
+		// ShortID the reader has to look up in `syncat peer ls`.
+		PeerLabel: pc.name,
+		Debug:     node.debugEnabled(),
+		Trash:     node.trash,
+		OnFrame:   func(protocol.MsgType) { ka.RecordReceived() },
+		OnControl: func(typ protocol.MsgType, payload []byte) {
+			pc.handleControl(sessCtx, sess, typ, payload)
+		},
+		// SPEC.md §5's fan-out: a change this peer sent us has to reach the
+		// share's *other* peers, and this session is the only thing that
+		// knows it happened. Handed to goTracked rather than run inline
+		// because the callback fires with the session's reconcile lock held
+		// for that share, and SyncShare writes a full snapshot to every
+		// other connection, which can block on their writers' bulk lanes.
+		OnApplied: func(shareID string) {
+			node.goTracked(func() { node.propagateShareExcept(sessCtx, shareID, pc) })
+		},
+	})
 	sess.Writer().SetWriteObserver(func(protocol.MsgType) { ka.RecordSent() })
-	sess.SetFrameObserver(func(protocol.MsgType) { ka.RecordReceived() })
-	sess.SetControlHandler(func(typ protocol.MsgType, payload []byte) {
-		pc.handleControl(sessCtx, sess, typ, payload)
-	})
-	// SPEC.md §5's fan-out: a change this peer sent us has to reach the
-	// share's *other* peers, and this session is the only thing that knows
-	// it happened. Handed to goTracked rather than run inline because the
-	// callback fires with the session's reconcile lock held for that share,
-	// and SyncShare writes a full snapshot to every other connection, which
-	// can block on their writers' bulk lanes.
-	sess.SetAppliedHandler(func(shareID string) {
-		node.goTracked(func() { node.propagateShareExcept(sessCtx, shareID, pc) })
-	})
 
 	pc.sessCancel = cancel
 	pc.session = sess
@@ -601,7 +606,7 @@ func (pc *peerConn) runKeepalive(ctx context.Context, ka *protocol.Keepalive, se
 }
 
 // handleControl dispatches one frame Session's own read loop doesn't
-// handle (see Session.SetControlHandler's doc comment): ShareList,
+// handle (see syncsvc.SessionOptions.OnControl): ShareList,
 // SubscribeRequest, AccessUpdate, and Ping/Pong. Runs synchronously on
 // the session's read-loop goroutine; anything that does I/O (config
 // persistence, a store-backed rescan) is handed off via node.goTracked so

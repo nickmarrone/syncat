@@ -44,7 +44,7 @@ func TestStartBoundedDoesNotCreateWaitingGoroutines(t *testing.T) {
 }
 
 func TestIndexNotificationsCoalesceToLatestPendingWork(t *testing.T) {
-	s := NewSession(nil, nil, "self", "peer", nil, nil)
+	s := NewSession(nil, nil, "self", "peer", SessionOptions{})
 	ctx, cancel := context.WithCancel(context.Background())
 	s.ctx = ctx
 	s.wg.Add(maxConcurrentIndexJobs)

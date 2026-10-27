@@ -36,7 +36,7 @@ func symlinkServeSession(t *testing.T, target, indexedTarget string) (*Session, 
 		t.Fatal(err)
 	}
 	near, far := net.Pipe()
-	s := NewSession(near, n.store, n.id, "peer", nil, log.New(io.Discard, "", 0))
+	s := NewSession(near, n.store, n.id, "peer", SessionOptions{Logger: log.New(io.Discard, "", 0)})
 	s.AddShare(ShareConfig{ShareID: testShareID, Root: n.root})
 	if err := s.writer.Start(); err != nil {
 		t.Fatal(err)
@@ -120,7 +120,7 @@ func TestSymlinkServeEmitsVerifiedTargetAndEOF(t *testing.T) {
 func TestTransferResponseEmitsExactlyOneTerminalOutcome(t *testing.T) {
 	n := newTestNode(t, "response-terminal")
 	near, far := net.Pipe()
-	s := NewSession(near, n.store, n.id, "peer", nil, log.New(io.Discard, "", 0))
+	s := NewSession(near, n.store, n.id, "peer", SessionOptions{Logger: log.New(io.Discard, "", 0)})
 	if err := s.writer.Start(); err != nil {
 		t.Fatal(err)
 	}

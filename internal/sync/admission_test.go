@@ -30,13 +30,13 @@ func TestShareAdmissionDirections(t *testing.T) {
 
 func TestUnauthorizedSnapshotAndAckDoNotCreateState(t *testing.T) {
 	a, b := newTestNode(t, "admissionA"), newTestNode(t, "admissionB")
-	sa, sb := connectSessions(t, a, b, Direction{}, Direction{})
-
 	processed := make(chan struct{}, 1)
-	sb.SetControlHandler(func(typ protocol.MsgType, _ []byte) {
-		if typ == protocol.MsgPing {
-			processed <- struct{}{}
-		}
+	sa, _ := connectSessionsWithOptions(t, a, b, Direction{}, Direction{}, SessionOptions{}, SessionOptions{
+		OnControl: func(typ protocol.MsgType, _ []byte) {
+			if typ == protocol.MsgPing {
+				processed <- struct{}{}
+			}
+		},
 	})
 	const unknown = "advertised-but-ungranted"
 	if err := sa.writer.WriteMessage(protocol.MsgIndexSnapshotBegin, protocol.IndexSnapshotBegin{ShareID: unknown, SnapshotID: "forged", Epoch: "evil", HighSeq: 99}); err != nil {
@@ -72,7 +72,7 @@ func TestUnauthorizedSnapshotAndAckDoNotCreateState(t *testing.T) {
 
 func TestAnswerSyncRequestRejectsUnknownAndReceiveOnlyShares(t *testing.T) {
 	n := newTestNode(t, "answer")
-	s := NewSession(nil, n.store, n.id, "peer", nil, nil)
+	s := NewSession(nil, n.store, n.id, "peer", SessionOptions{})
 	s.AddShare(ShareConfig{ShareID: "receive-only", Root: n.root, Direction: receiveOnlyDir()})
 
 	for _, shareID := range []string{"unknown", "receive-only"} {
@@ -84,7 +84,7 @@ func TestAnswerSyncRequestRejectsUnknownAndReceiveOnlyShares(t *testing.T) {
 
 func TestIndexAckCannotAdvancePastFramesWrittenBySession(t *testing.T) {
 	n := newTestNode(t, "ack-range")
-	s := NewSession(nil, n.store, n.id, "peer", nil, nil)
+	s := NewSession(nil, n.store, n.id, "peer", SessionOptions{})
 	s.ctx = context.Background()
 
 	const shareID = "share"
@@ -114,7 +114,7 @@ func TestIndexAckCannotAdvancePastFramesWrittenBySession(t *testing.T) {
 
 func TestIndexAckRequiresMatchingSnapshot(t *testing.T) {
 	n := newTestNode(t, "snapshot-ack")
-	s := NewSession(nil, n.store, n.id, "peer", nil, nil)
+	s := NewSession(nil, n.store, n.id, "peer", SessionOptions{})
 	s.ctx = context.Background()
 	s.noteSnapshotWritten("share", "epoch", "snapshot-good", 9)
 

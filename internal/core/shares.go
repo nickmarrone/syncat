@@ -297,7 +297,7 @@ func (n *Node) propagateShare(ctx context.Context, shareID string) {
 // This is the other half of SPEC.md §5's fan-out rule. A change that
 // originates locally reaches every peer through rescanShare, but a change
 // *pulled* from one peer reaches the rest only through here. See
-// syncsvc.Session.SetAppliedHandler for why no rescan will do it, and
+// syncsvc.SessionOptions.OnApplied for why no rescan will do it, and
 // scripts/net/08-three-node-fanout.sh for the case that proves it.
 func (n *Node) propagateShareExcept(ctx context.Context, shareID string, except *peerConn) {
 	for _, pc := range n.snapshotPeers() {

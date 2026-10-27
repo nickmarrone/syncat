@@ -79,7 +79,7 @@ func (c ShareConfig) ignored(relpath string, isDir bool) bool {
 // internal/protocol already happened. From then on it handles only
 // IndexUpdate, FileRequest, FileChunk, and file-transfer-scoped Error. It
 // passes other message types to the control handler that internal/core
-// registers (see SetControlHandler), because the peer manager drives those
+// registers (see SessionOptions.OnControl), because the peer manager drives those
 // exchanges. A test can therefore drive a Session with a bare net.Conn
 // (e.g. transport.PipeTransport) and no peer manager.
 //
@@ -97,9 +97,9 @@ type Session struct {
 	peerID string // the peer's ShortID
 	clock  Clock
 
-	// trash is this Session's trash can (SPEC.md §7). SetTrash sets it. Until
-	// then it is nil and trashHook does nothing (see apply.go), so tests that
-	// ignore trash can use a Session without one.
+	// trash is this Session's trash can (SPEC.md §7), from
+	// SessionOptions.Trash. If it is nil, trashHook does nothing (see
+	// apply.go), so tests that ignore trash can use a Session without one.
 	trash *Trash
 
 	// warningsMu/warnings record every LocallyModifiedWarning this Session
@@ -113,30 +113,18 @@ type Session struct {
 
 	logger *log.Logger
 
-	// peerLabel prefixes every logf line for this session. It defaults to
-	// peerID (an 8-byte hex ShortID). SetPeerLabel replaces it with the peer's
-	// configured name, so sync's log lines match core's, which use the name,
-	// without cross-referencing `syncat peer ls`.
+	// peerLabel prefixes every logf line for this session. See
+	// SessionOptions.PeerLabel.
 	peerLabel string
 
-	// debug enables debugf, the routine-activity log (per-pass reconcile
-	// summaries). It is off by default. These lines fire on every index update
-	// from every peer, which helps when diagnosing a share that will not
-	// converge and is too noisy for an idle daemon.
+	// debug enables debugf. See SessionOptions.Debug.
 	debug bool
 
-	// ctrlMu guards controlHandler and frameObserver, hooks internal/core
-	// uses to drive the parts of the connection lifecycle that Session does
-	// not own. controlHandler receives ShareList, SubscribeRequest,
-	// AccessUpdate, Ping, and Pong (see readLoop's default case).
-	// frameObserver fires for every frame this Session reads, of any type, for
-	// keepalive activity tracking, matching protocol.Keepalive's "any frame
-	// counts as received traffic" contract. Both may be nil. Set them before
-	// calling Start so they cannot race the read loop's first frame.
-	ctrlMu         sync.Mutex
-	controlHandler func(typ protocol.MsgType, payload []byte)
-	frameObserver  func(typ protocol.MsgType)
-	appliedHandler func(shareID string)
+	// The hooks from SessionOptions. Each may be nil. They are fixed at
+	// construction, so the read loop reads them without a lock.
+	onControl func(typ protocol.MsgType, payload []byte)
+	onFrame   func(typ protocol.MsgType)
+	onApplied func(shareID string)
 
 	sharesMu   sync.RWMutex
 	shares     map[string]*ShareConfig
@@ -298,18 +286,86 @@ var (
 	ErrSessionClosed         = errors.New("sync: session is closed")
 )
 
+// SessionOptions configures a Session. Every field is optional, and the
+// zero value gives a Session that logs to log.Default(), uses time.Now, and
+// has no trash and no hooks.
+type SessionOptions struct {
+	// Clock is the time source (see reconcile.go's Clock). nil means time.Now.
+	Clock Clock
+
+	// Logger receives this session's log lines. nil means log.Default().
+	Logger *log.Logger
+
+	// PeerLabel prefixes every log line in place of the peer's ShortID.
+	// internal/core passes the peer's configured name, so sync's log lines
+	// match core's without cross-referencing `syncat peer ls`.
+	PeerLabel string
+
+	// Debug enables debugf, the routine-activity log (per-pass reconcile
+	// summaries). These lines fire on every index update from every peer,
+	// which helps when diagnosing a share that will not converge and is too
+	// noisy for an idle daemon.
+	Debug bool
+
+	// Trash is where this session moves files it deletes or overwrites
+	// (SPEC.md §7). nil makes trashHook do nothing.
+	Trash *Trash
+
+	// OnControl is called, synchronously from the read loop, for every frame
+	// type this Session does not handle itself: Hello, Auth, ShareList,
+	// SubscribeRequest, AccessUpdate, Ping, and Pong (see readLoop).
+	// internal/core uses it to drive the peering flow (SPEC.md §2, §4, §6)
+	// on the connection Session reads exclusively. It runs on the read loop
+	// goroutine like every other dispatch here, so it should not block for
+	// long. Start a goroutine for anything that does I/O.
+	OnControl func(typ protocol.MsgType, payload []byte)
+
+	// OnFrame is called once per frame read, of any type, before dispatch.
+	// internal/core uses it to drive protocol.Keepalive.RecordReceived.
+	// SPEC.md §4's "90s without traffic" dead-connection rule counts every
+	// message, not just Ping/Pong, and only Session's read loop sees the
+	// IndexUpdate/FileRequest/FileChunk/Error traffic that OnControl never
+	// receives.
+	OnFrame func(typ protocol.MsgType)
+
+	// OnApplied is called after a reconcile pass that changed something on
+	// disk, naming the share it changed. internal/core uses it to fan that
+	// change out to the share's *other* peers.
+	//
+	// Session cannot do that itself, because it owns one connection and
+	// knows nothing about the others. At the end of handleIndexUpdate it
+	// sends a delta back to the peer it just heard from, which is enough for
+	// a two-node pairing. It is not enough for a share offered to more than
+	// one peer. SPEC.md §5's fan-out rule routes those through the offerer,
+	// so when bob's change reaches alice, alice has to pass it to carol and
+	// nothing else will. The rescan that internal/core triggers from
+	// fsnotify compares the working tree against the index. Applying a
+	// pulled change updates both, so that scan finds no difference and stops
+	// before it would propagate. The periodic rescan finds the same nothing,
+	// so it never self-heals either.
+	//
+	// It is called from the goroutine handling the peer's update, not the
+	// read loop, but it should still hand off anything slow, because it runs
+	// while reconcileMu is held for that share.
+	OnApplied func(shareID string)
+}
+
 // NewSession constructs a Session over conn. nodeID is this node's own
 // ShortID, used to bump version vectors on conflict resolution. peerID is
 // the ShortID of the node at the other end of conn, and keys its mirrored
-// index rows (index.Store.UpsertPeerFiles/ListPeerFiles). If clock is nil,
-// time.Now is used (see reconcile.go's Clock). If logger is nil,
-// log.Default() is used.
-func NewSession(conn net.Conn, store *index.Store, nodeID, peerID string, clock Clock, logger *log.Logger) *Session {
+// index rows (index.Store.UpsertPeerFiles/ListPeerFiles).
+func NewSession(conn net.Conn, store *index.Store, nodeID, peerID string, opts SessionOptions) *Session {
+	clock := opts.Clock
 	if clock == nil {
 		clock = time.Now
 	}
+	logger := opts.Logger
 	if logger == nil {
 		logger = log.Default()
+	}
+	peerLabel := peerID
+	if opts.PeerLabel != "" {
+		peerLabel = protocol.SanitizeDiagnostic(opts.PeerLabel)
 	}
 	return &Session{
 		conn:         conn,
@@ -318,7 +374,12 @@ func NewSession(conn net.Conn, store *index.Store, nodeID, peerID string, clock 
 		store:        store,
 		nodeID:       nodeID,
 		peerID:       peerID,
-		peerLabel:    peerID,
+		peerLabel:    peerLabel,
+		debug:        opts.Debug,
+		trash:        opts.Trash,
+		onControl:    opts.OnControl,
+		onFrame:      opts.OnFrame,
+		onApplied:    opts.OnApplied,
 		clock:        clock,
 		logger:       logger,
 		warnIndex:    make(map[string]int),
@@ -431,82 +492,6 @@ func (s *Session) AddShare(cfg ShareConfig) {
 	s.sharesMu.Unlock()
 }
 
-// SetTrash configures the Trash this Session's trashHook uses (SPEC.md
-// §7). Safe to call before or after Start. nil (the default) makes
-// trashHook do nothing.
-func (s *Session) SetTrash(tr *Trash) {
-	s.trash = tr
-}
-
-// SetPeerLabel replaces the peer identifier that logf prefixes to this
-// session's log lines (default: the peer's ShortID). internal/core passes
-// the peer's configured name. Call before Start, like the other setters.
-func (s *Session) SetPeerLabel(label string) {
-	if label != "" {
-		s.peerLabel = protocol.SanitizeDiagnostic(label)
-	}
-}
-
-// SetDebug enables this session's routine-activity logging (see the debug
-// field). Call before Start, like the other setters.
-func (s *Session) SetDebug(debug bool) {
-	s.debug = debug
-}
-
-// SetControlHandler registers fn to be called, synchronously from the read
-// loop, for every frame type this Session does not handle itself: Hello,
-// Auth, ShareList, SubscribeRequest, AccessUpdate, Ping, and Pong (see
-// readLoop's default case). internal/core uses it to drive the peering
-// flow (SPEC.md §2, §4, §6) on the connection Session reads exclusively.
-// Session remains "the single reader of the connection" (readLoop's own
-// invariant), and fn sees frames that readLoop would otherwise drop. fn
-// runs on the read loop goroutine like every other dispatch here, so it
-// should not block for long. Start a goroutine for anything that does
-// I/O. Call before Start so fn cannot miss the peer's first frame.
-func (s *Session) SetControlHandler(fn func(typ protocol.MsgType, payload []byte)) {
-	s.ctrlMu.Lock()
-	s.controlHandler = fn
-	s.ctrlMu.Unlock()
-}
-
-// SetFrameObserver registers fn to be called once per frame read, of any
-// type, before dispatch. internal/core uses it to drive
-// protocol.Keepalive.RecordReceived. SPEC.md §4's "90s without traffic"
-// dead-connection rule counts every message, not just Ping/Pong, and only
-// Session's read loop sees the IndexUpdate/FileRequest/FileChunk/Error
-// traffic that SetControlHandler's default case never reaches. Call before
-// Start, for the same reason as SetControlHandler.
-func (s *Session) SetFrameObserver(fn func(typ protocol.MsgType)) {
-	s.ctrlMu.Lock()
-	s.frameObserver = fn
-	s.ctrlMu.Unlock()
-}
-
-// SetAppliedHandler registers fn to be called after a reconcile pass that
-// changed something on disk, naming the share it changed. internal/core
-// uses it to fan that change out to the share's *other* peers.
-//
-// Session cannot do that itself, because it owns one connection and knows
-// nothing about the others. At the end of handleIndexUpdate it sends a
-// delta back to the peer it just heard from, which is enough for a
-// two-node pairing. It is not enough for a share offered to more than one
-// peer. SPEC.md §5's fan-out rule routes those through the offerer, so
-// when bob's change reaches alice, alice has to pass it to carol and
-// nothing else will. The rescan that internal/core triggers from fsnotify
-// compares the working tree against the index. Applying a pulled change
-// updates both, so that scan finds no difference and stops before it would
-// propagate. The periodic rescan finds the same nothing, so it never
-// self-heals either.
-//
-// fn is called from the goroutine handling the peer's update, not the read
-// loop, but it should still hand off anything slow, because it runs while
-// reconcileMu is held for that share.
-func (s *Session) SetAppliedHandler(fn func(shareID string)) {
-	s.ctrlMu.Lock()
-	s.appliedHandler = fn
-	s.ctrlMu.Unlock()
-}
-
 // Writer returns this Session's protocol.StreamWriter, so internal/core's
 // peer manager can send ShareList / SubscribeRequest / AccessUpdate / Ping
 // frames on the same connection where Session writes
@@ -514,7 +499,7 @@ func (s *Session) SetAppliedHandler(fn func(shareID string)) {
 // and never tears or interleaves frames. All of those are control frames,
 // which it drains ahead of file bytes, so a caller never waits behind a
 // transfer. That is what lets the read loop reply to a Ping inline (see
-// SetControlHandler).
+// SessionOptions.OnControl).
 func (s *Session) Writer() *protocol.StreamWriter {
 	return s.writer
 }
@@ -756,7 +741,7 @@ func (s *Session) logf(format string, args ...any) {
 	s.logger.Printf("sync: peer %s: "+format, append([]any{s.peerLabel}, args...)...)
 }
 
-// debugf logs routine sync activity, suppressed unless SetDebug was called.
+// debugf logs routine sync activity, suppressed unless SessionOptions.Debug was set.
 func (s *Session) debugf(format string, args ...any) {
 	if !s.debug {
 		return
@@ -1098,11 +1083,8 @@ func (s *Session) readLoop() {
 			return
 		}
 
-		s.ctrlMu.Lock()
-		observer, ctrlHandler := s.frameObserver, s.controlHandler
-		s.ctrlMu.Unlock()
-		if observer != nil {
-			observer(typ)
+		if s.onFrame != nil {
+			s.onFrame(typ)
 		}
 		if handler, ok := sessionFrameHandlers[typ]; ok {
 			if !handler(s, payload) {
@@ -1113,8 +1095,8 @@ func (s *Session) readLoop() {
 
 		// Handshake/share-list/access/ping-pong messages are owned by the
 		// core control plane. Session remains the connection's sole reader.
-		if ctrlHandler != nil {
-			ctrlHandler(typ, payload)
+		if s.onControl != nil {
+			s.onControl(typ, payload)
 		}
 	}
 }
@@ -1251,14 +1233,9 @@ func (s *Session) reconcileLocked(ctx context.Context, cfg ShareConfig, why stri
 
 	// The delta above only reaches the peer this update came from. Every
 	// *other* peer of this share learns about it here. See
-	// SetAppliedHandler for why nothing else would tell them.
-	if len(changed) > 0 {
-		s.ctrlMu.Lock()
-		applied := s.appliedHandler
-		s.ctrlMu.Unlock()
-		if applied != nil {
-			applied(shareID)
-		}
+	// SessionOptions.OnApplied for why nothing else would tell them.
+	if len(changed) > 0 && s.onApplied != nil {
+		s.onApplied(shareID)
 	}
 
 	// A pass over an already-converged share produces nothing but ActionNone,

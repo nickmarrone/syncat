@@ -326,8 +326,7 @@ func TestTrash_FailureAbortsApply(t *testing.T) {
 	}
 	failingTrash := NewTrash(blockedRoot, nil)
 
-	sess := NewSession(nil, store, "nodeA", "nodeB", nil, nil)
-	sess.SetTrash(failingTrash)
+	sess := NewSession(nil, store, "nodeA", "nodeB", SessionOptions{Trash: failingTrash})
 
 	destAbs := filepath.Join(shareDir, "notes.txt")
 	if err := sess.trashHook(ctx, testShareID, "notes.txt", destAbs); err == nil {
@@ -397,8 +396,7 @@ func TestTrash_LocalDeleteIsNeverTrashed_RemoteDeleteIs(t *testing.T) {
 
 	// --- remote-initiated delete: goes through Session.applyDelete, which
 	// does call the trash hook.
-	sess := NewSession(nil, store, "nodeA", "nodeB", nil, nil)
-	sess.SetTrash(tr)
+	sess := NewSession(nil, store, "nodeA", "nodeB", SessionOptions{Trash: tr})
 	cfg := ShareConfig{ShareID: trashTestShareID, Root: shareDir}
 	deleted, err := sess.applyDelete(ctx, cfg, "remote-deleted.txt")
 	if err != nil {

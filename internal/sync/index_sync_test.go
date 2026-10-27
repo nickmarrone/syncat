@@ -209,7 +209,17 @@ func TestJournalDeltasPageAcrossReads(t *testing.T) {
 	ctx := context.Background()
 	a := newTestNode(t, "aaaaaaaaaaaaaaaa")
 	b := newTestNode(t, "bbbbbbbbbbbbbbbb")
-	sa, _ := connectSessions(t, a, b, Direction{}, Direction{})
+	// resyncs counts IndexSyncRequests from b once counting is set, after
+	// the warm-up below.
+	var counting atomic.Bool
+	var resyncs atomic.Int32
+	sa, _ := connectSessionsWithOptions(t, a, b, Direction{}, Direction{}, SessionOptions{
+		OnFrame: func(typ protocol.MsgType) {
+			if counting.Load() && typ == protocol.MsgIndexSyncRequest {
+				resyncs.Add(1)
+			}
+		},
+	}, SessionOptions{})
 	sa.testJournalPageSize = 3 // several pages out of a handful of entries
 
 	// The first sync is always a full snapshot: a's outgoing cursor starts
@@ -225,12 +235,7 @@ func TestJournalDeltasPageAcrossReads(t *testing.T) {
 		return err == nil && c.Epoch != ""
 	})
 
-	var resyncs atomic.Int32
-	sa.SetFrameObserver(func(typ protocol.MsgType) {
-		if typ == protocol.MsgIndexSyncRequest {
-			resyncs.Add(1)
-		}
-	})
+	counting.Store(true)
 
 	const files = 10
 	for i := 0; i < files; i++ {

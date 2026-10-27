@@ -56,11 +56,11 @@ func FuzzSessionDecodeValidateDispatch(f *testing.F) {
 		}
 		n := newTestNode(t, "dispatch-fuzz")
 		near, far := net.Pipe()
-		s := NewSession(near, n.store, n.id, "peer000000000000", nil, log.New(io.Discard, "", 0))
-		s.AddShare(ShareConfig{ShareID: testShareID, Root: n.root, Direction: Direction{}})
-		s.SetControlHandler(func(typ protocol.MsgType, payload []byte) {
-			decodeControlForFuzz(typ, payload)
+		s := NewSession(near, n.store, n.id, "peer000000000000", SessionOptions{
+			Logger:    log.New(io.Discard, "", 0),
+			OnControl: decodeControlForFuzz,
 		})
+		s.AddShare(ShareConfig{ShareID: testShareID, Root: n.root, Direction: Direction{}})
 		if err := s.Start(context.Background()); err != nil {
 			t.Fatal(err)
 		}

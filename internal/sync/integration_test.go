@@ -169,6 +169,20 @@ func connectSessions(t *testing.T, a, b *testNode, dirA, dirB Direction) (sa, sb
 // synced, so the two sides genuinely can differ).
 func connectSessionsWithIgnore(t *testing.T, a, b *testNode, dirA, dirB Direction, ignoreA, ignoreB func(string, bool) bool) (sa, sb *Session) {
 	t.Helper()
+	return connectSessionPair(t, a, b, dirA, dirB, ignoreA, ignoreB, SessionOptions{}, SessionOptions{})
+}
+
+// connectSessionsWithOptions is connectSessions plus SessionOptions for
+// each side, for tests that need a hook or a Trash on a live Session.
+func connectSessionsWithOptions(t *testing.T, a, b *testNode, dirA, dirB Direction, optsA, optsB SessionOptions) (sa, sb *Session) {
+	t.Helper()
+	return connectSessionPair(t, a, b, dirA, dirB, nil, nil, optsA, optsB)
+}
+
+// connectSessionPair is the shared body of the connectSessions helpers. A
+// nil Logger in either SessionOptions is replaced with one that discards.
+func connectSessionPair(t *testing.T, a, b *testNode, dirA, dirB Direction, ignoreA, ignoreB func(string, bool) bool, optsA, optsB SessionOptions) (sa, sb *Session) {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
@@ -177,11 +191,17 @@ func connectSessionsWithIgnore(t *testing.T, a, b *testNode, dirA, dirB Directio
 	t.Cleanup(func() { _ = tr.Close() })
 
 	logger := log.New(io.Discard, "", 0)
+	if optsA.Logger == nil {
+		optsA.Logger = logger
+	}
+	if optsB.Logger == nil {
+		optsB.Logger = logger
+	}
 
 	var sess1 *Session
 	ready := make(chan struct{})
 	if err := tr.Start(ctx, func(conn net.Conn) {
-		sess1 = NewSession(conn, a.store, a.id, b.id, nil, logger)
+		sess1 = NewSession(conn, a.store, a.id, b.id, optsA)
 		sess1.AddShare(ShareConfig{ShareID: testShareID, Root: a.root, Direction: dirA, Ignore: ignoreA})
 		if err := sess1.Start(ctx); err != nil {
 			t.Errorf("start session 1: %v", err)
@@ -195,7 +215,7 @@ func connectSessionsWithIgnore(t *testing.T, a, b *testNode, dirA, dirB Directio
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	sess2 := NewSession(conn, b.store, b.id, a.id, nil, logger)
+	sess2 := NewSession(conn, b.store, b.id, a.id, optsB)
 	sess2.AddShare(ShareConfig{ShareID: testShareID, Root: b.root, Direction: dirB, Ignore: ignoreB})
 	if err := sess2.Start(ctx); err != nil {
 		t.Fatalf("start session 2: %v", err)
@@ -766,9 +786,8 @@ func TestIntegration_ReceiveOnlyRevertsLocalEditViaTrash(t *testing.T) {
 	dirOfferer := DirectionFor(config.PermissionReadWrite, "")
 	dirSubscriber := DirectionFor("", config.ModeReceiveOnly)
 
-	sOfferer, sSubscriber := connectSessions(t, offerer, subscriber, dirOfferer, dirSubscriber)
 	tr := NewTrash(filepath.Join(t.TempDir(), "trash"), nil)
-	sSubscriber.SetTrash(tr)
+	sOfferer, sSubscriber := connectSessionsWithOptions(t, offerer, subscriber, dirOfferer, dirSubscriber, SessionOptions{}, SessionOptions{Trash: tr})
 
 	mustSync(t, sOfferer, testShareID)
 	mustSync(t, sSubscriber, testShareID)
@@ -843,9 +862,8 @@ func TestIntegration_RestorePropagatesAsNewChange(t *testing.T) {
 	writeFile(t, a.root, "keepme.txt", "original content")
 	indexFile(t, a.store, a.id, "keepme.txt", a.root)
 
-	sa, sb := connectSessions(t, a, b, Direction{}, Direction{})
 	tr := NewTrash(filepath.Join(t.TempDir(), "trash"), nil)
-	sa.SetTrash(tr)
+	sa, sb := connectSessionsWithOptions(t, a, b, Direction{}, Direction{}, SessionOptions{Trash: tr}, SessionOptions{})
 
 	mustSync(t, sa, testShareID)
 	mustSync(t, sb, testShareID)
