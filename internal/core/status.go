@@ -261,8 +261,8 @@ func (pc *peerConn) snapshot() PeerStatus {
 		TransportFailures: counters.transportFailures, HandshakeFailures: counters.handshakeFailures,
 		Backoffs: counters.backoffs, TotalBackoff: time.Duration(counters.backoffNanos), LastBackoff: time.Duration(counters.lastBackoffNanos),
 		Connections: counters.connections, Reconnects: counters.reconnects, DedupLosses: counters.dedupLosses,
-		PingsSent: counters.pingsSent, PongsReceived: counters.pongsReceived, DeadConnections: counters.deadConnections,
-		LastPingRTT: time.Duration(counters.lastPingRTTNanos), Session: toSessionNetworkStatus(totals),
+		PingsSent: totals.PingsSent, PongsReceived: totals.PongsReceived, DeadConnections: totals.DeadConnections,
+		LastPingRTT: totals.LastPingRTT, Session: toSessionNetworkStatus(totals),
 	}
 	return status
 }

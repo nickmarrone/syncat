@@ -189,7 +189,20 @@ type Session struct {
 	// a frame could not be read. See [Session.Done]. The owner (internal/core's
 	// peer manager) watches it to act on a disconnect when it happens, not
 	// when the keepalive's dead timer next notices.
-	done        chan struct{}
+	done chan struct{}
+	// endErr is why the read loop exited. It is written before done is
+	// closed and read only after, so it needs no lock. See [Session.Err].
+	endErr error
+
+	// keepalive runs SPEC.md §4's ping and dead rule for this connection.
+	// Every frame read or written feeds it. pingSentAt is the clock reading
+	// (UnixNano) when the unanswered Ping went out, or 0, for LastPingRTT.
+	// keepaliveDead is set before the dead rule closes conn, so Err can tell
+	// that close apart from the peer's.
+	keepalive     *protocol.Keepalive
+	pingSentAt    atomic.Int64
+	keepaliveDead atomic.Bool
+
 	lifecycleMu sync.Mutex
 	lifecycle   sessionLifecycle
 }
@@ -214,6 +227,8 @@ type sessionCounters struct {
 	snapshotsSent, snapshotEntriesSent                        atomic.Uint64
 	deltaBatchesSent, deltaEntriesSent, reconciliations       atomic.Uint64
 	reconciliationsCoalesced                                  atomic.Uint64
+	pingsSent, pongsReceived, deadConnections                 atomic.Uint64
+	lastPingRTTNanos                                          atomic.Int64
 }
 
 // SessionStats is a low-cardinality snapshot suitable for status and metrics.
@@ -229,6 +244,8 @@ type SessionStats struct {
 	SnapshotsSent, SnapshotEntriesSent                      uint64
 	DeltaBatchesSent, DeltaEntriesSent, Reconciliations     uint64
 	ReconciliationsCoalesced                                uint64
+	PingsSent, PongsReceived, DeadConnections               uint64
+	LastPingRTT                                             time.Duration // zero until a Pong answers a Ping
 	Writer                                                  protocol.StreamWriterStats
 }
 
@@ -248,7 +265,10 @@ func (s *Session) Stats() SessionStats {
 		SnapshotsSent: s.stats.snapshotsSent.Load(), SnapshotEntriesSent: s.stats.snapshotEntriesSent.Load(),
 		DeltaBatchesSent: s.stats.deltaBatchesSent.Load(), DeltaEntriesSent: s.stats.deltaEntriesSent.Load(), Reconciliations: s.stats.reconciliations.Load(),
 		ReconciliationsCoalesced: s.stats.reconciliationsCoalesced.Load(),
-		Writer:                   s.writer.Stats(),
+		PingsSent:                s.stats.pingsSent.Load(), PongsReceived: s.stats.pongsReceived.Load(),
+		DeadConnections: s.stats.deadConnections.Load(),
+		LastPingRTT:     time.Duration(s.stats.lastPingRTTNanos.Load()),
+		Writer:          s.writer.Stats(),
 	}
 }
 
@@ -284,14 +304,19 @@ const (
 var (
 	ErrSessionAlreadyStarted = errors.New("sync: session has already been started")
 	ErrSessionClosed         = errors.New("sync: session is closed")
+
+	// ErrKeepaliveDead is [Session.Err] when the session closed its own
+	// connection because nothing arrived for SPEC.md §4's dead interval.
+	ErrKeepaliveDead = errors.New("sync: no traffic from peer for the keepalive dead interval")
 )
 
 // SessionOptions configures a Session. Every field is optional, and the
 // zero value gives a Session that logs to log.Default(), uses time.Now, and
 // has no trash and no hooks.
 type SessionOptions struct {
-	// Clock is the time source (see reconcile.go's Clock). nil means time.Now.
-	Clock Clock
+	// Clock is the time source for reconcile (see reconcile.go's Clock) and
+	// for the keepalive's ping and dead timers. nil means protocol.RealClock.
+	Clock protocol.Clock
 
 	// Logger receives this session's log lines. nil means log.Default().
 	Logger *log.Logger
@@ -313,7 +338,7 @@ type SessionOptions struct {
 
 	// OnControl is called, synchronously from the read loop, for every frame
 	// type this Session does not handle itself: Hello, Auth, ShareList,
-	// SubscribeRequest, AccessUpdate, Ping, and Pong (see readLoop).
+	// SubscribeRequest, AccessUpdate (see readLoop).
 	// internal/core uses it to drive the peering flow (SPEC.md §2, §4, §6)
 	// on the connection Session reads exclusively. It runs on the read loop
 	// goroutine like every other dispatch here, so it should not block for
@@ -321,11 +346,7 @@ type SessionOptions struct {
 	OnControl func(typ protocol.MsgType, payload []byte)
 
 	// OnFrame is called once per frame read, of any type, before dispatch.
-	// internal/core uses it to drive protocol.Keepalive.RecordReceived.
-	// SPEC.md §4's "90s without traffic" dead-connection rule counts every
-	// message, not just Ping/Pong, and only Session's read loop sees the
-	// IndexUpdate/FileRequest/FileChunk/Error traffic that OnControl never
-	// receives.
+	// It observes; it cannot change how the frame is handled.
 	OnFrame func(typ protocol.MsgType)
 
 	// OnApplied is called after a reconcile pass that changed something on
@@ -357,7 +378,7 @@ type SessionOptions struct {
 func NewSession(conn net.Conn, store *index.Store, nodeID, peerID string, opts SessionOptions) *Session {
 	clock := opts.Clock
 	if clock == nil {
-		clock = time.Now
+		clock = protocol.RealClock
 	}
 	logger := opts.Logger
 	if logger == nil {
@@ -367,10 +388,11 @@ func NewSession(conn net.Conn, store *index.Store, nodeID, peerID string, opts S
 	if opts.PeerLabel != "" {
 		peerLabel = protocol.SanitizeDiagnostic(opts.PeerLabel)
 	}
-	return &Session{
+	s := &Session{
 		conn:         conn,
 		reader:       protocol.NewReader(conn),
 		writer:       protocol.NewStreamWriter(conn, 0),
+		keepalive:    protocol.NewKeepalive(clock, 0, 0),
 		store:        store,
 		nodeID:       nodeID,
 		peerID:       peerID,
@@ -380,7 +402,7 @@ func NewSession(conn net.Conn, store *index.Store, nodeID, peerID string, opts S
 		onControl:    opts.OnControl,
 		onFrame:      opts.OnFrame,
 		onApplied:    opts.OnApplied,
-		clock:        clock,
+		clock:        clock.Now,
 		logger:       logger,
 		warnIndex:    make(map[string]int),
 		shares:       make(map[string]*ShareConfig),
@@ -396,6 +418,8 @@ func NewSession(conn net.Conn, store *index.Store, nodeID, peerID string, opts S
 		serveCancel:  make(map[string]context.CancelFunc),
 		done:         make(chan struct{}),
 	}
+	s.writer.SetWriteObserver(func(protocol.MsgType) { s.keepalive.RecordSent() })
+	return s
 }
 
 // startBounded starts fn only after reserving capacity. The single read
@@ -499,7 +523,7 @@ func (s *Session) AddShare(cfg ShareConfig) {
 // and never tears or interleaves frames. All of those are control frames,
 // which it drains ahead of file bytes, so a caller never waits behind a
 // transfer. That is what lets the read loop reply to a Ping inline (see
-// SessionOptions.OnControl).
+// handleKeepaliveFrame).
 func (s *Session) Writer() *protocol.StreamWriter {
 	return s.writer
 }
@@ -692,18 +716,87 @@ func (s *Session) Start(ctx context.Context) error {
 	for range maxConcurrentIndexJobs {
 		go s.runIndexWorker()
 	}
-	s.wg.Add(1)
-	go s.readLoop()
+	kaCtx, stopKeepalive := context.WithCancel(s.ctx)
+	s.wg.Add(2)
+	go s.readLoop(stopKeepalive)
+	go s.runKeepalive(kaCtx)
 	return nil
+}
+
+// runKeepalive drives SPEC.md §4's ping and dead rule until ctx ends, which
+// is when the session closes or its read loop exits. It sends a Ping when the connection has been idle outbound,
+// and closes the connection when nothing has arrived for the dead interval,
+// which ends the read loop and so closes Done.
+func (s *Session) runKeepalive(ctx context.Context) {
+	defer s.wg.Done()
+	s.keepalive.Run(ctx, 0, func() {
+		// Stamped before the write, so a Pong that comes back before
+		// WriteMessage returns still finds it.
+		s.pingSentAt.Store(s.clock().UnixNano())
+		if err := s.writer.WriteMessage(protocol.MsgPing, protocol.Ping{}); err != nil {
+			// Not a transient condition to log and retry in 30s: a ping is
+			// one small frame on the writer's priority lane, so a failure to
+			// even queue it means the connection is finished. Close it and
+			// let the read loop's EOF end the session, the same way a peer
+			// disconnecting does.
+			s.logf("send ping, dropping connection: %v", err)
+			_ = s.conn.Close()
+			return
+		}
+		s.stats.pingsSent.Add(1)
+	}, func() {
+		// The single most diagnostic event the transport has: the peer
+		// stopped answering entirely. Silently closing here made it
+		// indistinguishable from the peer hanging up cleanly, which is the
+		// difference between "the other node was restarted" and "the
+		// network between us is black-holing traffic".
+		s.logf("no traffic for the keepalive dead interval; treating the connection as dead")
+		s.stats.deadConnections.Add(1)
+		s.keepaliveDead.Store(true)
+		_ = s.conn.Close()
+	})
+}
+
+// handleKeepaliveFrame answers a Ping and times a Pong. It runs on the read
+// loop, which may write a Pong inline because the writer drains control
+// frames ahead of file bytes.
+func (s *Session) handleKeepaliveFrame(typ protocol.MsgType) {
+	switch typ {
+	case protocol.MsgPing:
+		if err := s.writer.WriteMessage(protocol.MsgPong, protocol.Pong{}); err != nil {
+			s.logf("reply pong: %v", err)
+		}
+	case protocol.MsgPong:
+		s.stats.pongsReceived.Add(1)
+		if sent := s.pingSentAt.Swap(0); sent != 0 {
+			s.stats.lastPingRTTNanos.Store(s.clock().UnixNano() - sent)
+		}
+	}
+}
+
+// Err reports why the session ended. It returns nil until Done is closed.
+// After that it returns ErrKeepaliveDead if the keepalive's dead rule
+// closed the connection, and otherwise the error that ended the read loop:
+// io.EOF for a clean close by the peer, a network error for a broken link
+// or a local Close, or nil if a frame handler ended the loop.
+func (s *Session) Err() error {
+	select {
+	case <-s.done:
+	default:
+		return nil
+	}
+	if s.keepaliveDead.Load() {
+		return ErrKeepaliveDead
+	}
+	return s.endErr
 }
 
 // Done returns a channel closed when the session's read loop has exited:
 // the peer closed the connection, the socket broke, or Close was called.
-// It is the session's own "this connection is finished" signal. The owner
-// should watch it, because nothing else in the session reacts to a
-// disconnect. A caller that waits for protocol.Keepalive's dead timer
-// instead pays SPEC.md §4's full 90s before it reconnects, even when the
-// peer said goodbye cleanly and immediately.
+// It is the session's own "this connection is finished" signal, and it
+// also closes when the keepalive's dead rule gives up on a silent peer.
+// The owner should watch it, because nothing else in the session reacts
+// to a disconnect. [Session.Err] says which of these happened.
 //
 // The channel is never closed for a Session that was never started.
 func (s *Session) Done() <-chan struct{} {
@@ -1074,17 +1167,26 @@ func (s *Session) sendIndexUpdate(shareID string, rows []index.FileRow, full boo
 //
 // On exit, for any reason including a clean io.EOF, it closes s.done,
 // which is how the owner learns the connection is over ([Session.Done]).
-func (s *Session) readLoop() {
+func (s *Session) readLoop(stopKeepalive context.CancelFunc) {
 	defer s.wg.Done()
 	defer close(s.done)
+	defer stopKeepalive() // a finished connection needs no more pings
 	for {
 		typ, payload, err := s.reader.ReadFrame()
 		if err != nil {
+			s.endErr = err
 			return
 		}
 
+		// SPEC.md §4's dead rule counts every frame as traffic, not just
+		// Pongs.
+		s.keepalive.RecordReceived()
 		if s.onFrame != nil {
 			s.onFrame(typ)
+		}
+		if typ == protocol.MsgPing || typ == protocol.MsgPong {
+			s.handleKeepaliveFrame(typ)
+			continue
 		}
 		if handler, ok := sessionFrameHandlers[typ]; ok {
 			if !handler(s, payload) {
@@ -1093,7 +1195,7 @@ func (s *Session) readLoop() {
 			continue
 		}
 
-		// Handshake/share-list/access/ping-pong messages are owned by the
+		// Handshake/share-list/access messages are owned by the
 		// core control plane. Session remains the connection's sole reader.
 		if s.onControl != nil {
 			s.onControl(typ, payload)

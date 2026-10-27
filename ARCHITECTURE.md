@@ -233,7 +233,8 @@ without breaking an older one (§11).
 | Group | Messages | Handled by |
 |---|---|---|
 | Handshake | `Hello`, `Auth` (also carries `HelloAuth`), `Finished`, `Error` | `protocol/handshake.go` |
-| Control | `ShareList`, `SubscribeRequest`, `AccessUpdate`, `Ping`, `Pong` | `core/peer.go`, `core/access.go` |
+| Control | `ShareList`, `SubscribeRequest`, `AccessUpdate` | `core/peer.go`, `core/access.go` |
+| Keepalive | `Ping`, `Pong` | `sync/session.go` |
 | Index | `IndexSyncRequest`, `IndexSnapshotBegin`, `IndexSnapshotBatch`, `IndexSnapshotEnd`, `IndexDeltaBatch`, `IndexAck`, `IndexUpdate` | `sync/dispatch.go`, `sync/session.go` |
 | Transfer | `FileRequest`, `FileChunk`, `CancelTransfer`, `Error` | `sync/transfer.go` |
 
@@ -293,7 +294,9 @@ flowchart LR
 
 **Keepalive.** A node sends `Ping` after 30 s with no outgoing traffic. It
 declares the connection dead after 90 s with no incoming traffic. Any frame
-counts as traffic.
+counts as traffic. `sync.Session` runs this rule for its connection, answers
+`Ping`, and reports ping counts, round-trip time, and dead connections in
+`SessionStats`.
 
 ### `internal/index`
 
@@ -425,7 +428,7 @@ flowchart TB
     conn[("net.Conn")]
     RL["read loop<br/>(only reader)"]
     DT{"frame handler<br/>table"}
-    CH["core control handler<br/>(ShareList, SubscribeRequest,<br/>AccessUpdate, Ping, Pong)"]
+    CH["core control handler<br/>(ShareList, SubscribeRequest,<br/>AccessUpdate)"]
     IQ["index queue<br/>4 workers, 64 keys,<br/>coalesced by share"]
     REC["reconcile pass<br/>(reconcileMu)"]
     AW["action workers<br/>(4)"]
@@ -502,7 +505,7 @@ each other and gives the API a typed Go interface. It never encodes JSON.
 | File | Purpose |
 |---|---|
 | `node.go` | `Node`, `Open` and `Close`, inbound connection admission, and test clocks |
-| `peer.go` | `peerConn`: dial, handshake, deduplication, session start, keepalive, and teardown for one peer |
+| `peer.go` | `peerConn`: dial, handshake, deduplication, session start, and teardown for one peer |
 | `access.go` | Share list, subscription requests, access decisions, and access updates |
 | `approvals.go` | Persisted queues of pending peers and pending share requests |
 | `shares.go` | `shareWatch`, rescans, version bumps, and propagation to peers |
@@ -528,7 +531,6 @@ flowchart LR
     subgraph peerConn
         sup["dial supervisor"]
         sess["session *syncsvc.Session"]
-        ka["keepalive"]
         active["activeShares"]
     end
     subgraph shareWatch
@@ -546,7 +548,7 @@ flowchart LR
   `KeepConnection`. The losing connection is closed. A second winning
   connection is closed as redundant.
 - When a connection is adopted, core creates a `Session`, connects the session
-  to the trash, the keepalive, and the control handler, and then sends the
+  to the trash and the control handler, and then sends the
   share list and subscription requests.
 - `provisionShareForRequest` and `provisionAccessUpdate` run on the session's
   read-loop goroutine. The share must be known to the session before the next
@@ -698,8 +700,8 @@ sequenceDiagram
     TB->>B: onAccept (admission limits)
     A->>B: Handshake (Hello, Auth, Auth, Finished)
     Note over A,B: each side: KeepConnection(own key, peer key, dialed?)<br/>the loser closes, the winner is adopted
-    A->>A: NewSession + Keepalive, Start
-    B->>B: NewSession + Keepalive, Start
+    A->>A: NewSession, Start
+    B->>B: NewSession, Start
     A->>B: ShareList (shares A offers to B)
     B->>A: ShareList (shares B offers to A)
     B->>A: SubscribeRequest(share S)
@@ -710,7 +712,8 @@ sequenceDiagram
     B->>A: index stream for S
 ```
 
-When a session ends, core cancels its work, waits for the keepalive, closes
+A session ends when the peer closes, the link breaks, or the session's
+keepalive gives up on a silent peer. Core then cancels its work, closes
 the session and the connection, calls `Transport.DiscardPeer`, and lets the
 supervisor dial again.
 

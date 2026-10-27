@@ -52,7 +52,7 @@ var RealClock Clock = realClock{}
 // Keepalive tracks send/receive activity on one connection and decides
 // when to send a Ping and when to declare the connection dead (SPEC.md
 // §4). It does no I/O and starts no goroutines on its own: the owner
-// (internal/core's peer manager) calls [Keepalive.RecordSent] and
+// (internal/sync's Session) calls [Keepalive.RecordSent] and
 // [Keepalive.RecordReceived] from its read/write loop, and drives the
 // timing with [Keepalive.Run] (or polls [Keepalive.NeedsPing] /
 // [Keepalive.Dead] directly).

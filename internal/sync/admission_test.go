@@ -33,7 +33,7 @@ func TestUnauthorizedSnapshotAndAckDoNotCreateState(t *testing.T) {
 	processed := make(chan struct{}, 1)
 	sa, _ := connectSessionsWithOptions(t, a, b, Direction{}, Direction{}, SessionOptions{}, SessionOptions{
 		OnControl: func(typ protocol.MsgType, _ []byte) {
-			if typ == protocol.MsgPing {
+			if typ == protocol.MsgShareList {
 				processed <- struct{}{}
 			}
 		},
@@ -45,7 +45,7 @@ func TestUnauthorizedSnapshotAndAckDoNotCreateState(t *testing.T) {
 	if err := sa.writer.WriteMessage(protocol.MsgIndexAck, protocol.IndexAck{ShareID: unknown, Epoch: "evil", AppliedSeq: 99}); err != nil {
 		t.Fatal(err)
 	}
-	if err := sa.writer.WriteMessage(protocol.MsgPing, protocol.Ping{}); err != nil {
+	if err := sa.writer.WriteMessage(protocol.MsgShareList, protocol.ShareList{}); err != nil {
 		t.Fatal(err)
 	}
 	select {

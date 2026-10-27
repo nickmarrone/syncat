@@ -6,7 +6,7 @@
 // mutations.go is the config-mutation API the REST layer and CLI call;
 // resolve.go is the reference resolution that lets those callers pass
 // names and id prefixes instead of raw hex. peer.go implements the
-// per-peer dial/accept/dedup/keepalive state machine (SPEC.md §2, §4), and
+// per-peer dial/accept/dedup state machine (SPEC.md §2, §4), and
 // access.go the ShareList/SubscribeRequest/AccessUpdate negotiation that
 // runs over an adopted connection (SPEC.md §6). shares.go wires local
 // share/subscription directories to internal/index's Scanner/Watcher and

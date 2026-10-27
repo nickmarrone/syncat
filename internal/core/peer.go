@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -140,9 +141,9 @@ const (
 // peerConn is one configured peer's connection state machine (SPEC.md
 // §2/§4): it drives the dial-with-backoff loop, adopts whichever
 // connection (dialed or accepted) wins SPEC.md §2.4's dedup rule, and
-// wires that connection's syncsvc.Session together with a
-// protocol.Keepalive and handleControl, which dispatches
-// ShareList/SubscribeRequest/AccessUpdate to access.go.
+// wires that connection's syncsvc.Session to handleControl, which
+// dispatches ShareList/SubscribeRequest/AccessUpdate to access.go. The
+// Session runs SPEC.md §4's keepalive itself.
 //
 // At most one connection is ever active at a time, guarded by mu.
 // Reaching that invariant doesn't require coordinating the two sides of a
@@ -181,15 +182,12 @@ type peerConn struct {
 	connDone      chan struct{}   // closed when the current connection ends
 	network       peerNetworkCounters
 	sessionTotals syncsvc.SessionStats
-	lastPingAt    time.Time
 }
 
 type peerNetworkCounters struct {
 	dialAttempts, dialFailures, transportFailures, handshakeFailures uint64
 	backoffs, backoffNanos, lastBackoffNanos                         uint64
 	connections, reconnects, dedupLosses                             uint64
-	pingsSent, pongsReceived, deadConnections                        uint64
-	lastPingRTTNanos                                                 uint64
 }
 
 func newPeerConn(n *Node, p config.Peer) (*peerConn, error) {
@@ -368,7 +366,7 @@ func (pc *peerConn) dialAttempt(ctx context.Context) error {
 // offer applies SPEC.md §2.4's dedup rule to one authenticated connection
 // (dialed=true for our own outbound dial, false for an inbound accept)
 // and, if it wins, adopts it as this peer's active connection: wires a
-// syncsvc.Session with this file's control-message and keepalive hooks,
+// syncsvc.Session with this file's control-message and fan-out hooks,
 // starts it, and sends our initial ShareList/SubscribeRequests. Returns
 // which of offerOutcome's three cases applied; a connection that is not
 // adopted is closed here and never touches pc's state.
@@ -413,19 +411,17 @@ func (pc *peerConn) offer(ctx context.Context, conn net.Conn, result *protocol.H
 
 	node := pc.node
 	sessCtx, cancel := context.WithCancel(pc.ctx)
-	ka := protocol.NewKeepalive(asProtocolClock(node.clock), 0, 0)
 	// sess is captured by OnControl before it is assigned. That is safe:
 	// the read loop, the only caller, starts in sess.Start below.
 	var sess *syncsvc.Session
 	sess = syncsvc.NewSession(conn, node.store, node.identity.ShortID(), pc.peerShort, syncsvc.SessionOptions{
-		Clock:  asSyncClock(node.clock),
+		Clock:  asProtocolClock(node.clock),
 		Logger: node.logger,
 		// So sync's lines say "peer laptop" like core's, not a bare hex
 		// ShortID the reader has to look up in `syncat peer ls`.
 		PeerLabel: pc.name,
 		Debug:     node.debugEnabled(),
 		Trash:     node.trash,
-		OnFrame:   func(protocol.MsgType) { ka.RecordReceived() },
 		OnControl: func(typ protocol.MsgType, payload []byte) {
 			pc.handleControl(sessCtx, sess, typ, payload)
 		},
@@ -439,7 +435,6 @@ func (pc *peerConn) offer(ctx context.Context, conn net.Conn, result *protocol.H
 			node.goTracked(func() { node.propagateShareExcept(sessCtx, shareID, pc) })
 		},
 	})
-	sess.Writer().SetWriteObserver(func(protocol.MsgType) { ka.RecordSent() })
 
 	pc.sessCancel = cancel
 	pc.session = sess
@@ -486,52 +481,39 @@ func (pc *peerConn) offer(ctx context.Context, conn net.Conn, result *protocol.H
 	node.sendShareList(sess, pc.peerKeyHex)
 	node.requestSubscriptions(sess, pc.peerKeyHex)
 
-	node.goTracked(func() { pc.runConnection(sessCtx, cancel, sess, ka, conn, done) })
+	node.goTracked(func() { pc.runConnection(sessCtx, cancel, sess, conn, done) })
 	return offerAdopted, nil
 }
 
 // runConnection is the adopted connection's lifetime, on its own tracked
-// goroutine: it runs the keepalive alongside the session, waits for
-// whichever ends first, then tears everything down and releases
-// dialAttempt (by closing done) to redial.
+// goroutine: it waits for the session to end, or for a local teardown,
+// then tears everything down and releases dialAttempt (by closing done) to
+// redial.
 //
-// The keepalive runs alongside the wait rather than being the wait itself.
-// Its dead timer is the *backstop* for noticing this connection has ended,
-// not the mechanism: a peer that closes cleanly, or a socket that breaks
-// under a write, ends the session's read loop immediately, and waiting
-// out SPEC.md §4's 90s instead (at the poll granularity, up to 120s) is
-// 90s of a node reporting itself connected to something that is gone, and
-// 90s before dialAttempt is released to redial. The check interval comes
-// from protocol.DefaultKeepaliveCheckInterval.
+// The session ends itself in every case that is not local: the peer closes
+// cleanly, the socket breaks, or the session's keepalive gives up on a
+// silent peer after SPEC.md §4's dead interval. All three close
+// sess.Done(), and sess.Err() says which.
 //
-// The teardown order is essential: cancel unblocks ka.Run; sess.Close
-// must precede conn.Close (see notePeerRedialed); the transport's cached
-// per-peer state must be discarded before close(done) lets dialAttempt
-// redial; and pc's fields are reset under mu in the same critical section
-// that closes done.
-func (pc *peerConn) runConnection(sessCtx context.Context, cancel context.CancelFunc, sess *syncsvc.Session, ka *protocol.Keepalive, conn net.Conn, done chan struct{}) {
-	kaDone := make(chan struct{})
-	go func() {
-		defer close(kaDone)
-		pc.runKeepalive(sessCtx, ka, sess, conn)
-	}()
-
+// The teardown order is essential: sess.Close must precede conn.Close (see
+// notePeerRedialed); the transport's cached per-peer state must be
+// discarded before close(done) lets dialAttempt redial; and pc's fields are
+// reset under mu in the same critical section that closes done.
+func (pc *peerConn) runConnection(sessCtx context.Context, cancel context.CancelFunc, sess *syncsvc.Session, conn net.Conn, done chan struct{}) {
 	var why string
 	select {
-	case <-sess.Done(): // the read loop ended: peer closed, or the link broke
+	case <-sess.Done():
 		why = "peer closed the connection or the link broke"
-	case <-kaDone: // the dead rule fired, or the session context was cancelled
-		// runKeepalive distinguishes these two for us; a cancelled session
-		// context is an orderly local teardown (shutdown, peer removal,
-		// notePeerRedialed), not the 90s dead rule.
-		why = "keepalive ended the connection"
-		if sessCtx.Err() != nil {
-			why = "shut down locally"
+		if errors.Is(sess.Err(), syncsvc.ErrKeepaliveDead) {
+			why = "keepalive ended the connection"
 		}
+	case <-sessCtx.Done():
+		// An orderly local teardown: shutdown, peer removal, or
+		// notePeerRedialed.
+		why = "shut down locally"
 	}
 
 	cancel()
-	<-kaDone // cancel() above is what unblocks ka.Run
 	sess.Close()
 	finishedStats := sess.Stats()
 	conn.Close()
@@ -571,62 +553,15 @@ func (pc *peerConn) runConnection(sessCtx context.Context, cancel context.Cancel
 	pc.node.logger.Printf("core: peer %s (%s): disconnected after %s (%s)", name, pc.peerShort, uptime.Truncate(time.Second), why)
 }
 
-// runKeepalive drives SPEC.md §4's ping/dead rule for one connection until
-// ctx is cancelled: it sends a Ping on ka's schedule and closes conn when
-// the dead timer fires (which unblocks the session's read loop and so ends
-// runConnection's wait).
-func (pc *peerConn) runKeepalive(ctx context.Context, ka *protocol.Keepalive, sess *syncsvc.Session, conn net.Conn) {
-	ka.Run(ctx, 0, func() {
-		if err := sess.Writer().WriteMessage(protocol.MsgPing, protocol.Ping{}); err != nil {
-			// Not a transient condition to log and retry in 30s: a
-			// ping is one small frame on the writer's priority lane,
-			// so a failure to even queue it means the connection is
-			// finished. Close it and let the read loop's EOF unwind
-			// the session, the same way a peer disconnecting does.
-			pc.node.logger.Printf("core: peer %s: send ping, dropping connection: %v", pc.name, err)
-			conn.Close()
-			return
-		}
-		pc.mu.Lock()
-		pc.network.pingsSent++
-		pc.lastPingAt = pc.node.clock.Now()
-		pc.mu.Unlock()
-	}, func() {
-		// The single most diagnostic event the transport has: the peer
-		// stopped answering entirely. Silently closing here made it
-		// indistinguishable from the peer hanging up cleanly, which is
-		// the difference between "the other node was restarted" and "the
-		// network between us is black-holing traffic".
-		pc.node.logger.Printf("core: peer %s (%s): no traffic for the keepalive dead interval; treating the connection as dead", pc.name, pc.peerShort)
-		pc.mu.Lock()
-		pc.network.deadConnections++
-		pc.mu.Unlock()
-		conn.Close() // dead per SPEC.md §4's 90s rule; unblocks the session's read loop
-	})
-}
-
 // handleControl dispatches one frame Session's own read loop doesn't
 // handle (see syncsvc.SessionOptions.OnControl): ShareList,
-// SubscribeRequest, AccessUpdate, and Ping/Pong. Runs synchronously on
+// SubscribeRequest, and AccessUpdate. Runs synchronously on
 // the session's read-loop goroutine; anything that does I/O (config
 // persistence, a store-backed rescan) is handed off via node.goTracked so
 // the read loop is never blocked by it.
 func (pc *peerConn) handleControl(ctx context.Context, sess *syncsvc.Session, typ protocol.MsgType, payload []byte) {
 	node := pc.node
 	switch typ {
-	case protocol.MsgPing:
-		if err := sess.Writer().WriteMessage(protocol.MsgPong, protocol.Pong{}); err != nil {
-			node.logger.Printf("core: peer %s: reply pong: %v", pc.name, err)
-		}
-	case protocol.MsgPong:
-		pc.mu.Lock()
-		pc.network.pongsReceived++
-		if !pc.lastPingAt.IsZero() {
-			pc.network.lastPingRTTNanos = uint64(pc.node.clock.Now().Sub(pc.lastPingAt))
-			pc.lastPingAt = time.Time{}
-		}
-		pc.mu.Unlock()
-
 	case protocol.MsgShareList:
 		var msg protocol.ShareList
 		if err := protocol.DecodeAndValidateMessage(payload, &msg); err != nil {
@@ -730,13 +665,11 @@ func (pc *peerConn) supersededByAdoptedConn() bool {
 // instant while restarting its peer took minutes, an asymmetry with no
 // cause beyond how the two keys happened to compare.
 //
-// Both the close and the cancel are needed, in that order. Closing the conn
-// is what unblocks the session's read loop. Cancelling alone would deadlock
-// the teardown, which calls sess.Close() before conn.Close() and so waits on
-// a reader still parked in conn.Read. Cancelling is what makes it prompt:
-// closing alone would leave the keepalive's Run loop waiting out the full
-// dead timer before the teardown that redials could run. The dead-rule path
-// closes the conn for exactly the first reason.
+// Closing the conn ends the session's read loop, which closes sess.Done
+// and wakes runConnection's teardown; the session's keepalive closes the
+// conn for the same reason when its dead rule fires. The cancel then ends
+// the session's context, so its other goroutines stop without waiting for
+// the teardown to reach sess.Close.
 func (pc *peerConn) notePeerRedialed() {
 	pc.mu.Lock()
 	cancel, sess, conn := pc.sessCancel, pc.session, pc.conn

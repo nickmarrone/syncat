@@ -39,6 +39,9 @@ func TestSessionDoneClosesWhenPeerDisconnects(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("Done stayed open after the peer disconnected; the owner would wait out the 90s dead rule instead")
 	}
+	if errors.Is(sa.Err(), ErrKeepaliveDead) {
+		t.Fatal("a peer's clean close was reported as the keepalive dead rule")
+	}
 }
 
 func TestSessionStartHasExplicitLifecycleErrors(t *testing.T) {
@@ -291,9 +294,9 @@ func TestCancelTransferCancelsActiveServe(t *testing.T) {
 }
 
 func TestSessionStatsCountStaleTransferFrames(t *testing.T) {
-	now := time.Now()
+	clock := newFakeClock(time.Now())
 	var logs bytes.Buffer
-	s := NewSession(nil, nil, "self", "peer", SessionOptions{Clock: func() time.Time { return now }, Logger: log.New(&logs, "", 0)})
+	s := NewSession(nil, nil, "self", "peer", SessionOptions{Clock: clock, Logger: log.New(&logs, "", 0)})
 	for range 100 {
 		s.routeChunk("11111111111111111111111111111111", pullChunk{})
 	}
@@ -304,7 +307,7 @@ func TestSessionStatsCountStaleTransferFrames(t *testing.T) {
 	if got := strings.Count(logs.String(), "unknown or finished transfer"); got != 1 {
 		t.Fatalf("rate-limited log count = %d, want 1; logs: %s", got, logs.String())
 	}
-	now = now.Add(staleTransferLogInterval)
+	clock.Advance(staleTransferLogInterval)
 	s.routeChunk("22222222222222222222222222222222", pullChunk{})
 	if got := strings.Count(logs.String(), "unknown or finished transfer"); got != 2 {
 		t.Fatalf("log count after interval = %d, want 2", got)
