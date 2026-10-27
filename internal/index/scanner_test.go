@@ -117,8 +117,8 @@ func TestScanContentChangeDetectsHashDiff(t *testing.T) {
 	}
 }
 
-// TestScanMetadataOnlyChangeIsNotContentChange is the load-bearing test the
-// load-bearing case for MetadataOnly: mtime differs from the index but the
+// TestScanMetadataOnlyChangeIsNotContentChange is the essential test the
+// essential case for MetadataOnly: mtime differs from the index but the
 // hash is identical (e.g. a `touch`, or a rewrite that produced identical
 // bytes) must classify as MetadataOnly, never ContentChanged.
 func TestScanMetadataOnlyChangeIsNotContentChange(t *testing.T) {
@@ -309,7 +309,7 @@ func TestScanFileVanishingMidScanDoesNotAbort(t *testing.T) {
 	// A custom fs.FS wrapping os.DirFS(root) that deletes vanish.txt the
 	// moment it's opened, simulating a concurrent delete racing the
 	// scanner's hash pass (the file is still present, and its metadata
-	// still readable, when the walk lists and stats it — it only
+	// still readable, when the walk lists and stats it, it only
 	// disappears when the scanner tries to read its bytes).
 	fsys := &vanishingFS{FS: os.DirFS(root), root: root, vanish: "vanish.txt"}
 
@@ -530,7 +530,7 @@ func rowsPaths(rows []FileRow) []string {
 // TestScanNewlyIgnoredRowIsNotTombstoned is the regression that protects
 // every peer's data. A file that is already indexed and then starts
 // matching a .syncatignore pattern must leave our index via the Ignored
-// bucket — never as a tombstone, which would propagate as a delete.
+// bucket, never as a tombstone, which would propagate as a delete.
 func TestScanNewlyIgnoredRowIsNotTombstoned(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, root, "notes.txt", []byte("keep"), time.Now())
@@ -614,7 +614,7 @@ func TestScanIgnoreFileItselfNeverIndexed(t *testing.T) {
 }
 
 // TestScanNegationReincludesUnderIgnoredDir pins that a '!' rule survives
-// an ignored parent directory — which only works because PruneDirs turns
+// an ignored parent directory, which only works because PruneDirs turns
 // pruning off when negations exist, so the walk actually descends.
 func TestScanNegationReincludesUnderIgnoredDir(t *testing.T) {
 	root := t.TempDir()
@@ -635,7 +635,7 @@ func TestScanNegationReincludesUnderIgnoredDir(t *testing.T) {
 // TestMatcherGlobExcludesDirectoryContents pins that a glob naming a
 // directory also excludes everything beneath it. The scanner gets this for
 // free by pruning the walk, but internal/sync's reconciler asks about one
-// path at a time and never walks — if the two disagreed, a peer's copy of
+// path at a time and never walks, if the two disagreed, a peer's copy of
 // "build/out.o" would be pulled, indexed, pruned, and pulled again.
 func TestMatcherGlobExcludesDirectoryContents(t *testing.T) {
 	m := NewMatcher([]string{"build", "vendor/pkg"})

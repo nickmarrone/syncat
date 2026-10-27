@@ -127,8 +127,8 @@ func TestTailcatDiagnosticsDoNotExposeCredentialsOrControls(t *testing.T) {
 // dialWithRetry dials addr, retrying until it succeeds or ctx expires.
 //
 // Transport.Start returns as soon as tailcat's Server.Start does, which is
-// before that server has picked a home DERP region and connected to it —
-// measured here at roughly 2.5–3s after Start returns. Until then the server
+// before that server has picked a home DERP region and connected to it,
+// measured here at roughly 2.5 to 3s after Start returns. Until then the server
 // is registered on no relay at all, and a dial's meow ping is a single DERP
 // packet with no retry of its own: tailcat's Client.ping sends one and then
 // waits on a hard internal 10s timeout, documented as applying "regardless
@@ -166,7 +166,7 @@ func dialWithRetry(ctx context.Context, t *testing.T, tr *TailcatTransport, addr
 // comes up with a live home region. It's guarded by -short: DERP setup plus a
 // netcheck-based region pick takes a few real seconds, and this
 // environment's netcheck reports udp=false, so every byte here is relayed
-// rather than direct — hence the generous timeout.
+// rather than direct, hence the generous timeout.
 func TestTailcatTransportEndToEnd(t *testing.T) {
 	if testing.Short() {
 		t.Skip("uses real DERP relays; skipped under -short")
@@ -275,7 +275,7 @@ func TestTailcatTransportDialRejectsEmptyAddress(t *testing.T) {
 //
 // The invariant under test is exactly that: *after* this transport has dialed
 // out, it must still be reachable by an inbound dial. A third transport does
-// the inbound dial rather than the one we dialed, deliberately — SPEC.md
+// the inbound dial rather than the one we dialed, deliberately, SPEC.md
 // §2.4's dedup rule exists because two nodes holding simultaneous tunnels to
 // each other is a state the design avoids, so asserting on it here would test
 // something syncat never relies on.
@@ -365,7 +365,7 @@ func TestClientCacheDiscardsFailedDials(t *testing.T) {
 	tr := NewTailcatTransport(tailcat.NewPrivateKey(), nil)
 	const addr = "tc-cache-test"
 
-	// Healthy peers must keep their warm Client — that is the point of
+	// Healthy peers must keep their warm Client, that is the point of
 	// caching, and only failed dials are supposed to discard.
 	first, err := tr.clientFor(addr)
 	if err != nil {
@@ -405,7 +405,7 @@ func TestClientCacheDiscardsFailedDials(t *testing.T) {
 // pre-shared key, and tailcat.Server mints a throwaway one whenever
 // Server.PresharedKey is left zero.
 //
-// syncat produces its address two different ways and both have to agree —
+// syncat produces its address two different ways and both have to agree,
 // the daemon serves LocalAddress() from a running Server, while `syncat
 // token` derives it offline from the persisted PrivateKey.Public. Without
 // feeding the persisted pre-shared key back into the Server, the daemon

@@ -13,7 +13,7 @@ import (
 // tests: nothing here ever sleeps on a wall clock. Advance fires any
 // pending After channels whose deadline it reaches, synchronously with
 // respect to the caller (though the goroutines woken by those channels
-// still run concurrently, same as with a real timer) — tests synchronize
+// still run concurrently, same as with a real timer), tests synchronize
 // with those goroutines via their own channels, never by sleeping.
 type fakeClock struct {
 	mu      sync.Mutex
@@ -88,7 +88,7 @@ func (c *fakeClock) Advance(d time.Duration) {
 // not yet having re-registered its next timer, silently attaching that
 // registration to a clock value that already moved past when the test
 // expected it to fire. The bounded time.After here is only a test
-// safety-net deadline, not a polling interval — waking happens
+// safety-net deadline, not a polling interval, waking happens
 // event-driven via c.notify.
 func (c *fakeClock) waitForWaiters(min int, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
@@ -172,7 +172,7 @@ func TestKeepaliveRunPingsAtIntervalAndPongResets(t *testing.T) {
 
 	// First tick at +30s: idle since construction, so a ping is due. Wait
 	// for Run to actually be parked on its timer before advancing past
-	// it — see waitForWaiters' doc comment for why this matters.
+	// it. See waitForWaiters' doc comment for why this matters.
 	if !clock.waitForWaiters(1, 5*time.Second) {
 		t.Fatal("timed out waiting for Run to register its first timer")
 	}

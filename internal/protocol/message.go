@@ -117,14 +117,14 @@ func (t MsgType) String() string {
 // with explicit `cbor:"..."` string-keyed tags, so it round-trips through
 // fxamacker/cbor as a CBOR map rather than an array. Decoding a map into a
 // struct silently ignores keys the struct doesn't declare (this is
-// fxamacker/cbor's default behavior, not an option we had to opt into) —
+// fxamacker/cbor's default behavior, not an option we had to opt into),
 // so a future v2 peer can add fields to any of these messages and v1 nodes
 // keep working. Do not switch any of these to array-shaped encoding
 // (e.g. via `cbor:",toarray"`), and do not add ExtraDecErrorUnknownField
 // anywhere in this package, or that guarantee breaks.
 
 // VersionVector is a per-file version vector: node-short-id (the first 8
-// bytes of a node's Ed25519 public key, hex-encoded — see
+// bytes of a node's Ed25519 public key, hex-encoded; see
 // config.IdentityKey.ShortID) mapped to that node's local counter for the
 // file (SPEC.md §5). This package defines only the wire shape; the
 // dominance/merge algebra lives in internal/sync.
@@ -145,7 +145,7 @@ const (
 //
 // Forward-compat (SPEC.md §11): this is encoded as a CBOR map, so v2's
 // optional `blocks` field (FastCDC block list, §11) can be added later
-// without a wire break — v1 decoders will simply ignore it, and v2
+// without a wire break. v1 decoders will simply ignore it, and v2
 // decoders talking to a v1 peer will see it absent. Do not add that field
 // yet; it's noted here only so the shape isn't accidentally closed off
 // (e.g. by switching to array encoding).
@@ -301,7 +301,7 @@ type FileRequest struct {
 
 // FileChunkHeader is the small CBOR header preceding a FileChunk's raw
 // bytes (SPEC.md §4). It is encoded and decoded separately from the raw
-// data — see [Writer.WriteFileChunk] and [DecodeFileChunk] — because
+// data (see [Writer.WriteFileChunk] and [DecodeFileChunk]) because
 // FileChunk's payload is CBOR header + raw bytes concatenated, not a
 // single CBOR value.
 type FileChunkHeader struct {
@@ -333,7 +333,7 @@ const (
 
 	// ErrCodeFileNotFound and ErrCodeVersionChanged are the
 	// file-transfer-level error codes (SPEC.md §4/§5: "a peer requesting a
-	// file we no longer have, or whose version moved on, gets an Error —
+	// file we no longer have, or whose version moved on, gets an Error,
 	// never a hung stream"). Unlike the handshake codes above, an Error
 	// carrying one of these also sets ShareID/RelPath so the requester can
 	// route it back to the specific FileRequest it answers.
@@ -370,7 +370,7 @@ const (
 	// (SPEC.md §4: "Max frame 4 MiB"). The length prefix covers the 1-byte
 	// type plus the payload, so MaxFrameSize is also the ceiling on
 	// type+payload combined. A peer that sends a bigger length is
-	// rejected before we ever allocate a buffer for the claimed size —
+	// rejected before we ever allocate a buffer for the claimed size.
 	// see [Reader.ReadFrame].
 	MaxFrameSize = 4 * 1024 * 1024
 
@@ -397,7 +397,7 @@ func EncodedMessageSize(typ MsgType, v any) (int, error) {
 // It exists so that batch planning can be linear. internal/sync fills a
 // frame by asking "does one more entry still fit?", and answering that by
 // re-encoding the whole growing message once per candidate entry is
-// quadratic — for a 20k-file share it cost tens of gigabytes of garbage
+// quadratic. For a 20k-file share it cost tens of gigabytes of garbage
 // and over a minute of CPU to plan a single snapshot. Summing per-entry
 // sizes against a fixed envelope costs one encode per entry instead.
 func EncodedEntrySize(v any) (int, error) {
@@ -412,7 +412,7 @@ func EncodedEntrySize(v any) (int, error) {
 // frames (SPEC.md §4).
 //
 // Concurrency: a *Writer is safe for concurrent use by multiple goroutines
-// — each WriteFrame/WriteMessage/WriteFileChunk call builds its complete
+// Each WriteFrame/WriteMessage/WriteFileChunk call builds its complete
 // frame in memory and writes it in one Write call under an internal mutex,
 // so frames from different goroutines (e.g. interleaved chunks from
 // several concurrent transfers, SPEC.md §4) are never torn or interleaved
@@ -445,8 +445,8 @@ func (w *Writer) WriteFrame(typ MsgType, payload []byte) error {
 	return nil
 }
 
-// encodeFrame builds one complete on-the-wire frame — length prefix, type
-// byte, payload — as a single self-contained buffer.
+// encodeFrame builds one complete on-the-wire frame (length prefix, type
+// byte, payload) as a single self-contained buffer.
 //
 // Returning bytes rather than writing them is what lets [StreamWriter]
 // queue a frame: the buffer owns its copy of payload, so a caller that
@@ -518,7 +518,7 @@ func encodeFileChunk(hdr FileChunkHeader, data []byte) ([]byte, error) {
 //
 // Concurrency: a *Reader is NOT safe for concurrent use. Frames are
 // inherently ordered on a single stream, so callers must serialize calls
-// to ReadFrame — typically one read loop per connection, dispatching
+// to ReadFrame, typically one read loop per connection, dispatching
 // decoded messages to other goroutines as needed.
 type Reader struct {
 	r io.Reader
@@ -533,7 +533,7 @@ func NewReader(r io.Reader) *Reader {
 //
 // A length prefix over MaxFrameSize is rejected immediately, without
 // allocating a buffer of that size, so a hostile peer cannot use an
-// oversized length header to force a large allocation — the only
+// oversized length header to force a large allocation. The only
 // allocation ReadFrame ever performs is exactly the (bounded) body length
 // it just validated.
 //
@@ -570,7 +570,7 @@ func (r *Reader) ReadFrame() (MsgType, []byte, error) {
 
 // DecodeMessage CBOR-decodes payload (as returned by [Reader.ReadFrame])
 // into v. Fields present in payload but not in v's type are ignored
-// (SPEC.md §11 forward compatibility) — this is fxamacker/cbor's default
+// (SPEC.md §11 forward compatibility). This is fxamacker/cbor's default
 // decode behavior, not an option enabled here.
 func DecodeMessage(payload []byte, v any) error {
 	if err := wireDecMode.Unmarshal(payload, v); err != nil {
@@ -595,7 +595,7 @@ func DecodeAndValidateMessage(payload []byte, v any) error {
 // DecodeFileChunk splits a MsgFileChunk frame's payload (as returned by
 // [Reader.ReadFrame]) back into its CBOR header and raw data, using the
 // CBOR decoder's own knowledge of how many bytes the header item occupied
-// — the header is a self-delimiting CBOR value, so no separate length
+// The header is a self-delimiting CBOR value, so no separate length
 // prefix between header and data is needed on the wire.
 func DecodeFileChunk(payload []byte) (FileChunkHeader, []byte, error) {
 	dec := wireDecMode.NewDecoder(bytes.NewReader(payload))

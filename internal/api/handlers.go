@@ -311,7 +311,7 @@ func (s *Server) handleSubscriptionsPatch(w http.ResponseWriter, r *http.Request
 	}
 	if req.Mode != nil {
 		// core.Node exposes no subscription-mode-change method (only
-		// pause/resume and remove — see internal/core/node.go); changing
+		// pause/resume and remove, see internal/core/node.go); changing
 		// mode means remove-then-re-add. Documented rather than silently
 		// ignored.
 		writeError(w, http.StatusBadRequest, "bad_request", "changing a subscription's mode is not supported by this build; remove and re-add the subscription with the new mode")

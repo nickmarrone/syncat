@@ -44,14 +44,14 @@ const dialFailureLogEvery = 30
 // A connection that ends this fast never did anything. In practice it means
 // the peer closed it the moment it arrived, because the peer still holds a
 // connection to us that it believes is alive while we have already torn our
-// end down — the two sides disagree about whether the pairing is up, and
+// end down. The two sides disagree about whether the pairing is up, and
 // only the peer's own dead-peer detection or notePeerRedialed's staleness
 // inference will settle it.
 //
 // Until then, the redial path has no brake: an adopted connection ending
 // returns nil from dialAttempt, and Supervisor.Run treats nil as success and
 // retries with no delay whatsoever. So we dial, get adopted, get closed, and
-// dial again, dozens of times a second — building and tearing down a whole
+// dial again, dozens of times a second, building and tearing down a whole
 // tailcat/WireGuard session each time, which is both a lot of pointless
 // relay traffic and (see dedupLossPause, which exists for the same reason on
 // the dedup path) actively counterproductive: it never leaves the peer a
@@ -75,7 +75,7 @@ const staleInboundGrace = 15 * time.Second
 //
 // Supervisor.Run hands dialAttempt the peer's own long-lived context,
 // which is cancelled only on shutdown or peer removal, so without this a
-// dial has no deadline whatsoever — and a dial into a half-dead tunnel does
+// dial has no deadline whatsoever, and a dial into a half-dead tunnel does
 // not fail, it *hangs*. tailcat's WireGuard session retries its handshake
 // forever ("Handshake did not complete after 5 seconds, retrying (try N)")
 // while netstack keeps retransmitting the SYN behind it, so Dial simply
@@ -84,8 +84,8 @@ const staleInboundGrace = 15 * time.Second
 // That is worse than slow: every recovery path here is driven by a dial
 // *failing*. A dial that hangs never reaches the backoff schedule, never
 // increments the failure count, and never reaches
-// TailcatTransport.discardClient — which is what rebuilds the stale
-// per-peer Client after the peer restarts. One wedged dial pins the peer in
+// TailcatTransport.discardClient, which rebuilds the stale
+// per-peer Client after the peer restarts. One stuck dial pins the peer in
 // that state indefinitely.
 //
 // 30s is comfortably above a legitimate cold dial (a fresh Client needs a
@@ -114,8 +114,8 @@ const (
 )
 
 // offerOutcome is what offer did with one authenticated connection. The
-// three cases look alike from the outside — in two of them the connection
-// is closed and nothing is adopted — but they mean very different things
+// three cases look alike from the outside (in two of them the connection
+// is closed and nothing is adopted) but they mean very different things
 // about this peer, and dialAttempt reports them differently.
 type offerOutcome int
 
@@ -129,7 +129,7 @@ const (
 	offerLostDedup
 	// offerRedundant: this connection won the dedup rule, but a connection
 	// to the same peer was already adopted, so it was closed as surplus.
-	// Emphatically *not* a dedup loss: nothing about our reachability is in
+	// This is not a dedup loss: nothing about our reachability is in
 	// question, we simply already have what this connection would have
 	// given us. Telling the two apart is what keeps noteDedupLoss from
 	// eventually reporting "the peer ... may not be able to reach us" about
@@ -153,8 +153,8 @@ const (
 type peerConn struct {
 	node *Node
 
-	peerKeyHex string // full Ed25519 public key, hex — canonical id
-	peerShort  string // first 8 bytes, hex — matches config.IdentityKey.ShortID
+	peerKeyHex string // full Ed25519 public key, (hex), canonical id
+	peerShort  string // first 8 bytes, (hex), matches config.IdentityKey.ShortID
 	addr       string // transport address to dial (the token's "tc" field)
 	peerPub    ed25519.PublicKey
 
@@ -239,15 +239,15 @@ func (pc *peerConn) runSupervisor() {
 
 // dialAttempt is transport.Supervisor's dial func for this peer. If a
 // connection is already active, it just waits for that connection to end
-// (or ctx to be canceled) rather than opening a second, redundant one —
+// (or ctx to be canceled) rather than opening a second, redundant one.
 // SPEC.md §2.2 says dial continuously, but there's nothing to gain from
 // actually holding two tunnels to the same peer open at once when dedup
 // would just close one of them anyway.
 //
 // A successful dial+handshake that loses dedup (see offer) returns nil,
 // not an error: per transport.Supervisor's doc comment, "the losing side
-// of dedup closing voluntarily" isn't a failure worth backing off from —
-// the peer was reachable, we just aren't the side responsible for this
+// of dedup closing voluntarily" isn't a failure worth backing off from.
+// The peer was reachable, we just aren't the side responsible for this
 // pairing's connection.
 func (pc *peerConn) dialAttempt(ctx context.Context) error {
 	pc.mu.Lock()
@@ -305,7 +305,7 @@ func (pc *peerConn) dialAttempt(ctx context.Context) error {
 	if outcome == offerRedundant {
 		// A connection to this peer was adopted while we were dialing, so
 		// this one is surplus. Nothing failed, so this is not a backoff
-		// case — but it still gets dedupLossPause's brake. Supervisor.Run
+		// case, but it still gets dedupLossPause's brake. Supervisor.Run
 		// retries a nil return with no delay at all, and if the adopted
 		// connection is itself about to be torn down (it may well be the
 		// stale one the peer is trying to replace), returning straight
@@ -322,14 +322,14 @@ func (pc *peerConn) dialAttempt(ctx context.Context) error {
 		// the higher key, so it's expected to complete this pairing's
 		// connection via its own dial to us instead. Supervisor.Run
 		// treats a nil error as success and retries with no backoff at
-		// all (deliberately — see this func's doc comment, "isn't a
-		// failure worth backing off from") — but redialing instantly,
+		// all (deliberately, see this func's doc comment, "isn't a
+		// failure worth backing off from"), but redialing instantly,
 		// over and over, tears down and rebuilds the underlying
 		// tailcat/WireGuard session far faster than the peer's own dial
 		// can complete its handshake, so in practice the peer's dial
 		// never gets a clear window and both sides spin forever without
-		// ever converging. A short pause here — still not counted as a
-		// failure, still not subject to the growing backoff schedule —
+		// ever converging. A short pause here, still not counted as a
+		// failure and still not subject to the growing backoff schedule,
 		// is enough to let the peer's dial land.
 		//
 		// That pause assumes the peer's dial *does* eventually land. When
@@ -355,7 +355,7 @@ func (pc *peerConn) dialAttempt(ctx context.Context) error {
 	case <-ctx.Done():
 	}
 	// An ordinary disconnect returns nil so the next dial goes out
-	// immediately — that is what makes reconnection prompt. A connection
+	// immediately, which is what makes reconnection prompt. A connection
 	// that ended almost as soon as it was adopted is not that: see
 	// minConnectionLifetime for why redialing it at full speed makes things
 	// worse rather than better.
@@ -381,7 +381,7 @@ func (pc *peerConn) dialAttempt(ctx context.Context) error {
 //
 // That does not make the "already have a session" check below dead code.
 // It is where a winning connection lands when this side is still holding
-// a stale session for the same peer — see the comment at that branch.
+// a stale session for the same peer. See the comment at that branch.
 func (pc *peerConn) offer(ctx context.Context, conn net.Conn, result *protocol.HandshakeResult, dialed bool) (offerOutcome, error) {
 	keep := transport.KeepConnection(pc.node.identity.Public(), result.PeerPub, dialed)
 	if !keep {
@@ -400,7 +400,7 @@ func (pc *peerConn) offer(ctx context.Context, conn net.Conn, result *protocol.H
 		// Same inference as the !keep branch above, and for a case that is
 		// anything but hypothetical. When the *higher*-keyed peer restarts,
 		// its fresh dial wins the rule on both ends, so on this (lower-keyed)
-		// side it sails past !keep and lands right here — where, if we are
+		// side it sails past !keep and lands right here. There, if we are
 		// still holding a session from before its restart, we would silently
 		// drop the winning connection and then wait out the dead timer for a
 		// connection whose peer no longer exists. The peer, having adopted
@@ -430,8 +430,8 @@ func (pc *peerConn) offer(ctx context.Context, conn net.Conn, result *protocol.H
 	// share's *other* peers, and this session is the only thing that knows
 	// it happened. Handed to goTracked rather than run inline because the
 	// callback fires with the session's reconcile lock held for that share,
-	// and SyncShare writes a full snapshot to every other connection —
-	// which can block on their writers' bulk lanes.
+	// and SyncShare writes a full snapshot to every other connection, which
+	// can block on their writers' bulk lanes.
 	sess.SetAppliedHandler(func(shareID string) {
 		node.goTracked(func() { node.propagateShareExcept(sessCtx, shareID, pc) })
 	})
@@ -450,8 +450,8 @@ func (pc *peerConn) offer(ctx context.Context, conn net.Conn, result *protocol.H
 	if pc.network.connections > 1 {
 		pc.network.reconnects++
 	}
-	pc.dedupLosses = 0  // a connection was adopted (either direction) — see noteDedupLoss
-	pc.dialFailures = 0 // ... and getting here means dialling works — see noteDialFailure
+	pc.dedupLosses = 0  // a connection was adopted (either direction); see noteDedupLoss
+	pc.dialFailures = 0 // ... and getting here means dialling works; see noteDialFailure
 	done := pc.connDone
 	pc.mu.Unlock()
 
@@ -469,7 +469,7 @@ func (pc *peerConn) offer(ctx context.Context, conn net.Conn, result *protocol.H
 
 	// The one line that says this pairing is actually up. Without it a
 	// healthy node and one whose peer flaps every thirty seconds produce
-	// almost identical logs — the flapping one simply has less in it,
+	// almost identical logs. The flapping one simply has less in it,
 	// since every existing line here is an error path. Pairs with
 	// runConnection's teardown line, which reports how long this lasted.
 	direction := "accepted from"
@@ -499,7 +499,7 @@ func (pc *peerConn) offer(ctx context.Context, conn net.Conn, result *protocol.H
 // 90s before dialAttempt is released to redial. The check interval comes
 // from protocol.DefaultKeepaliveCheckInterval.
 //
-// The teardown order is load-bearing: cancel unblocks ka.Run; sess.Close
+// The teardown order is essential: cancel unblocks ka.Run; sess.Close
 // must precede conn.Close (see notePeerRedialed); the transport's cached
 // per-peer state must be discarded before close(done) lets dialAttempt
 // redial; and pc's fields are reset under mu in the same critical section
@@ -533,8 +533,8 @@ func (pc *peerConn) runConnection(sessCtx context.Context, cancel context.Cancel
 
 	// Before close(done) releases dialAttempt to redial: whatever the
 	// transport cached for this peer belongs to the connection that
-	// just died. tailcat's per-peer Client is the case that matters —
-	// it announces itself to the peer's server exactly once, so a
+	// just died. The case that matters is tailcat's per-peer Client.
+	// It announces itself to the peer's server exactly once, so a
 	// Client reused across the peer's restart dials into a tunnel the
 	// far side has forgotten, and hangs there.
 	pc.node.transport.DiscardPeer(pc.addr)
@@ -639,8 +639,8 @@ func (pc *peerConn) handleControl(ctx context.Context, sess *syncsvc.Session, ty
 			return
 		}
 		// provisionShareForRequest's sess.AddShare must happen here, on
-		// the read-loop goroutine, not inside the goTracked closure below
-		// — see its doc comment for why: it establishes the local
+		// the read-loop goroutine, not inside the goTracked closure below.
+		// See its doc comment for why: it establishes the local
 		// happens-before ordering that the async work here relies on.
 		share, access, ok := node.provisionShareForRequest(pc, sess, msg.ShareID)
 		if !ok {
@@ -672,7 +672,7 @@ func (pc *peerConn) handleControl(ctx context.Context, sess *syncsvc.Session, ty
 // An adopted connection is the authoritative state of this peer, and the
 // dial loop's own progress reporting must never contradict it. The two
 // race routinely: dialAttempt checks pc.session, finds it nil, and only
-// then calls this — by which point an inbound connection may already have
+// then calls this, by which point an inbound connection may already have
 // been adopted by offer, on another goroutine. Without the guard, a peer
 // that is connected and syncing reports "connecting". See noteDialFailure
 // for the same race with a worse outcome.
@@ -689,12 +689,12 @@ func (pc *peerConn) setState(s ConnState) {
 // went wrong with our own dial a non-event rather than a failure.
 //
 // dialAttempt only dials when it holds no session, so a session existing
-// now means one was adopted — from either direction — while we were
+// now means one was adopted, from either direction, while we were
 // dialing. SPEC.md §2.4 keeps exactly one connection per pairing, so the
 // other one being torn down is the *expected* consequence of that
 // adoption, not a fault: the peer closes the loser as soon as its own
 // handshake completes, and that close surfaces here as whatever call our
-// handshake happened to be sitting in — a read, a write, or even the
+// handshake happened to be sitting in: a read, a write, or even the
 // SetDeadline that clears the handshake deadline on success.
 //
 // Reporting that as a dial failure is what noteDialFailure would do, and
@@ -713,20 +713,20 @@ func (pc *peerConn) supersededByAdoptedConn() bool {
 // dedup rule told us to reject while we still hold a session for that peer.
 //
 // That combination is evidence, not noise. dialAttempt does not dial while
-// it holds a session, so a peer only dials us when it has none — and if it
-// has none while we believe we have one, ours is a corpse. The peer just
+// it holds a session, so a peer only dials us when it has none, and if it
+// has none while we believe we have one, ours is dead. The peer just
 // proved it is alive and reachable by completing a full handshake over it.
 //
-// Without this the corpse is only noticed by SPEC.md §4's 90s dead rule,
+// Without this the dead connection is only noticed by SPEC.md §4's 90s dead rule,
 // and the wait is paid by whichever node the dedup rule made responsible
 // for dialling this pairing: the *other* node can redial all it likes, but
 // its connections are rejected here by design, so they can never repair the
 // pairing on their own. Restarting the dialling node therefore looked
-// instant while restarting its peer took minutes — an asymmetry with no
+// instant while restarting its peer took minutes, an asymmetry with no
 // cause beyond how the two keys happened to compare.
 //
 // Both the close and the cancel are needed, in that order. Closing the conn
-// is what unblocks the session's read loop — cancelling alone would deadlock
+// is what unblocks the session's read loop. Cancelling alone would deadlock
 // the teardown, which calls sess.Close() before conn.Close() and so waits on
 // a reader still parked in conn.Read. Cancelling is what makes it prompt:
 // closing alone would leave the keepalive's Run loop waiting out the full
@@ -752,7 +752,7 @@ func (pc *peerConn) notePeerRedialed() {
 //
 // Rate-limited rather than silent or spammy. transport.Supervisor.Run
 // deliberately does no logging of its own, so before this existed a peer
-// that could not dial out produced *no log line at all* — the error reached
+// that could not dial out produced *no log line at all*. The error reached
 // `syncat status` as lastErr and nowhere else. That is a bad way to find
 // out a link is down: this node looks like it is merely backing off, and
 // the only thing written to any log is on the *other* node, which keeps
@@ -775,7 +775,7 @@ func (pc *peerConn) noteDialFailure(stage string, err error) {
 	// to call this when supersededByAdoptedConn says a connection landed
 	// during the dial; this closes the remaining window, where adoption
 	// happens between that check and this line. Counting and logging the
-	// failure is still right — the dial really did fail — but a peer we
+	// failure is still right, since the dial really did fail, but a peer we
 	// hold a live session to is connected, whatever our own dial did.
 	if pc.session == nil {
 		pc.state = ConnStateBackingOff
@@ -792,7 +792,7 @@ func (pc *peerConn) noteDialFailure(stage string, err error) {
 // SPEC.md §2.4's dedup rule, and reports the condition once it has
 // repeated enough times to mean something is wrong.
 //
-// A single loss — even a few — is entirely normal for the lower-keyed side
+// A single loss, even a few, is entirely normal for the lower-keyed side
 // of a pairing: it means the peer is the one responsible for this
 // connection, and its own dial is expected to land within a beat, at which
 // point offer adopts it and resets this counter. What is not normal is
@@ -803,7 +803,7 @@ func (pc *peerConn) noteDialFailure(stage string, err error) {
 // simply offline: state "connecting", no error, no log line.
 //
 // This deliberately sets lastErr without touching state. The node really
-// is still connecting, and it is still correct for it to keep trying — the
+// is still connecting, and it is still correct for it to keep trying. The
 // only thing missing was a way to see why it never finishes.
 func (pc *peerConn) noteDedupLoss() {
 	pc.mu.Lock()
@@ -827,7 +827,7 @@ func (pc *peerConn) noteDedupLoss() {
 // disable stops pc from ever dialing and records why, for a peer that is
 // misconfigured badly enough that dialing it could not possibly succeed
 // (see Open's own-token check). The peerConn stays registered so the peer
-// remains visible — with reason attached — in `syncat peer ls` and the web
+// remains visible, with reason attached, in `syncat peer ls` and the web
 // UI for as long as it is still in config.json.
 func (pc *peerConn) disable(reason string) {
 	pc.cancel()
@@ -856,7 +856,7 @@ func (pc *peerConn) currentSession() *syncsvc.Session {
 }
 
 // neuterShare blocks a share on this peer's current session, if any (both
-// Direction flags set — see the package doc comment) and stops counting it
+// Direction flags set; see the package doc comment) and stops counting it
 // as active for propagation. Root is irrelevant once both flags are set:
 // Reconcile/SyncShare both check InboundBlocked/OutboundBlocked before
 // ever touching cfg.Root (see reconcile.go and session.go), so an empty

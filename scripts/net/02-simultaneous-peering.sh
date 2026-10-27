@@ -2,7 +2,7 @@
 # The dedup race, on the real relay, repeated.
 #
 # When both nodes are given each other's token at the same instant, both dial
-# and SPEC.md §2.4 keeps exactly one of the two connections — the one dialed
+# and SPEC.md §2.4 keeps exactly one of the two connections, the one dialed
 # by the node with the higher Ed25519 key. The loser's connection is closed
 # by the winner, and that close lands on whatever the losing side happened to
 # be doing, including the last step of its own handshake.

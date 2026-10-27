@@ -47,7 +47,7 @@ func TestHandlerMimeTypes(t *testing.T) {
 	// "/index.html" is deliberately not a case here: http.FileServer
 	// canonicalizes a request for the index file itself into a 301
 	// redirect to "/" (standard net/http behavior, nothing to do with
-	// this package's own logic) — TestHandlerServesIndexAtRoot already
+	// this package's own logic), TestHandlerServesIndexAtRoot already
 	// covers "/" serving index.html with the right Content-Type.
 	cases := []struct {
 		path   string
@@ -80,7 +80,7 @@ func TestHandlerMimeTypes(t *testing.T) {
 // path.Cleans the request URL before resolving it against the FS, so a
 // traversal attempt collapses to an in-tree (or nonexistent) path long
 // before either defense matters in practice. Every case here must come
-// back 404, and — the actually security-relevant assertion — must never
+// back 404, and, the actually security-relevant assertion, must never
 // come back 200 with content from outside internal/webui/static/.
 func TestHandlerRejectsPathTraversal(t *testing.T) {
 	paths := []string{

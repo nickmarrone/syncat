@@ -20,7 +20,7 @@ import (
 // TestSessionDoneClosesWhenPeerDisconnects is the property Done exists for.
 //
 // Nothing else in a Session reacts to a disconnect, so before Done the only
-// thing that noticed one was protocol.Keepalive's dead timer — SPEC.md §4's
+// thing that noticed one was protocol.Keepalive's dead timer, SPEC.md §4's
 // full 90s, even for a peer that closed cleanly and immediately. The
 // timeout here is deliberately far below that: passing it on the dead
 // timer alone is impossible.
@@ -122,8 +122,8 @@ func TestSessionDoneClosesOnOwnClose(t *testing.T) {
 
 // silentPeerSession returns a started Session whose peer end is drained but
 // never answered: every frame the session writes is read off the wire and
-// dropped. That is the peer SPEC.md §4/§5 promise doesn't exist — one that
-// replies to a FileRequest with neither a chunk nor an Error — and the only
+// dropped. That is the peer SPEC.md §4/§5 promise doesn't exist, one that
+// replies to a FileRequest with neither a chunk nor an Error, and the only
 // thing pullFile can do about it is give up.
 func silentPeerSession(t *testing.T, stall time.Duration) *Session {
 	t.Helper()
@@ -156,8 +156,8 @@ func TestPullFileStallsWhenPeerNeverAnswers(t *testing.T) {
 
 	// The stuck pull was never the real harm: it held one of
 	// maxConcurrentPulls slots for as long as the session lived, so four of
-	// them wedged every transfer with that peer while the connection still
-	// looked perfectly healthy — pings, index updates and share lists kept
+	// them stalled every transfer with that peer while the connection still
+	// looked perfectly healthy, pings, index updates and share lists kept
 	// flowing, so nothing declared it dead. Releasing the slot is the point.
 	if held := len(s.pullSem); held != 0 {
 		t.Errorf("%d of %d pull slots still held after the stall, want 0", held, maxConcurrentPulls)
@@ -315,7 +315,7 @@ func TestSessionStatsCountStaleTransferFrames(t *testing.T) {
 
 // newWarningSession builds a bare Session for exercising the warning
 // bookkeeping directly. Nothing here touches the connection, so a nil conn
-// is fine — the same trick session_test's trash helpers use.
+// is fine, the same trick session_test's trash helpers use.
 func newWarningSession(t *testing.T) *Session {
 	t.Helper()
 	return NewSession(nil, nil, "self", "peerid", nil, log.New(io.Discard, "", 0))
@@ -373,7 +373,7 @@ func TestRecordWarningKeepsLatestPerPath(t *testing.T) {
 // life. A reconcile pass sees the whole share, so the paths it flags are
 // the complete set of currently-diverged files; anything still holding a
 // warning has converged and its warning is stale. Without this the UI's
-// warning list only ever grew — a divergence the user resolved stayed on
+// warning list only ever grew, a divergence the user resolved stayed on
 // screen for the life of the connection.
 func TestRetainWarningsDropsConverged(t *testing.T) {
 	s := newWarningSession(t)

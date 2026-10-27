@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Peering is mutual (SPEC.md §2.1): pasting one node's token into the other
 # is only half of it. This pins what the *unpeered* half does in the
-# meantime — it must reject the connection and say so, not quietly accept it
-# and not wedge — and that completing the pairing afterwards recovers with no
+# meantime, it must reject the connection and say so, not quietly accept it
+# and not hang, and that completing the pairing afterwards recovers with no
 # restart, no stale error, and no manual intervention.
 #
 # README calls this out as the state users land in most often: "adding a peer
@@ -50,7 +50,7 @@ nx alice peer add "$(nx bob token)" --name bob >/dev/null
 wait_for "$CONNECT_TIMEOUT" "alice to see bob connected" peer_connected alice bob
 wait_for "$CONNECT_TIMEOUT" "bob to see alice connected" peer_connected bob alice
 
-# The rejections happened, and are meant to stay visible as history — this
+# The rejections happened, and are meant to stay visible as history, this
 # just confirms recovery did not depend on clearing them.
 assert_mutually_clean alice bob
 

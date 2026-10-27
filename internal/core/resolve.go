@@ -8,10 +8,10 @@ import (
 
 // --- reference resolution ---------------------------------------------------
 
-// Reference resolution for the CLI and REST surface.
+// Reference resolution for the CLI and REST API.
 //
-// Every peer and share has an unreadable canonical id — a 64-hex Ed25519
-// public key, a 16-hex share id — and a readable display name shown right
+// Every peer and share has an unreadable canonical id (a 64-hex Ed25519
+// public key, a 16-hex share id) and a readable display name shown right
 // beside it by `syncat peer ls` and `syncat remote ls`. Taking only the id
 // is a usability trap: the name is what a user reads, remembers, and types,
 // so `syncat subscription add nishinomiya test ./test/` is the natural
@@ -27,8 +27,8 @@ import (
 //
 // Checked strictly in that order, so an id always wins over a name that
 // happens to look like one, and an exact match always wins over a prefix.
-// Ambiguity is an error naming every candidate rather than a silent pick —
-// resolving "test" to whichever share sorted first is exactly the class of
+// Ambiguity is an error naming every candidate rather than a silent pick.
+// Resolving "test" to whichever share sorted first is exactly the class of
 // bug this file exists to remove.
 
 // matchRef applies the resolution order above to a set of candidates,
@@ -92,8 +92,8 @@ func describeCandidates(candidates [][2]string) string {
 	return strings.Join(out, ", ")
 }
 
-// resolvePeerRef resolves a peer ref — hex key, display name, or unique key
-// prefix — to the configured peer it names.
+// resolvePeerRef resolves a peer ref (hex key, display name, or unique key
+// prefix) to the configured peer it names.
 func (n *Node) resolvePeerRef(ref string) (*peerConn, error) {
 	peers := n.snapshotPeers()
 	candidates := make([][2]string, 0, len(peers))
@@ -116,7 +116,7 @@ func (n *Node) resolvePeerRef(ref string) (*peerConn, error) {
 // offered us.
 //
 // A peer that has never sent a ShareList (not connected since this process
-// started — remoteShares is in-memory only) leaves us nothing to resolve
+// started, since remoteShares is in-memory only) leaves us nothing to resolve
 // against, so the ref is passed through as a literal share id. Subscribing
 // to a peer before ever connecting to it is legitimate, and refusing it
 // outright would be worse than taking the id on faith.
@@ -145,7 +145,7 @@ func (n *Node) resolveOfferedShareRef(pc *peerConn, ref string) (string, error) 
 // Deliberately best-effort: whatever it cannot resolve it passes through
 // unchanged, so the caller's own "is not configured" error is what the user
 // sees. That matters most for the case resolution would otherwise make
-// unfixable — a subscription whose peer is no longer configured, which is
+// unfixable, namely a subscription whose peer is no longer configured, which is
 // precisely the state a bad `subscribe` used to leave behind. Those have to
 // stay removable by their literal stored values.
 func (n *Node) resolveSubscriptionRef(peerRef, shareRef string) (peerKeyHex, shareID string) {
@@ -200,7 +200,7 @@ func (n *Node) resolveLocalShareRef(ref string) (string, error) {
 // A subscription's display name comes from the offering peer's last
 // ShareList, so it is only known while that peer has been connected during
 // this run. A subscription with no name yet is still matchable by id or id
-// prefix — it simply contributes no name to match against.
+// prefix. It simply contributes no name to match against.
 func (n *Node) resolveShareOrSubscriptionRef(ref string) (string, error) {
 	type subRef struct{ peerKeyHex, shareID string }
 

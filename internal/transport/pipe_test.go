@@ -223,7 +223,7 @@ func TestPipeTransportLocalAddressBeforeStartFails(t *testing.T) {
 // This is a regression test for the pipe transport itself. The hand-rolled
 // buffered net.Conn this transport used to be evaluated its read deadline
 // once, at the top of Read, so a SetDeadline arriving afterwards could not
-// unblock anything — and Handshake's ctx watcher does precisely that, on a
+// unblock anything, and Handshake's ctx watcher does precisely that, on a
 // connection another goroutine is already blocked reading. Nothing failed;
 // the cancellation path simply never worked over the test transport, and
 // no test could tell.
@@ -239,7 +239,7 @@ func TestPipeTransportReadDeadlineInterruptsBlockedRead(t *testing.T) {
 		readErr <- err
 	}()
 
-	// Give the Read time to actually block before arming the deadline —
+	// Give the Read time to actually block before arming the deadline,
 	// the point of the test is the deadline landing on an in-flight Read,
 	// not on one that hasn't started.
 	time.Sleep(50 * time.Millisecond)
@@ -269,9 +269,9 @@ func TestPipeTransportWriteFailsAfterPeerClose(t *testing.T) {
 		t.Fatalf("peer Close: %v", err)
 	}
 
-	// The first write after the peer's close usually succeeds — it lands
-	// in the send buffer before the RST arrives — so keep writing until
-	// one fails. A write deadline keeps a wedged socket from hanging the
+	// The first write after the peer's close usually succeeds, it lands
+	// in the send buffer before the RST arrives, so keep writing until
+	// one fails. A write deadline keeps a stuck socket from hanging the
 	// test instead of failing it.
 	payload := make([]byte, 1024)
 	deadline := time.Now().Add(5 * time.Second)

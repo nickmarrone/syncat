@@ -487,7 +487,7 @@ func TestFrameGarbageBytesNeverPanics(t *testing.T) {
 			// Drain everything this "stream" will give us; garbage bytes
 			// can legally decode as a well-formed (if meaningless) frame
 			// header, so ReadFrame may succeed one or more times before
-			// running out of input — the only requirement is: no panic.
+			// running out of input, the only requirement is: no panic.
 			for {
 				_, _, err := r.ReadFrame()
 				if err != nil {
@@ -521,7 +521,7 @@ func TestFrameGarbagePayloadNeverPanicsCBORDecode(t *testing.T) {
 // allocated so far", used only to sanity-check that rejecting an oversized
 // frame length doesn't allocate a buffer anywhere near that size. It's
 // intentionally simple (runtime.ReadMemStats is process-wide and includes
-// noise from the test binary itself) — see the generous threshold at the
+// noise from the test binary itself). See the generous threshold at the
 // call site.
 func allocatedBytes() uint64 {
 	var m runtime.MemStats
@@ -533,7 +533,7 @@ func allocatedBytes() uint64 {
 // whatever payload it yields, the message decoders layered on top
 // ([DecodeMessage] into every known struct type, [DecodeFileChunk]).
 // Per SPEC.md §13.9/§14, none of this may ever panic on attacker-supplied
-// bytes — the only acceptable outcomes are "returns a value" or "returns
+// bytes, the only acceptable outcomes are "returns a value" or "returns
 // an error".
 func FuzzDecode(f *testing.F) {
 	// Seed with valid frames for every message type, so the fuzzer starts
@@ -588,7 +588,7 @@ func FuzzDecode(f *testing.F) {
 				return
 			}
 			// Whatever type came back, try decoding the payload as every
-			// message shape we know about (not just the declared type —
+			// message shape we know about (not just the declared type,
 			// a corrupted type byte should still never cause a panic
 			// when something downstream naively decodes it) plus the
 			// FileChunk header/data split.

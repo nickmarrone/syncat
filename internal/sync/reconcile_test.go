@@ -661,7 +661,7 @@ func ignoreOnly(paths ...string) func(string, bool) bool {
 // TestReconcile_IgnoredRemoteOnlyFile_NotPulled closes the flap loop. An
 // ignored path has no local index row, so without the filter it looks like
 // a brand-new remote file: we would pull it, index it, ignore it on the
-// next scan, and then propagate the resulting tombstone back — deleting
+// next scan, and then propagate the resulting tombstone back, deleting
 // the peer's copy.
 func TestReconcile_IgnoredRemoteOnlyFile_NotPulled(t *testing.T) {
 	remote := []protocol.FileInfo{fi("build/out.o", 100, "x", vv("remote", 1), false)}
@@ -674,7 +674,7 @@ func TestReconcile_IgnoredRemoteOnlyFile_NotPulled(t *testing.T) {
 
 // TestReconcile_IgnoredRemoteTombstone_NoLocalDelete is the data-loss case.
 // Once a path is ignored it has no local row, so a peer deleting *their*
-// copy reaches reconcileOne as a remote-only tombstone — which would
+// copy reaches reconcileOne as a remote-only tombstone, which would
 // execute a delete against our still-present local file.
 func TestReconcile_IgnoredRemoteTombstone_NoLocalDelete(t *testing.T) {
 	remote := []protocol.FileInfo{fi("secret.txt", 100, "x", vv("remote", 2), true)}

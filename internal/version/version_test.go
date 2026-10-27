@@ -13,7 +13,7 @@ func TestVersionIsSet(t *testing.T) {
 
 // TestStringStartsWithVersion pins the shape String() promises: Version,
 // optionally followed by "+" and build metadata. Anything reading the
-// version — a human, a bug report, a `syncat status --json` consumer —
+// version, a human, a bug report, a `syncat status --json` consumer,
 // relies on the release number being the leading, unadorned part.
 //
 // The commit suffix is deliberately not asserted on: `go test` builds

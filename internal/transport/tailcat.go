@@ -192,11 +192,11 @@ func (t *TailcatTransport) Start(ctx context.Context, onConn func(net.Conn)) err
 // peer, since each independently dials and keeps a "home" DERP connection
 // alive) needs a *distinct* key, or their DERP registrations keep
 // stealing each other's routing slot. Concretely: reusing the server's
-// key here meant that the moment any client (i.e. any dial — including
+// key here meant that the moment any client (i.e. any dial, including
 // one started well after Start, like Node.AddPeer's) registered with
 // DERP, it silently superseded the server's own registration, so a
 // MeowPing another peer sent us landed on a Client's locoBackend instead
-// of the Server's — and Client.onDERPRecv explicitly ignores MeowPing
+// of the Server's, and Client.onDERPRecv explicitly ignores MeowPing
 // ("client ignores MeowPing"). The sender then just sits on
 // Client.Ping's unconditional 10s internal timeout, forever, with no
 // error surfaced anywhere below dialAttempt. See internal/core/peer.go's
@@ -270,10 +270,10 @@ func (t *TailcatTransport) Dial(ctx context.Context, addr string) (net.Conn, err
 // WireGuard peer. So a cached Client which has meowed once never meows
 // again. When the peer restarts, its new process has no WireGuard peers at
 // all, and every later dial on the cached Client sends TCP into a tunnel
-// the far side will not accept — forever, because each retry reuses the
+// the far side will not accept, forever, because each retry reuses the
 // same latched Client.
 //
-// Observed as a striking asymmetry: restarting the *peer* wedged the link
+// Observed as a striking asymmetry: restarting the *peer* stalled the link
 // permanently, while restarting *this* node fixed it (Close clears the
 // whole map). Nothing on this side said anything; the only visible symptom
 // was on the peer, which kept dialing, kept authenticating, and kept losing
@@ -353,7 +353,7 @@ func (t *TailcatTransport) Close() error {
 	if srv != nil && state == tailcatStateStarted {
 		// tailcat's TCP stack is userspace: exiting right after closing a
 		// net.Conn can lose its final FIN before it's ever transmitted, so
-		// drain first (bounded — the peer may simply be gone).
+		// drain first (bounded, the peer may simply be gone).
 		drainCtx, cancel := context.WithTimeout(context.Background(), drainTimeout)
 		if err := srv.DrainTCP(drainCtx); err != nil {
 			t.logf("transport: tailcat: drain: %v", err)

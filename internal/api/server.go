@@ -11,7 +11,7 @@
 // crypto/subtle.ConstantTimeCompare so a wrong guess can't be timed. The
 // one exception is GET /ui-token, a login-less same-origin bootstrap the
 // embedded web UI uses to fetch the token before it can set the header
-// itself — see handleUIToken's doc comment for its defenses.
+// itself. See handleUIToken's doc comment for its defenses.
 //
 // The listener itself is loopback-only (ListenLoopback refuses to bind
 // anything else) so the API is never reachable from the LAN even if the
@@ -111,7 +111,7 @@ func NormalizeLoopbackAddress(addr string) (LoopbackAddress, error) {
 	return LoopbackAddress{BindAddress: authority, ClientAuthority: authority}, nil
 }
 
-// Handler returns the http.Handler to serve — wraps the routed mux with
+// Handler returns the http.Handler to serve. It wraps the routed mux with
 // panic recovery (a handler bug must never crash the daemon) and basic
 // access logging.
 func (s *Server) Handler() http.Handler {
@@ -120,7 +120,7 @@ func (s *Server) Handler() http.Handler {
 
 // ListenLoopback binds a TCP listener on addr, refusing to bind any host
 // that isn't loopback (SPEC.md §8: "the API isn't exposed on the LAN even
-// if the token leaks" — see the package doc comment). An empty host in
+// if the token leaks", see the package doc comment). An empty host in
 // addr (e.g. ":8347") is treated as 127.0.0.1, matching config.Default's
 // APIAddr shape ("127.0.0.1:8347") rather than defaulting to "all
 // interfaces" the way net.Listen normally would.
@@ -175,7 +175,7 @@ func (s *Server) routes() {
 	// /api/status instead. Not registered at all, so it 404s like any
 	// other unknown route rather than pretending to stream.
 
-	// Embedded web UI (internal/webui, go:embed) — see webui.Handler's
+	// Embedded web UI (internal/webui, go:embed). See webui.Handler's
 	// doc comment for its own path-traversal and auth reasoning.
 	// Unauthenticated by design: a browser must be able to load the page
 	// before it has a token (GET /ui-token is how it gets one).
@@ -205,7 +205,7 @@ func (s *Server) auth(h http.HandlerFunc) http.HandlerFunc {
 //
 //  1. RemoteAddr must be loopback. Read from the actual TCP connection
 //     (http.Request.RemoteAddr), never a client-supplied header like
-//     X-Forwarded-For — this server has no reverse proxy in front of it
+//     X-Forwarded-For. This server has no reverse proxy in front of it
 //     (it binds loopback-only, see ListenLoopback), so RemoteAddr is
 //     trustworthy and a spoofable header would only weaken the check.
 //
@@ -214,7 +214,7 @@ func (s *Server) auth(h http.HandlerFunc) http.HandlerFunc {
 //     attacker.com can have its DNS re-pointed at 127.0.0.1 mid-session,
 //     after which a same-origin fetch("/ui-token") from that page really
 //     does connect to this loopback server (RemoteAddr genuinely is
-//     loopback) — but the browser still sets the Host header from the
+//     loopback), but the browser still sets the Host header from the
 //     URL's authority, "attacker.com", which it never lets page JS
 //     override. Comparing Host against our real listener address catches
 //     exactly that case, which the RemoteAddr check alone cannot.
@@ -228,12 +228,12 @@ func (s *Server) auth(h http.HandlerFunc) http.HandlerFunc {
 //     browser's same-origin policy to stop the attacker page from
 //     *reading* the response (this server also sends no
 //     Access-Control-Allow-Origin header, so that read would already be
-//     blocked — this check adds defense in depth and a clean 403 instead
+//     blocked, this check adds defense in depth and a clean 403 instead
 //     of quietly processing a request that came from nowhere legitimate).
 //     Origin is intentionally *not* required to be present: some
 //     legitimate same-origin requests (plain top-level navigation, and
 //     historically some same-origin fetches) omit it, and Host has
-//     already done the load-bearing check.
+//     already done the essential check.
 func (s *Server) handleUIToken(w http.ResponseWriter, r *http.Request) {
 	if !isLoopbackAddr(r.RemoteAddr) {
 		writeError(w, http.StatusForbidden, "forbidden", "this endpoint is only served to localhost")
@@ -312,7 +312,7 @@ func (s *Server) recoverMiddleware(next http.Handler) http.Handler {
 
 // statusRecorder captures the response status so logMiddleware can decide
 // after the fact whether a request was worth a log line. WriteHeader is not
-// guaranteed to be called — a handler that only writes a body implies 200 —
+// guaranteed to be called, a handler that only writes a body implies 200,
 // so status is seeded with http.StatusOK rather than zero.
 type statusRecorder struct {
 	http.ResponseWriter
@@ -331,7 +331,7 @@ func (rec *statusRecorder) Unwrap() http.ResponseWriter { return rec.ResponseWri
 // isPollEndpoint reports whether path is one the web UI polls on a timer
 // rather than one a user or the CLI drives. The dashboard refreshes
 // GET /api/status every 2s for as long as a browser tab is open, so logging
-// every one of those buries every other line in the daemon's log — 30
+// every one of those buries every other line in the daemon's log, 30
 // lines a minute that say only "a tab is still open". A *failing* poll is
 // a different matter (see logMiddleware): a status request that starts
 // answering 401 or 500 is exactly the kind of thing the log should carry.

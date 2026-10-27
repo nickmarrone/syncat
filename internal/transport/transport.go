@@ -1,6 +1,6 @@
 // Package transport abstracts peer connectivity behind a Transport
 // interface, with a tailcat implementation for production (tailcat.go)
-// and an in-process net.Pipe implementation for tests (pipe.go) — SPEC.md §10.
+// and an in-process net.Pipe implementation for tests (pipe.go), per SPEC.md §10.
 // It also owns the reconnect schedule (Backoff/Supervisor) and SPEC.md
 // §2.4's duplicate-connection tie-break (KeepConnection).
 package transport
@@ -24,8 +24,8 @@ import (
 // tests. A future mobile-native carrier need only satisfy this interface.
 //
 // Per SPEC.md §4, one Transport connection (whether returned by Dial or
-// handed to onConn by Start) carries exactly one syncat protocol stream —
-// framing, handshake, and message types are internal/protocol's concern,
+// handed to onConn by Start) carries exactly one syncat protocol stream.
+// Framing, handshake, and message types are internal/protocol's concern,
 // not this package's.
 type Transport interface {
 	// Start begins accepting inbound connections, invoking onConn in a new
@@ -34,7 +34,7 @@ type Transport interface {
 	// background goroutines, until the transport is closed.
 	Start(ctx context.Context, onConn func(net.Conn)) error
 
-	// Dial opens a connection to the peer identified by addr — the "tc"
+	// Dial opens a connection to the peer identified by addr, the "tc"
 	// field of that peer's sc1 token (SPEC.md §2) for [TailcatTransport],
 	// or a registry key for [PipeTransport].
 	Dial(ctx context.Context, addr string) (net.Conn, error)
@@ -42,7 +42,7 @@ type Transport interface {
 	// DiscardPeer drops whatever per-peer state the transport has cached
 	// for addr, so the next Dial to it starts from scratch. Called when a
 	// connection to that peer has ended and anything cached for it should
-	// be assumed stale — notably tailcat's per-peer Client, whose "tell the
+	// be assumed stale, notably tailcat's per-peer Client, whose "tell the
 	// server to add us as a WireGuard peer" handshake happens once per
 	// Client and never again (see TailcatTransport.discardClient).
 	//
@@ -57,7 +57,7 @@ type Transport interface {
 
 	// Close shuts down the transport: it stops accepting new connections
 	// and releases background resources. It does not forcibly close
-	// connections already handed to onConn or returned by Dial — callers
+	// connections already handed to onConn or returned by Dial. Callers
 	// own those and must close them separately. Close is safe to call more
 	// than once, and safe to call without a prior Start.
 	Close() error
@@ -133,7 +133,7 @@ func (b Backoff) jitter() float64 {
 //
 // rnd supplies the randomness for jitter: the returned delay is uniform in
 // [(1-Jitter)*d, d] where d is the un-jittered delay. A nil rnd disables
-// jitter, returning d itself — useful in tests that want to assert the
+// jitter, returning d itself. Useful in tests that want to assert the
 // base schedule without also accounting for randomness.
 func (b Backoff) NextDelay(failures int, rnd *rand.Rand) time.Duration {
 	if failures < 0 {
@@ -205,7 +205,7 @@ type Supervisor struct {
 // Run calls dial in a loop until ctx is done. Each call should attempt one
 // connection and block for as long as it stays usable, then return: nil if
 // the disconnect shouldn't count as a failure (e.g. a clean shutdown, or
-// the losing side of dedup closing voluntarily — see [KeepConnection]), or
+// the losing side of dedup closing voluntarily, see [KeepConnection]), or
 // a non-nil error otherwise. The failure count backing off the delay
 // between calls resets to zero after any call that returns nil.
 func (s Supervisor) Run(ctx context.Context, dial func(ctx context.Context) error) {
@@ -254,16 +254,16 @@ func (s Supervisor) Run(ctx context.Context, dial func(ctx context.Context) erro
 // exposes the decision itself; internal/core's peer manager calls it once
 // both connections to a peer are authenticated.
 //
-// Both ends of a duplicate pair call this with dialed flipped — one side's
-// outbound connection is the other side's inbound connection — and always
+// Both ends of a duplicate pair call this with dialed flipped (one side's
+// outbound connection is the other side's inbound connection) and always
 // agree on which single connection survives: for connection C dialed by
 // node D and accepted by node O, D calls KeepConnection(D.key, O.key,
 // true) and O calls KeepConnection(O.key, D.key, false); both evaluate to
 // bytes.Compare(D.key, O.key) > 0, so they reach the same answer about C
 // without coordinating. (Equal keys can't arise between distinct peers in
 // practice; KeepConnection still returns a well-defined, self-consistent
-// answer for them — the "peer" with the equal key is treated as not
-// higher — it just isn't a meaningful dedup decision.)
+// answer for them. The "peer" with the equal key is treated as not
+// higher. It just isn't a meaningful dedup decision.)
 func KeepConnection(local, peer ed25519.PublicKey, dialed bool) bool {
 	localIsHigher := bytes.Compare(local, peer) > 0
 	return dialed == localIsHigher

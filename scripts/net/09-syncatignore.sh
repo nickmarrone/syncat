@@ -6,7 +6,7 @@
 # once, and only the first is obvious:
 #
 #   1. An ignored file never leaves this node.
-#   2. An ignored file is never accepted from a peer either — and crucially,
+#   2. An ignored file is never accepted from a peer either, and
 #      not accepting it must not turn into deleting the peer's copy. A node
 #      that pulled an ignored file would index it, ignore it on the next
 #      scan, tombstone it, and propagate that tombstone back.

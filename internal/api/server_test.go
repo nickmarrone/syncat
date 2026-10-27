@@ -33,7 +33,7 @@ const testSelfAddr = "127.0.0.1:8347"
 var testCounter int
 
 // newTestServer builds a Server over a freshly opened core.Node (PipeTransport,
-// temp config/data dirs — SPEC.md §10's loopback transport stand-in),
+// temp config/data dirs, SPEC.md §10's loopback transport stand-in),
 // closed automatically via t.Cleanup.
 func newTestServer(t *testing.T) (*Server, *core.Node, *config.Paths) {
 	t.Helper()
@@ -92,12 +92,12 @@ func doRequest(t *testing.T, srv *Server, method, path, token string, body any) 
 }
 
 // fakePeerToken builds a syntactically valid sc1 token (SPEC.md §2) for a
-// peer key that isn't backed by any running node — it's not reachable at
+// peer key that isn't backed by any running node, it's not reachable at
 // its "tc" tailcat address. That's deliberate: tests exercising peer CRUD
 // via the API only care that AddPeer accepts/parses a token and persists a
 // peer, not that a connection can actually be established, so this avoids
 // spinning up a second live node (and the dial/handshake/backoff
-// goroutines that would come with it — unrelated background activity a
+// goroutines that would come with it, unrelated background activity a
 // peer-CRUD test has no reason to trigger).
 func fakePeerToken(t *testing.T, name string) string {
 	t.Helper()
@@ -227,7 +227,7 @@ func TestUITokenAcceptsLoopbackSameOrigin(t *testing.T) {
 
 func TestUITokenAcceptsAbsentOrigin(t *testing.T) {
 	// A same-origin request that omits Origin (common for plain GETs)
-	// must still succeed — Host is the load-bearing check.
+	// must still succeed, Host is the essential check.
 	srv, _, _ := newTestServer(t)
 	req := httptest.NewRequest(http.MethodGet, "/ui-token", nil)
 	req.RemoteAddr = "[::1]:54321"
@@ -763,7 +763,7 @@ func TestTrashListAndRestoreRoundTrip(t *testing.T) {
 	}
 
 	// Put something in the trash the way applyDelete/pullAndInstall would
-	// (see internal/sync/trash.go's doc comment) — a second Trash instance
+	// (see internal/sync/trash.go's doc comment), a second Trash instance
 	// over the same on-disk root as the node's own.
 	tr := syncsvc.NewTrash(paths.TrashDir(), nil)
 	src := filepath.Join(t.TempDir(), "foo.txt")
@@ -833,7 +833,7 @@ func TestSubscriptionsAddRejectsUnknownPeer(t *testing.T) {
 // TestSubscriptionsList covers the GET that completes the collection:
 // /api/peers and /api/shares have always had one, and subscriptions
 // were the one collection you could create, modify and delete but never
-// enumerate — so `syncat subscription ls` had nothing to call.
+// enumerate, so `syncat subscription ls` had nothing to call.
 func TestSubscriptionsList(t *testing.T) {
 	srv, _, _ := newTestServer(t)
 
@@ -902,7 +902,7 @@ func captureLogs(srv *Server) func() string {
 // TestLogMiddlewareSkipsSuccessfulStatusPolls covers the noise rule: the web
 // UI polls GET /api/status every 2s for as long as a tab is open, so logging
 // each one buries every other line in the daemon's log. A *failing* poll is
-// still logged — a status request answering 401 is exactly the kind of thing
+// still logged, a status request answering 401 is exactly the kind of thing
 // the log exists for.
 func TestLogMiddlewareSkipsSuccessfulStatusPolls(t *testing.T) {
 	srv, _, _ := newTestServer(t)

@@ -19,12 +19,12 @@ import (
 
 // ScanResult is a Scanner.Scan diff against the index's current view of a
 // share, bucketed by the classification SPEC.md §5 asks for. Scanning
-// never mutates the index itself — see Scanner.Scan's doc comment for why
-// applying is a separate step — so a ScanResult is inert data until a
+// never mutates the index itself. See Scanner.Scan's doc comment for why
+// applying is a separate step, so a ScanResult is inert data until a
 // caller passes it to Store.ApplyScanResult.
 //
 // None of the rows here carry a bumped version vector: Scanner has no
-// opinion on version-vector algebra — that lives in internal/sync. For an
+// opinion on version-vector algebra, which lives in internal/sync. For an
 // existing file, a row's Version is copied unchanged from the index's
 // current entry; for a brand-new or resurrected path, Version is nil. The
 // caller bumps local counters (internal/core's rescanShare does) before
@@ -34,11 +34,11 @@ type ScanResult struct {
 
 	// Added holds paths with no corresponding live index entry: brand new
 	// files/dirs, and paths whose only prior index entry was a tombstone
-	// (Deleted=true) — i.e. resurrections.
+	// (Deleted=true), i.e. resurrections.
 	Added []FileRow
 
 	// ContentChanged holds files whose size or mtime differ from the
-	// index AND whose sha256 differs from the index's recorded hash —
+	// index AND whose sha256 differs from the index's recorded hash,
 	// i.e. the bytes actually changed.
 	ContentChanged []FileRow
 
@@ -55,7 +55,7 @@ type ScanResult struct {
 	// entirely; SPEC.md §5's "keep non-empty locally-modified dirs" rule
 	// belongs to internal/sync's apply step, not here.
 	//
-	// A path that is merely newly *ignored* never lands here — see
+	// A path that is merely newly *ignored* never lands here. See
 	// Ignored, and the comment there for why the distinction matters.
 	Deleted []FileRow
 
@@ -72,7 +72,7 @@ type ScanResult struct {
 	// entry, so peers are told nothing and keep what they have.
 	//
 	// Parking keeps the row (and with it the version vector) rather than
-	// deleting it — see FileRow.Ignored for why discarding the vector
+	// deleting it. See FileRow.Ignored for why discarding the vector
 	// would leave the two sides permanently diverged if the rule were
 	// ever removed.
 	Ignored []FileRow
@@ -80,7 +80,7 @@ type ScanResult struct {
 	// Warnings collects human-readable descriptions of entries the scan
 	// skipped rather than erroring out on: symlinks (not followed in the
 	// MVP), and paths that vanished or changed underfoot mid-walk. A
-	// non-empty Warnings never means the scan failed — see Scanner.Scan.
+	// non-empty Warnings never means the scan failed. See Scanner.Scan.
 	Warnings []string
 }
 
@@ -94,7 +94,7 @@ type ScanResult struct {
 // directory listing when the value supports it. os.DirFS(shareRoot)
 // satisfies both, so production needs no adapter and tests can substitute
 // fstest.MapFS. There is deliberately no write-side interface: nothing
-// here writes into a share tree — that belongs to internal/sync.
+// here writes into a share tree, which belongs to internal/sync.
 //
 // The zero value is not usable; construct with NewScanner.
 type Scanner struct {
@@ -104,7 +104,7 @@ type Scanner struct {
 
 // NewScanner returns a Scanner that reads share contents through fsys
 // (typically os.DirFS(shareRoot) in production) and excludes paths
-// matched by ignore (nil is fine — nothing is ignored).
+// matched by ignore (nil is fine and ignores nothing).
 func NewScanner(fsys fs.FS, ignore *Matcher) *Scanner {
 	return &Scanner{fsys: fsys, ignore: ignore}
 }
@@ -115,14 +115,14 @@ func (r *ScanResult) warnf(format string, args ...any) {
 }
 
 // Scan walks the share and classifies every entry against existing (the
-// index's current rows for this share, including tombstones — see
+// index's current rows for this share, including tombstones; see
 // Store.ListShareMap). It does not write anything to the index; the
 // caller applies the result explicitly (e.g. via Store.ApplyScanResult)
 // once it's ready to make the change durable. This split matters because
 // the caller needs to see a scan's outcome before it becomes the new
 // source of truth (e.g. to fold in version-vector bumps).
 //
-// Scan is robust to the tree changing underneath it: a file or directory
+// Scan tolerates the tree changing underneath it: a file or directory
 // that vanishes, or a file that shrinks/errors out while being hashed,
 // is recorded in ScanResult.Warnings and skipped, never treated as a
 // fatal error that aborts the rest of the walk. Scan returns a non-nil
@@ -153,8 +153,8 @@ func (sc *Scanner) Scan(ctx context.Context, shareID string, existing map[string
 		}
 		if old.Ignored {
 			// A parked row whose file is gone from disk. It is not on
-			// disk and not synced, so there is nothing to report — and
-			// emphatically nothing to tombstone, since a tombstone would
+			// disk and not synced, so there is nothing to report and
+			// nothing to tombstone, since a tombstone would
 			// propagate and delete the peer's copy of a file we merely
 			// stopped tracking.
 			continue
@@ -174,7 +174,7 @@ func (sc *Scanner) Scan(ctx context.Context, shareID string, existing map[string
 // noteworthy), marks the path seen, and classifies the entry against
 // existing into one of result's buckets. It returns fs.SkipDir to prune a
 // subtree, and a non-nil error only for the share root itself being
-// unreadable — every other problem is a warning, never a walk failure.
+// unreadable. Every other problem is a warning, never a walk failure.
 func (sc *Scanner) visit(result *ScanResult, existing map[string]FileRow, seen map[string]bool, now time.Time, p string, d fs.DirEntry, err error) error {
 	shareID := result.ShareID
 	if p == "." {
@@ -196,7 +196,7 @@ func (sc *Scanner) visit(result *ScanResult, existing map[string]FileRow, seen m
 	relpath := path.Clean(p)
 	if relpath == "." || relpath == ".." || strings.HasPrefix(relpath, "../") || path.IsAbs(relpath) {
 		// Defensive only: fs.WalkDir's paths are already clean,
-		// relative, and rooted at fsys — this should be unreachable
+		// relative, and rooted at fsys. This should be unreachable
 		// for any real fs.FS implementation, but we never trust a
 		// path enough to let it name something outside the share.
 		result.warnf("index: scan %s: rejecting escaping path %q", shareID, p)
@@ -210,7 +210,7 @@ func (sc *Scanner) visit(result *ScanResult, existing map[string]FileRow, seen m
 		sc.noteIgnored(result, existing, seen, relpath)
 		if d.IsDir() && sc.ignore.PruneDirs() {
 			// Pruning means the children are never visited, so they
-			// would never be marked seen — and Scan's tail loop would
+			// would never be marked seen, and Scan's tail loop would
 			// tombstone every one of them. Account for them here.
 			sc.noteIgnoredSubtree(result, existing, seen, relpath)
 			return fs.SkipDir
@@ -252,7 +252,7 @@ func (sc *Scanner) visit(result *ScanResult, existing map[string]FileRow, seen m
 
 	// A parked (previously ignored) row resurrects through Added rather
 	// than the classify path below, so that un-ignoring always produces a
-	// row the caller will version-bump — even when the file's bytes never
+	// row the caller will version-bump, even when the file's bytes never
 	// changed while it was ignored, which classifyExisting would other-
 	// wise report as "unchanged" and leave parked forever. carriedVersion
 	// keeps the old vector, so the bump dominates the peer's copy.
@@ -272,7 +272,7 @@ func (sc *Scanner) visit(result *ScanResult, existing map[string]FileRow, seen m
 
 	// SPEC.md §5: "A file is 'changed' when size or mtime differs
 	// from the index; then hash (sha256) to confirm. Hash-equal =>
-	// metadata-only update, no transfer." This is the load-bearing
+	// metadata-only update, no transfer." This is the essential
 	// distinction; see scanner_test.go for the case that pins it.
 	var sha []byte
 	if needsHash(old, info) {
@@ -294,10 +294,10 @@ func (sc *Scanner) visit(result *ScanResult, existing map[string]FileRow, seen m
 
 // noteIgnored records that relpath is ignored: it marks the path seen, so
 // Scan's tail loop does not mistake "ignored" for "deleted from disk", and
-// — if the index still holds a live row for it — queues that row for
+// if the index still holds a live row for it, queues that row for
 // removal in ScanResult.Ignored.
 //
-// Marking seen is the load-bearing half. Without it, adding one pattern to
+// Marking seen is the essential half. Without it, adding one pattern to
 // a .syncatignore tombstones every path it matches, and those tombstones
 // propagate and delete the files on every peer.
 func (sc *Scanner) noteIgnored(result *ScanResult, existing map[string]FileRow, seen map[string]bool, relpath string) {
@@ -332,7 +332,7 @@ const (
 	fileContentChanged                   // row goes in ScanResult.ContentChanged
 )
 
-// needsHash reports whether info's size or mtime differ from old's — the
+// needsHash reports whether info's size or mtime differ from old's. This is the
 // cheap pre-check SPEC.md §5 uses to decide a file must be re-hashed
 // before it can be classified. Files that pass it are never re-read.
 func needsHash(old FileRow, info fs.FileInfo) bool {
@@ -342,7 +342,7 @@ func needsHash(old FileRow, info fs.FileInfo) bool {
 // classifyExisting decides how a live, indexed file (old, stored under
 // shareID/relpath) relates to what is on disk now (info), and builds the
 // replacement row. sha is the file's current hash, and is only consulted
-// when needsHash(old, info) is true — callers pass nil otherwise, having
+// when needsHash(old, info) is true. Callers pass nil otherwise, having
 // skipped the read. It is a pure function of its inputs: no I/O, no
 // mutation of old (the returned row carries a fresh copy of old's version
 // vector, unchanged).
@@ -377,7 +377,7 @@ func classifyExisting(shareID, relpath string, old FileRow, info fs.FileInfo, sh
 
 // carriedVersion returns the version vector a newly-classified "Added" row
 // should carry: nil for a genuinely new path, or the prior tombstone's
-// vector (unchanged — the caller decides how to bump it) for a resurrection.
+// vector (unchanged, the caller decides how to bump it) for a resurrection.
 func carriedVersion(old FileRow, existed bool) protocol.VersionVector {
 	if !existed {
 		return nil
@@ -421,14 +421,14 @@ func (sc *Scanner) hashFile(relpath string) ([]byte, error) {
 //
 // Glob semantics for the first two layers, stated precisely because the web
 // UI and the README both have to describe them exactly (the .syncatignore
-// layer has its own, richer syntax — see ParseIgnore):
+// layer has its own, richer syntax; see ParseIgnore):
 //
 //   - Every pattern is a path.Match pattern: '*' matches any sequence of
 //     non-'/' characters, '?' matches any single non-'/' character, and
-//     '[...]' is a character class. There is no '**' — a pattern cannot
+//     '[...]' is a character class. There is no '**'. A pattern cannot
 //     cross a '/' boundary by itself (path.Match's ErrBadPattern aside,
 //     unmatched pattern syntax is treated as "does not match", not an
-//     error — see path.Match's own doc comment).
+//     error; see path.Match's own doc comment).
 //   - A path is ignored if the pattern matches EITHER the entry's base
 //     name (path.Base(relpath)) OR the full share-relative path
 //     (forward-slash separated, no leading '/'), tried independently. A
@@ -442,7 +442,7 @@ func (sc *Scanner) hashFile(relpath string) ([]byte, error) {
 //     reconciler asks about one path at a time and never walks, so the
 //     rule has to live here for the two to agree.
 //   - relpath is always expected in forward-slash form (as produced by
-//     the scanner — see scanner.go), regardless of host OS.
+//     the scanner, see scanner.go), regardless of host OS.
 type Matcher struct {
 	patterns []string
 	rules    *IgnoreRules // the share's .syncatignore; nil when it has none
@@ -495,7 +495,7 @@ func (m *Matcher) MatchPath(relpath string, isDir bool) bool {
 	}
 	// Ancestors first: a glob naming a directory excludes everything
 	// under it, the same way the scanner's fs.SkipDir does. Without this
-	// the two disagree — the scanner would prune "build/" while the
+	// the two disagree: the scanner would prune "build/" while the
 	// reconciler happily pulled "build/out.o" back from a peer, indexed
 	// it, pruned it again, and pulled it again.
 	for i := 0; i < len(relpath); i++ {
@@ -525,8 +525,8 @@ func (m *Matcher) matchGlobs(p string) bool {
 }
 
 // PruneDirs reports whether the scanner may skip an ignored directory
-// without descending into it. That is the cheap path — it is what keeps a
-// node_modules/ rule from costing a walk of node_modules — but it is only
+// without descending into it. That is the cheap path, and it keeps a
+// node_modules/ rule from costing a walk of node_modules, but it is only
 // sound when no rule can re-include something underneath. A '!' pattern
 // anywhere in the share's .syncatignore turns it off, and the scanner
 // tests every entry individually instead.

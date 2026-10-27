@@ -2,7 +2,7 @@
 # Removing a peer, over a live connection.
 #
 # A subscription names the peer that offers its share, so one left behind
-# after that peer is removed could never sync again — it would just sit in
+# after that peer is removed could never sync again, it would just sit in
 # `syncat status` forever with a watcher still running. The removal must take
 # the subscriptions with it, tear the session down on *both* sides, and leave
 # every file it had already synced exactly where it is: removal unsubscribes,
@@ -46,7 +46,7 @@ file_content_is "$BOB_SYNC/keep.txt" "synced before removal" ||
 info "ok: keep.txt survived the removal"
 
 log "Alice must lose the session too, and must not get it back"
-# Alice still has bob configured, so she keeps dialing — but bob no longer
+# Alice still has bob configured, so she keeps dialing, but bob no longer
 # knows her, so every attempt is rejected at the handshake.
 wait_while 60 "alice's session with bob to end" peer_connected alice bob
 wait_for "$CONNECT_TIMEOUT" "bob to start recording alice's dials as rejected" rejected_has bob "$ALICE_KEY"

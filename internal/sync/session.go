@@ -19,18 +19,16 @@ import (
 
 // maxConcurrentPulls bounds the number of FileRequests this Session keeps
 // outstanding to one peer at once (SPEC.md §4: "max 4 concurrent pulls per
-// peer"). Additional pulls queue on pullSem until a slot frees; chunks for
+// peer"). Additional pulls queue on pullSem until a slot frees. Chunks for
 // every in-flight pull are interleaved on the one underlying stream
-// (protocol.Writer is safe for concurrent writers — see message.go), which
-// is what lets several transfers make progress at once without their own
-// separate connections.
+// (protocol.Writer is safe for concurrent writers, see message.go), so
+// several transfers make progress at once without separate connections.
 const maxConcurrentPulls = 4
 
 // maxConcurrentServes bounds how many FileRequests from the peer we answer
-// at once. SPEC.md §4 only specifies a limit on the puller side, but
-// capping our own serving concurrency too keeps resource usage (open file
-// descriptors, goroutines) bounded symmetrically instead of growing
-// unboundedly with however many requests the peer happens to send at once.
+// at once. SPEC.md §4 only limits the puller side, but capping serving
+// concurrency too bounds open file descriptors and goroutines, which would
+// otherwise grow with however many requests the peer sends.
 const maxConcurrentServes = 4
 
 // maxConcurrentIndexJobs bounds independently requested index work. Index
@@ -53,47 +51,42 @@ type ShareConfig struct {
 	Root      string // absolute local directory this share's files live under
 	Direction Direction
 
-	// Ignore reports whether a share-relative path is excluded from
-	// syncing by this share's ignore rules — the built-ins, the global
-	// ignore list, and the share's own .syncatignore (SPEC.md §5). nil
-	// means nothing is ignored, which keeps the zero value usable.
+	// Ignore reports whether a share-relative path is excluded from syncing
+	// by this share's ignore rules: the built-ins, the global ignore list, and
+	// the share's own .syncatignore (SPEC.md §5). nil means nothing is
+	// ignored, so the zero value is usable.
 	//
-	// It is a closure rather than an *index.Matcher (which would compile
-	// fine — internal/sync already imports internal/index) because
-	// .syncatignore is re-read on every rescan: a snapshotted matcher
-	// would go stale the moment the user edited the file, and nothing
-	// re-adds a share when that happens. internal/core resolves this
-	// against the share's current matcher on every call.
+	// It is a closure rather than an *index.Matcher because .syncatignore is
+	// re-read on every rescan. A snapshotted matcher would go stale when the
+	// user edits the file, and nothing re-adds a share when that happens.
+	// internal/core resolves the closure against the share's current matcher
+	// on every call.
 	Ignore func(relpath string, isDir bool) bool
 }
 
-// ignored is Ignore with the nil check folded in, since almost every call
-// site is on a path where no ignore rules are configured at all.
+// ignored calls Ignore after checking it for nil.
 func (c ShareConfig) ignored(relpath string, isDir bool) bool {
 	return c.Ignore != nil && c.Ignore(relpath, isDir)
 }
 
-// Session drives sync for one already-authenticated peer connection:
-// exchanging IndexUpdate for each configured share, pulling and serving
-// file content, and applying the resulting actions ([Reconcile]'s output)
-// to the local filesystem and index. One Session corresponds to
-// one net.Conn (SPEC.md §4: a single stream carries every share synced
-// with that peer) and can hold any number of shares.
+// Session drives sync for one authenticated peer connection. It exchanges
+// IndexUpdate for each configured share, pulls and serves file content, and
+// applies the actions from [Reconcile] to the local filesystem and index.
+// One Session wraps one net.Conn (SPEC.md §4: a single stream carries every
+// share synced with that peer) and can hold any number of shares.
 //
-// Session assumes internal/protocol's handshake and the share/access
-// negotiation already happened, and handles only IndexUpdate, FileRequest,
-// FileChunk, and file-transfer-scoped Error from that point on. Other
-// message types arriving on the stream are handed to the control handler
-// internal/core registers (see SetControlHandler), because driving those
-// exchanges is the peer manager's job. This keeps Session fully driveable
-// from a test with a bare net.Conn (e.g. transport.PipeTransport) and no
-// real peer manager.
+// Session assumes the handshake and the share/access negotiation in
+// internal/protocol already happened. From then on it handles only
+// IndexUpdate, FileRequest, FileChunk, and file-transfer-scoped Error. It
+// passes other message types to the control handler that internal/core
+// registers (see SetControlHandler), because the peer manager drives those
+// exchanges. A test can therefore drive a Session with a bare net.Conn
+// (e.g. transport.PipeTransport) and no peer manager.
 //
 // Every background goroutine Session starts is tied to the context passed
-// to Start and unwound by Close, which cancels that context, closes the
-// connection (unblocking the read loop's pending Read), and waits for
-// every goroutine to exit — so a Session never leaks goroutines across its
-// own lifetime.
+// to Start. Close cancels that context, closes the connection (which
+// unblocks the read loop's pending Read), and waits for every goroutine to
+// exit, so no goroutine outlives the Session.
 type Session struct {
 	conn   net.Conn
 	reader *protocol.Reader
@@ -104,45 +97,42 @@ type Session struct {
 	peerID string // the peer's ShortID
 	clock  Clock
 
-	// trash is this Session's trash can (SPEC.md §7). Set via SetTrash;
-	// nil until then, in which case trashHook is a no-op (see apply.go) —
-	// so a Session is still fully usable in tests/contexts that don't
-	// care about trash.
+	// trash is this Session's trash can (SPEC.md §7). SetTrash sets it. Until
+	// then it is nil and trashHook does nothing (see apply.go), so tests that
+	// ignore trash can use a Session without one.
 	trash *Trash
 
 	// warningsMu/warnings record every LocallyModifiedWarning this Session
-	// has raised (SPEC.md §1/§5's receive-only "flagged as locally
-	// modified" UI warning), for a caller (the API layer) to read back.
-	// warnIndex keys warnings by share+relpath so a file that stays
-	// diverged across many reconcile passes occupies one entry rather
-	// than one per pass — see recordWarning.
+	// has raised (the receive-only "flagged as locally modified" UI warning in
+	// SPEC.md §1/§5). The API layer reads them back. warnIndex keys warnings by
+	// share+relpath, so a file that stays diverged across many reconcile
+	// passes occupies one entry instead of one per pass. See recordWarning.
 	warningsMu sync.Mutex
 	warnings   []LocallyModifiedWarning
 	warnIndex  map[string]int
 
 	logger *log.Logger
 
-	// peerLabel is what logf puts in front of every line for this session.
-	// It defaults to peerID (an 8-byte hex ShortID) and is replaced by the
-	// peer's configured name via SetPeerLabel, so sync's log lines can be
-	// matched up with core's — which have always used the name — without
-	// cross-referencing `syncat peer ls`.
+	// peerLabel prefixes every logf line for this session. It defaults to
+	// peerID (an 8-byte hex ShortID). SetPeerLabel replaces it with the peer's
+	// configured name, so sync's log lines match core's, which use the name,
+	// without cross-referencing `syncat peer ls`.
 	peerLabel string
 
 	// debug enables debugf, the routine-activity log (per-pass reconcile
-	// summaries). Off by default: these fire on every index update from
-	// every peer, which is the right level of detail when diagnosing why a
-	// share will not converge and far too much for a daemon at rest.
+	// summaries). It is off by default. These lines fire on every index update
+	// from every peer, which helps when diagnosing a share that will not
+	// converge and is too noisy for an idle daemon.
 	debug bool
 
-	// ctrlMu guards controlHandler/frameObserver, internal/core's hooks for
-	// driving the parts of the connection lifecycle Session itself doesn't
-	// own: ShareList/SubscribeRequest/AccessUpdate/Ping/Pong (see readLoop's
-	// default case) and keepalive activity tracking (frameObserver fires
-	// for every frame this Session reads, of any type, matching
-	// protocol.Keepalive's "any frame counts as received traffic"
-	// contract). Both are nil-safe: set them before calling Start to avoid
-	// racing the read loop's first frame.
+	// ctrlMu guards controlHandler and frameObserver, hooks internal/core
+	// uses to drive the parts of the connection lifecycle that Session does
+	// not own. controlHandler receives ShareList, SubscribeRequest,
+	// AccessUpdate, Ping, and Pong (see readLoop's default case).
+	// frameObserver fires for every frame this Session reads, of any type, for
+	// keepalive activity tracking, matching protocol.Keepalive's "any frame
+	// counts as received traffic" contract. Both may be nil. Set them before
+	// calling Start so they cannot race the read loop's first frame.
 	ctrlMu         sync.Mutex
 	controlHandler func(typ protocol.MsgType, payload []byte)
 	frameObserver  func(typ protocol.MsgType)
@@ -155,18 +145,16 @@ type Session struct {
 	sentMu     sync.Mutex
 	sentIndex  map[string]sentIndexState
 
-	// reconcileMu serializes Reconcile+apply+index-update passes across
-	// the whole session (all shares). IndexUpdates are handled
-	// concurrently with everything else (see handleIndexUpdate's
-	// goroutine in the read loop, needed to avoid a pull deadlocking
-	// against the very read loop that would deliver its chunks), but two
-	// reconcile passes racing each other — e.g. our own reply to peer A
-	// triggering a fresh IndexUpdate back from peer A while a second one
-	// is still mid-flight — could otherwise double-apply or interleave
-	// badly. Locking the whole pass is the simplest correct answer; it
-	// doesn't block transfers themselves, which run under this lock only
-	// long enough to hand off to pullFile (the actual byte transfer waits
-	// on the read loop independently).
+	// reconcileMu serializes Reconcile+apply+index-update passes across the
+	// whole session (all shares). The read loop handles IndexUpdates in their
+	// own goroutines (handleIndexUpdate), because a pull would otherwise
+	// deadlock against the read loop that delivers its chunks. Two reconcile
+	// passes that race could double-apply or interleave badly, for example
+	// when our reply to peer A triggers a fresh IndexUpdate from peer A while a
+	// second one is still in flight. Locking the whole pass is the simplest
+	// correct fix. It does not block transfers: a pass holds the lock only
+	// long enough to hand off to pullFile, and the byte transfer waits on the
+	// read loop independently.
 	reconcileMu sync.Mutex
 
 	pullMu       sync.Mutex
@@ -181,9 +169,9 @@ type Session struct {
 	serveMu      sync.Mutex
 	serveCancel  map[string]context.CancelFunc
 
-	// pullActive/pullPeak instrument concurrent-pull behavior for tests
-	// (see integration_test.go's interleaving test); always zero-cost in
-	// production beyond a couple of atomic ops.
+	// pullActive/pullPeak count concurrent pulls for tests (see
+	// integration_test.go's interleaving test). In production they cost a
+	// couple of atomic operations.
 	pullActive      int32
 	pullPeak        int32
 	stats           sessionCounters
@@ -191,32 +179,28 @@ type Session struct {
 	lastStaleLog    time.Time
 	staleSuppressed uint64
 
-	// testServeDelay, if non-zero, is slept before serving each
-	// FileRequest. It exists solely so a test can make transfers slow
-	// enough to observe real concurrency (see integration_test.go); it is
-	// unexported and never set outside this package's own tests.
+	// testServeDelay, if non-zero, is slept before serving each FileRequest.
+	// A test sets it to slow transfers enough to observe real concurrency (see
+	// integration_test.go). Only this package's tests set it.
 	testServeDelay time.Duration
 
-	// testPullStallTimeout, if non-zero, replaces pullStallTimeout. Same
-	// deal as testServeDelay: a test can't wait a real minute to watch a
-	// silent peer time out.
+	// testPullStallTimeout, if non-zero, replaces pullStallTimeout, so a
+	// test need not wait a real minute for a silent peer to time out.
 	testPullStallTimeout time.Duration
 
-	// testJournalPageSize, if non-zero, replaces journalPageSize. Same deal
-	// again: journalling 20,000 changes to watch a second page happen is
-	// not a test anyone will keep running.
+	// testJournalPageSize, if non-zero, replaces journalPageSize, so a test
+	// need not journal 20,000 changes to see a second page.
 	testJournalPageSize int
 
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
-	// done is closed when the read loop exits, i.e. the moment this session
-	// stops being usable — a peer that closed the connection, a broken
-	// socket, a frame we couldn't read. See [Session.Done]: the owner
-	// (internal/core's peer manager) watches it so a disconnect is acted on
-	// when it happens rather than when the keepalive's dead timer next
-	// notices.
+	// done is closed when the read loop exits, which is when this session
+	// stops being usable: the peer closed the connection, the socket broke, or
+	// a frame could not be read. See [Session.Done]. The owner (internal/core's
+	// peer manager) watches it to act on a disconnect when it happens, not
+	// when the keepalive's dead timer next notices.
 	done        chan struct{}
 	lifecycleMu sync.Mutex
 	lifecycle   sessionLifecycle
@@ -224,10 +208,10 @@ type Session struct {
 
 type sessionLifecycle uint8
 
-// sentIndexState is the highest index position which this live session has
-// actually put on the connection for one share. Store high-water marks are
-// deliberately insufficient: they can include a local change queued after the
-// last frame the peer received.
+// sentIndexState is the highest index position this live session has put
+// on the connection for one share. Store high-water marks are not enough,
+// because they can include a local change queued after the last frame the
+// peer received.
 type sentIndexState struct {
 	epoch      string
 	high       uint64
@@ -315,11 +299,11 @@ var (
 )
 
 // NewSession constructs a Session over conn. nodeID is this node's own
-// ShortID (used to bump version vectors on conflict resolution);
-// peerID is the ShortID of the node at the other end of conn, used to key
-// its mirrored index rows (index.Store.UpsertPeerFiles/ListPeerFiles). If
-// clock is nil, time.Now is used (see reconcile.go's Clock). If logger is
-// nil, log.Default() is used.
+// ShortID, used to bump version vectors on conflict resolution. peerID is
+// the ShortID of the node at the other end of conn, and keys its mirrored
+// index rows (index.Store.UpsertPeerFiles/ListPeerFiles). If clock is nil,
+// time.Now is used (see reconcile.go's Clock). If logger is nil,
+// log.Default() is used.
 func NewSession(conn net.Conn, store *index.Store, nodeID, peerID string, clock Clock, logger *log.Logger) *Session {
 	if clock == nil {
 		clock = time.Now
@@ -353,9 +337,9 @@ func NewSession(conn net.Conn, store *index.Store, nodeID, peerID string, clock 
 	}
 }
 
-// startBounded starts fn only after reserving capacity. It is called by the
-// single read loop, so a failed non-blocking reservation is an explicit
-// overload decision rather than another hidden queue of goroutines.
+// startBounded starts fn only after reserving capacity. The single read
+// loop calls it, so a failed non-blocking reservation is an explicit
+// overload decision, not another hidden queue of goroutines.
 func (s *Session) startBounded(sem chan struct{}, fn func()) bool {
 	select {
 	case sem <- struct{}{}:
@@ -371,9 +355,10 @@ func (s *Session) startBounded(sem chan struct{}, fn func()) bool {
 	}
 }
 
-// enqueueIndex schedules one coalescible index operation. At most one job for
-// a key runs at once; while it runs, repeated notifications replace one
-// pending follow-up instead of creating waiters or disconnecting the peer.
+// enqueueIndex schedules one coalescible index operation. At most one job
+// for a key runs at once. While it runs, repeated notifications replace a
+// single pending follow-up instead of creating waiters or disconnecting
+// the peer.
 func (s *Session) enqueueIndex(key string, fn func()) bool {
 	s.indexMu.Lock()
 	defer s.indexMu.Unlock()
@@ -447,15 +432,15 @@ func (s *Session) AddShare(cfg ShareConfig) {
 }
 
 // SetTrash configures the Trash this Session's trashHook uses (SPEC.md
-// §7). Safe to call before or after Start; nil (the default) makes
-// trashHook a no-op.
+// §7). Safe to call before or after Start. nil (the default) makes
+// trashHook do nothing.
 func (s *Session) SetTrash(tr *Trash) {
 	s.trash = tr
 }
 
-// SetPeerLabel replaces the peer identifier logf prefixes this session's
-// log lines with (default: the peer's ShortID). internal/core passes the
-// peer's configured name. Call before Start, like the other setters.
+// SetPeerLabel replaces the peer identifier that logf prefixes to this
+// session's log lines (default: the peer's ShortID). internal/core passes
+// the peer's configured name. Call before Start, like the other setters.
 func (s *Session) SetPeerLabel(label string) {
 	if label != "" {
 		s.peerLabel = protocol.SanitizeDiagnostic(label)
@@ -469,16 +454,15 @@ func (s *Session) SetDebug(debug bool) {
 }
 
 // SetControlHandler registers fn to be called, synchronously from the read
-// loop, for every frame type this Session doesn't itself handle: Hello,
+// loop, for every frame type this Session does not handle itself: Hello,
 // Auth, ShareList, SubscribeRequest, AccessUpdate, Ping, and Pong (see
-// readLoop's default case). This is internal/core's hook for driving the
-// peering flow (SPEC.md §2, §4, §6) on the same connection Session reads
-// exclusively — Session remains "the single reader of the connection"
-// (readLoop's own invariant); fn just gets a look at what readLoop would
-// otherwise silently drop. fn should not block for long (it runs on the
-// read loop goroutine, same as every other dispatch here); spin off a
-// goroutine internally for anything that does I/O. Call before Start to
-// avoid racing the very first frame the peer sends.
+// readLoop's default case). internal/core uses it to drive the peering
+// flow (SPEC.md §2, §4, §6) on the connection Session reads exclusively.
+// Session remains "the single reader of the connection" (readLoop's own
+// invariant), and fn sees frames that readLoop would otherwise drop. fn
+// runs on the read loop goroutine like every other dispatch here, so it
+// should not block for long. Start a goroutine for anything that does
+// I/O. Call before Start so fn cannot miss the peer's first frame.
 func (s *Session) SetControlHandler(fn func(typ protocol.MsgType, payload []byte)) {
 	s.ctrlMu.Lock()
 	s.controlHandler = fn
@@ -486,12 +470,12 @@ func (s *Session) SetControlHandler(fn func(typ protocol.MsgType, payload []byte
 }
 
 // SetFrameObserver registers fn to be called once per frame read, of any
-// type, before dispatch — internal/core's hook for driving
-// protocol.Keepalive.RecordReceived, since SPEC.md §4's "90s without
-// traffic" dead-connection rule counts every message, not just Ping/Pong,
-// and only Session's read loop ever sees the IndexUpdate/FileRequest/
-// FileChunk/Error traffic that SetControlHandler's default case never
-// reaches. Call before Start, for the same reason as SetControlHandler.
+// type, before dispatch. internal/core uses it to drive
+// protocol.Keepalive.RecordReceived. SPEC.md §4's "90s without traffic"
+// dead-connection rule counts every message, not just Ping/Pong, and only
+// Session's read loop sees the IndexUpdate/FileRequest/FileChunk/Error
+// traffic that SetControlHandler's default case never reaches. Call before
+// Start, for the same reason as SetControlHandler.
 func (s *Session) SetFrameObserver(fn func(typ protocol.MsgType)) {
 	s.ctrlMu.Lock()
 	s.frameObserver = fn
@@ -499,24 +483,23 @@ func (s *Session) SetFrameObserver(fn func(typ protocol.MsgType)) {
 }
 
 // SetAppliedHandler registers fn to be called after a reconcile pass that
-// actually changed something on disk, naming the share it changed —
-// internal/core's hook for fanning that change out to this share's *other*
-// peers.
+// changed something on disk, naming the share it changed. internal/core
+// uses it to fan that change out to the share's *other* peers.
 //
-// Session cannot do that itself: it owns one connection and knows nothing
-// about the others. It already tells the peer it just heard from, by
-// sending a delta back at the end of handleIndexUpdate, and for a two-node
-// pairing that is the whole story. It is not the whole story for a share
-// offered to more than one peer. SPEC.md §5's fan-out rule routes those
-// through the offerer, so when bob's change reaches alice it is alice who
-// has to pass it to carol — and nothing else will. The rescan that
-// internal/core triggers from fsnotify compares the working tree against
-// the index, and applying a pulled change updates both, so that scan finds
-// no difference and stops before it would propagate. The periodic rescan
-// finds the same nothing, so it never self-heals either.
+// Session cannot do that itself, because it owns one connection and knows
+// nothing about the others. At the end of handleIndexUpdate it sends a
+// delta back to the peer it just heard from, which is enough for a
+// two-node pairing. It is not enough for a share offered to more than one
+// peer. SPEC.md §5's fan-out rule routes those through the offerer, so
+// when bob's change reaches alice, alice has to pass it to carol and
+// nothing else will. The rescan that internal/core triggers from fsnotify
+// compares the working tree against the index. Applying a pulled change
+// updates both, so that scan finds no difference and stops before it would
+// propagate. The periodic rescan finds the same nothing, so it never
+// self-heals either.
 //
 // fn is called from the goroutine handling the peer's update, not the read
-// loop, but it should still hand off anything slow: it runs while
+// loop, but it should still hand off anything slow, because it runs while
 // reconcileMu is held for that share.
 func (s *Session) SetAppliedHandler(fn func(shareID string)) {
 	s.ctrlMu.Lock()
@@ -526,12 +509,12 @@ func (s *Session) SetAppliedHandler(fn func(shareID string)) {
 
 // Writer returns this Session's protocol.StreamWriter, so internal/core's
 // peer manager can send ShareList / SubscribeRequest / AccessUpdate / Ping
-// frames on the same connection Session writes
-// IndexUpdate/FileRequest/FileChunk/Error to. It is safe for concurrent
-// use, never tears or interleaves frames, and — because all of those are
-// control frames, which it drains ahead of file bytes — never makes its
-// caller wait behind a transfer. That last property is what lets the read
-// loop reply to a Ping inline (see SetControlHandler).
+// frames on the same connection where Session writes
+// IndexUpdate/FileRequest/FileChunk/Error. It is safe for concurrent use
+// and never tears or interleaves frames. All of those are control frames,
+// which it drains ahead of file bytes, so a caller never waits behind a
+// transfer. That is what lets the read loop reply to a Ping inline (see
+// SetControlHandler).
 func (s *Session) Writer() *protocol.StreamWriter {
 	return s.writer
 }
@@ -540,11 +523,11 @@ func (s *Session) Writer() *protocol.StreamWriter {
 // (SPEC.md §1, §5): a subscriber's local edit that diverged from the
 // offerer under a receive-only subscription. Reverted reports whether the
 // offerer already had content to revert to (a trash copy was taken and the
-// offerer's version installed) or the divergence was only flagged because
-// there was nothing yet to revert to (a local-only file the offerer
-// doesn't have — see applyLocallyModified in apply.go). Session keeps a
-// log of these (Session.LocallyModifiedWarnings) for the API and UI to
-// surface.
+// offerer's version installed). When it is false, the divergence was only
+// flagged because there was nothing to revert to, as with a local-only
+// file the offerer does not have (see applyLocallyModified in apply.go).
+// Session keeps a log of these (Session.LocallyModifiedWarnings) for the
+// API and UI to show.
 type LocallyModifiedWarning struct {
 	ShareID  string
 	RelPath  string
@@ -564,20 +547,20 @@ func (s *Session) LocallyModifiedWarnings() []LocallyModifiedWarning {
 }
 
 // recordWarning records w, replacing any previous warning for the same
-// share and relpath, and reports whether this is a *new* divergence — one
-// for which no warning was already standing.
+// share and relpath. It reports whether this is a *new* divergence, one
+// with no warning already standing.
 //
-// The dedup is not just tidiness. A locally-modified file is a standing
-// condition, not an event: it is re-detected by every reconcile pass for as
-// long as it stays diverged, and a receive-only share with a handful of
-// stray files reaches thousands of entries in an idle afternoon. Appending
-// each one grew this slice without bound for the life of the connection and
-// made the API repeat the same file once per pass in the UI's warning list.
-// Keeping the newest warning per path gives the UI exactly the set of
-// currently-diverged files, which is what it was always trying to show.
+// The dedup does more than tidy. A locally-modified file is a standing
+// condition, not an event. Every reconcile pass re-detects it for as long
+// as it stays diverged, and a receive-only share with a handful of stray
+// files reaches thousands of entries in an idle afternoon. Appending each
+// one grew this slice without bound for the life of the connection and
+// made the API repeat the same file once per pass in the UI's warning
+// list. Keeping the newest warning per path gives the UI the set of
+// currently-diverged files, which is what it was meant to show.
 //
-// The returned bool is what lets apply.go log a divergence once, when it
-// starts, instead of on every pass — see its call sites.
+// apply.go uses the returned bool to log a divergence once, when it
+// starts, instead of on every pass. See its call sites.
 func (s *Session) recordWarning(w LocallyModifiedWarning) bool {
 	key := w.ShareID + "\x00" + w.RelPath
 	s.warningsMu.Lock()
@@ -595,15 +578,16 @@ func (s *Session) recordWarning(w LocallyModifiedWarning) bool {
 // not in stillFlagged, and reports how many it dropped.
 //
 // A reconcile pass sees the whole share, so the paths it flags as locally
-// modified *are* the complete set of currently-diverged files for that
+// modified are the complete set of currently-diverged files for that
 // share. Anything holding a warning from an earlier pass but absent here
-// has converged — the user reverted their edit, or the file was deleted —
-// and its warning is stale. Without this the UI's warning list only ever
-// grew: a divergence that resolved itself stayed on screen for the life of
-// the connection.
+// has converged (the user reverted their edit, or the file was deleted),
+// and its warning is stale. Without this the UI's warning list only grew:
+// a divergence that resolved itself stayed on screen for the life of the
+// connection.
 //
-// Called once per pass rather than per file so the whole reconciliation
-// costs one lock acquisition, not one per path in the share.
+// It runs once per pass instead of once per file, so the whole
+// reconciliation takes one lock acquisition, not one per path in the
+// share.
 func (s *Session) retainWarnings(shareID string, stillFlagged map[string]bool) int {
 	s.warningsMu.Lock()
 	defer s.warningsMu.Unlock()
@@ -640,7 +624,7 @@ func (s *Session) getShare(shareID string) (ShareConfig, bool) {
 }
 
 // acceptsInboundIndex is the admission gate for peer-supplied index state.
-// Session.shares is the authorization source: database rows and a wire
+// Session.shares is the authorization source. Database rows and a wire
 // share ID never confer access by themselves.
 func (s *Session) acceptsInboundIndex(shareID string) bool {
 	cfg, ok := s.getShare(shareID)
@@ -648,8 +632,8 @@ func (s *Session) acceptsInboundIndex(shareID string) bool {
 }
 
 // servesOutboundShare is the admission gate for requests for our index or
-// file bytes. Receive-only shares are present locally but must never disclose
-// their local state back to the peer.
+// file bytes. Receive-only shares exist locally but must never disclose
+// their local state to the peer.
 func (s *Session) servesOutboundShare(shareID string) bool {
 	cfg, ok := s.getShare(shareID)
 	return ok && !cfg.Direction.OutboundBlocked
@@ -674,9 +658,9 @@ func (s *Session) noteDeltaWritten(shareID, epoch string, high uint64) {
 }
 
 // acceptIndexAck advances the persistent cursor only to the newest index
-// endpoint actually written by this live session. Requiring the exact newest
-// endpoint keeps the admission state constant-sized; an older legitimate ack
-// may be ignored because the peer will also acknowledge the newer frame it has
+// endpoint this live session wrote. Requiring the exact newest endpoint
+// keeps the admission state constant-sized. An older legitimate ack may be
+// ignored, because the peer will also acknowledge the newer frame it has
 // already received.
 func (s *Session) acceptIndexAck(m protocol.IndexAck) bool {
 	s.sentMu.Lock()
@@ -694,16 +678,16 @@ func (s *Session) acceptIndexAck(m protocol.IndexAck) bool {
 	}) == nil
 }
 
-// Start begins the session's read loop and its writer in background
+// Start runs the session's read loop and its writer in background
 // goroutines and returns immediately. ctx bounds the session's lifetime in
 // addition to Close: canceling ctx (or calling Close) stops all background
 // work.
 //
-// Writes before Start fail with protocol.ErrWriterNotStarted — the writer
-// is started here rather than in NewSession so that a Session constructed
-// for something other than driving a connection (see internal/sync's own
-// tests, which build one over a nil conn purely to reach its trash
-// helpers) never starts a goroutine.
+// Writes before Start fail with protocol.ErrWriterNotStarted. Start
+// launches the writer, not NewSession, so a Session built for something
+// other than driving a connection never starts a goroutine. internal/sync's
+// own tests do this, building one over a nil conn to reach its trash
+// helpers.
 func (s *Session) Start(ctx context.Context) error {
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
@@ -730,18 +714,18 @@ func (s *Session) Start(ctx context.Context) error {
 
 // Done returns a channel closed when the session's read loop has exited:
 // the peer closed the connection, the socket broke, or Close was called.
-// It is the session's own "this connection is finished" signal, and the
-// owner is expected to watch it — nothing else in the session reacts to a
-// disconnect, so a caller that instead waits for protocol.Keepalive's dead
-// timer to notice pays SPEC.md §4's full 90s before it reconnects, even
-// when the peer said goodbye cleanly and immediately.
+// It is the session's own "this connection is finished" signal. The owner
+// should watch it, because nothing else in the session reacts to a
+// disconnect. A caller that waits for protocol.Keepalive's dead timer
+// instead pays SPEC.md §4's full 90s before it reconnects, even when the
+// peer said goodbye cleanly and immediately.
 //
 // The channel is never closed for a Session that was never started.
 func (s *Session) Done() <-chan struct{} {
 	return s.done
 }
 
-// Close stops the session: it cancels the internal context, closes the
+// Close stops the session. It cancels the internal context, closes the
 // underlying connection (unblocking any pending Read in the read loop),
 // stops the writer, and waits for every goroutine Session started to
 // exit. Safe to call more than once.
@@ -756,9 +740,9 @@ func (s *Session) Close() error {
 	if s.cancel != nil {
 		s.cancel()
 	}
-	// Before the writer: closing the connection is what unblocks a
-	// write already in progress, and StreamWriter.Close waits for its
-	// goroutine to return.
+	// Close the connection before the writer. Closing it unblocks a write
+	// already in progress, and StreamWriter.Close waits for that goroutine to
+	// return.
 	if s.conn != nil {
 		_ = s.conn.Close()
 	}
@@ -782,9 +766,9 @@ func (s *Session) debugf(format string, args ...any) {
 
 // SyncShare sends a full snapshot IndexUpdate (Full: true) for shareID to
 // the peer, unless the share's Direction blocks outbound updates
-// (receive-only subscription). This is what a caller uses to kick off the
-// initial sync after connecting, and what internal/core's share watcher
-// calls (via propagateShare) to notify the peer of a local change.
+// (receive-only subscription). A caller uses it to start the initial sync
+// after connecting, and internal/core's share watcher calls it (via
+// propagateShare) to notify the peer of a local change.
 func (s *Session) SyncShare(ctx context.Context, shareID string) error {
 	cfg, ok := s.getShare(shareID)
 	if !ok {
@@ -810,7 +794,7 @@ func (s *Session) SyncShare(ctx context.Context, shareID string) error {
 func newSnapshotID() string { var b [16]byte; _, _ = rand.Read(b[:]); return hex.EncodeToString(b[:]) }
 
 func (s *Session) answerSyncRequest(ctx context.Context, req protocol.IndexSyncRequest) error {
-	// Re-check here as well as in readLoop: this runs asynchronously, and a
+	// Re-check here as well as in readLoop. This runs asynchronously, and a
 	// revocation can neuter the share after dispatch but before this goroutine
 	// reaches the store.
 	if !s.servesOutboundShare(req.ShareID) {
@@ -840,10 +824,10 @@ func (s *Session) answerSyncRequest(ctx context.Context, req protocol.IndexSyncR
 	if err != nil {
 		return err
 	}
-	// Ignored rows are parked, and ListShare already excludes those, so
-	// this is normally a no-op — but a rule added since the last rescan
-	// has not been applied to the index yet, and a snapshot must never
-	// advertise a path this node will refuse to serve.
+	// Ignored rows are parked, and ListShare already excludes those, so this
+	// is normally a no-op. A rule added since the last rescan has not reached
+	// the index yet, though, and a snapshot must never advertise a path this
+	// node will refuse to serve.
 	rows = filterIgnoredRows(cfg, rows)
 	entryCount := len(rows)
 	id := newSnapshotID()
@@ -876,13 +860,13 @@ func (s *Session) answerSyncRequest(ctx context.Context, req protocol.IndexSyncR
 // journalPageSize bounds how many journal rows one read holds in memory at
 // a time.
 //
-// This is a memory bound, not a protocol one: the peer acknowledges each
+// This is a memory bound, not a protocol one. The peer acknowledges each
 // batch as it lands, so where one read ends and the next begins is
-// invisible on the wire. The page is sized to still fill a delta batch
+// invisible on the wire. The page is sized to fill a delta batch
 // (protocol.TargetIndexBatchSize) for typical entries, so paging costs no
-// extra frames in practice, while a share with a long journal no longer
-// materialises tens of thousands of rows -- version-vector map and all --
-// in one slice per peer asking to resync.
+// extra frames in practice. A share with a long journal no longer
+// materialises tens of thousands of rows, version-vector maps included,
+// in one slice for each peer that asks to resync.
 const journalPageSize = 20000
 
 // sendJournalDeltas walks the journal from applied to the end, sending each
@@ -890,18 +874,17 @@ const journalPageSize = 20000
 // holds a path this share now ignores, which means the caller must answer
 // with a full snapshot instead.
 //
-// A delta batch cannot simply omit an entry: the receiver requires the
-// entries to be contiguous from FromSeq (see readLoop) and
-// Store.ApplyPeerDelta additionally requires FromSeq == cursor+1 and
-// len(rows) == ToSeq-FromSeq+1. Drop one and the peer rejects the batch and
-// resyncs, forever. So an ignored path anywhere in the range hands the
-// whole answer over to a snapshot, which carries no per-entry sequence
-// contract and re-anchors the peer's cursor at HighSeq. This is reachable
-// only for a path that was journalled while still syncing and has since
-// become ignored, with a peer whose cursor predates that entry -- and the
-// snapshot moves that peer past it for good. Pages already sent before the
-// ignored entry was reached are not a problem: the snapshot supersedes
-// them.
+// A delta batch cannot omit an entry. The receiver requires the entries to
+// be contiguous from FromSeq (see readLoop), and Store.ApplyPeerDelta also
+// requires FromSeq == cursor+1 and len(rows) == ToSeq-FromSeq+1. If one is
+// dropped, the peer rejects the batch and resyncs, forever. So an ignored
+// path anywhere in the range hands the whole answer to a snapshot, which
+// has no per-entry sequence contract and re-anchors the peer's cursor at
+// HighSeq. This happens only for a path that was journalled while still
+// syncing and has since become ignored, with a peer whose cursor predates
+// that entry. The snapshot moves that peer past it for good. Pages sent
+// before the ignored entry was reached are not a problem, because the
+// snapshot supersedes them.
 func (s *Session) sendJournalDeltas(ctx context.Context, cfg ShareConfig, epoch string, applied uint64) (done bool, err error) {
 	shareID := cfg.ShareID
 	pageSize := journalPageSize
@@ -951,35 +934,35 @@ func (s *Session) sendJournalDeltas(ctx context.Context, cfg ShareConfig, epoch 
 // journalled sequence, and the oldest sequence still on hand (0 when the
 // journal holds nothing for this epoch).
 //
-// Every clause is a way of *not* being able to, and each one falls back to
-// a full snapshot, which re-anchors the peer's cursor unconditionally:
+// Every clause is a way of *not* being able to. Each one falls back to a
+// full snapshot, which re-anchors the peer's cursor unconditionally:
 //
 //   - A different epoch means the sequence numbers are not comparable.
 //   - A peer claiming a sequence past our own high-water mark is not a
-//     peer we can compute a delta for. (It happens: restore this node's
-//     database from a backup and every peer is ahead of it.)
+//     peer we can compute a delta for. This happens after restoring this
+//     node's database from a backup, when every peer is ahead of it.
 //   - An entry the peer needs may have aged out of the journal, which is
 //     pruned on a retention window (see core's journal sweep). Requiring
-//     oldest <= AppliedSeq+1 is what makes pruning safe; note that oldest
-//     == 0 — an empty journal — is only "nothing to send" when the peer is
-//     already at high, and otherwise means the entries it needs are gone.
+//     oldest <= AppliedSeq+1 is what makes pruning safe. An oldest of 0
+//     means an empty journal, which is "nothing to send" only when the
+//     peer is already at high. Otherwise the entries it needs are gone.
 func canAnswerWithDeltas(req protocol.IndexSyncRequest, epoch string, high, oldest uint64) bool {
 	if req.Epoch != epoch || req.AppliedSeq > high {
 		return false
 	}
 	if req.AppliedSeq == high {
-		// Already current: the delta path sends nothing, which is both
-		// correct and cheaper than a snapshot the peer would discard.
+		// Already current. The delta path sends nothing, which is correct and
+		// cheaper than a snapshot the peer would discard.
 		return true
 	}
 	return oldest > 0 && oldest <= req.AppliedSeq+1
 }
 
 // journalHasIgnored reports whether any journal entry in rows names a path
-// this share now ignores. Such entries are historical: they were written
-// while the path was still syncing, and survive in change_journal after
-// the file row itself was dropped, because dropping an ignored row is
-// deliberately not journalled (see index.Store.ApplyScanResult).
+// this share now ignores. Such entries are historical. They were written
+// while the path was still syncing and survive in change_journal after the
+// file row was dropped, because dropping an ignored row is deliberately
+// not journalled (see index.Store.ApplyScanResult).
 func journalHasIgnored(cfg ShareConfig, rows []index.JournalRow) bool {
 	if cfg.Ignore == nil {
 		return false
@@ -993,8 +976,8 @@ func journalHasIgnored(cfg ShareConfig, rows []index.JournalRow) bool {
 }
 
 // filterIgnoredRows drops rows for paths this share ignores. It returns
-// rows unchanged when the share has no ignore rules, which is the common
-// case and the one worth not allocating for.
+// rows unchanged when the share has no ignore rules, the common case,
+// which avoids an allocation.
 func filterIgnoredRows(cfg ShareConfig, rows []index.FileRow) []index.FileRow {
 	if cfg.Ignore == nil {
 		return rows
@@ -1010,10 +993,10 @@ func filterIgnoredRows(cfg ShareConfig, rows []index.FileRow) []index.FileRow {
 }
 
 // batchArrayHeaderSlack covers the one part of a batch envelope that grows
-// with the number of entries in it: CBOR writes an array header of 1 byte
+// with the number of entries in it. CBOR writes an array header of 1 byte
 // for up to 23 elements, 2 up to 255, 3 up to 65535 and 5 beyond, while
 // the envelope below is measured with an empty array (1 byte). Four bytes
-// is therefore the exact worst case; eight leaves room and costs at most
+// is therefore the exact worst case. Eight leaves room and costs at most
 // one entry at a frame boundary.
 const batchArrayHeaderSlack = 8
 
@@ -1021,14 +1004,14 @@ const batchArrayHeaderSlack = 8
 // frame, and 0 if even the first one does not.
 //
 // It measures the fixed envelope once and then adds each row's own encoded
-// length, because CBOR array elements are self-delimiting values laid down
-// back to back: an entry contributes exactly its own encoding, wherever it
-// sits in the array. The obvious alternative — re-encode the whole growing
-// message after each candidate row and look at the total — is quadratic,
-// and not mildly so. Planning one snapshot of a 20k-file share that way
-// allocated 28 GB and took 77 seconds; the same plan here is one encode
-// per row. Anything that reintroduces a whole-message encode inside this
-// loop reintroduces that.
+// length. CBOR array elements are self-delimiting values laid down back to
+// back, so an entry contributes exactly its own encoding wherever it sits
+// in the array. The obvious alternative is to re-encode the whole growing
+// message after each candidate row and look at the total. That is
+// quadratic, and not mildly so: planning one snapshot of a 20k-file share
+// that way allocated 28 GB and took 77 seconds, while the same plan here
+// is one encode per row. Any whole-message encode inside this loop brings
+// that cost back.
 func snapshotBatchLen(share, id string, b uint64, rows []index.FileRow) int {
 	envelope, err := protocol.EncodedMessageSize(protocol.MsgIndexSnapshotBatch,
 		protocol.IndexSnapshotBatch{ShareID: share, SnapshotID: id, Batch: b, Files: []protocol.FileInfo{}})
@@ -1047,9 +1030,9 @@ func snapshotBatchLen(share, id string, b uint64, rows []index.FileRow) int {
 }
 
 // deltaBatchLen is snapshotBatchLen for an IndexDeltaBatch. Its envelope is
-// measured with the *last* row's sequence number as ToSeq: sequence numbers
-// ascend, and CBOR's integer width grows with the value, so whatever ToSeq
-// the chosen batch ends on cannot encode wider than that.
+// measured with the *last* row's sequence number as ToSeq. Sequence
+// numbers ascend and CBOR's integer width grows with the value, so
+// whatever ToSeq the chosen batch ends on cannot encode wider than that.
 func deltaBatchLen(share, epoch string, rows []index.JournalRow) int {
 	if len(rows) == 0 {
 		return 0
@@ -1075,9 +1058,9 @@ func deltaBatchLen(share, epoch string, rows []index.JournalRow) int {
 }
 
 func (s *Session) sendIndexUpdate(shareID string, rows []index.FileRow, full bool) error {
-	// This is the single funnel for MsgIndexUpdate, so the "never
-	// advertise an ignored path" guarantee belongs here even though the
-	// rows reaching it are already filtered upstream.
+	// This is the single funnel for MsgIndexUpdate, so the "never advertise
+	// an ignored path" guarantee belongs here even though upstream code
+	// already filters the rows that reach it.
 	cfg, _ := s.getShare(shareID)
 	rows = filterIgnoredRows(cfg, rows)
 
@@ -1094,17 +1077,17 @@ func (s *Session) sendIndexUpdate(shareID string, rows []index.FileRow, full boo
 }
 
 // readLoop is the single reader of the connection (protocol.Reader is not
-// safe for concurrent use). It observes each frame and routes it through the
-// data-plane handler table or the core control callback. Individual handlers
-// hand network-blocking or receive-dependent work to bounded workers, so this
-// loop is never the thing a background operation is waiting on — that would
+// safe for concurrent use). It observes each frame and routes it through
+// the data-plane handler table or the core control callback. Individual
+// handlers hand network-blocking or receive-dependent work to bounded
+// workers, so no background operation waits on this loop. That would
 // deadlock a pull against the loop that delivers its chunks.
 //
-// The control handler may enqueue a Pong inline. That is safe because urgent
-// liveness writes cannot queue behind FileChunks; no inline handler writes the
-// socket directly.
+// The control handler may enqueue a Pong inline. That is safe because
+// urgent liveness writes cannot queue behind FileChunks, and no inline
+// handler writes the socket directly.
 //
-// On exit — for any reason, including a clean io.EOF — it closes s.done,
+// On exit, for any reason including a clean io.EOF, it closes s.done,
 // which is how the owner learns the connection is over ([Session.Done]).
 func (s *Session) readLoop() {
 	defer s.wg.Done()
@@ -1143,12 +1126,12 @@ func (s *Session) reconcilePeerShare(ctx context.Context, shareID string) {
 }
 
 // handleIndexUpdate is the core reconcile-and-apply pass, run under the
-// read loop's bounded index-worker admission (see readLoop). It folds the peer's
-// reported files into our mirror of their view (peer_files), reconciles
-// that against our own current view ([Reconcile]), executes every
-// resulting Action against the filesystem and index, and — unless this
-// share's direction blocks outbound updates — reports back whatever
-// actually changed locally so the peer's own reconcile pass converges too.
+// read loop's bounded index-worker admission (see readLoop). It folds the
+// peer's reported files into our mirror of their view (peer_files),
+// reconciles that against our own current view ([Reconcile]), and executes
+// every resulting Action against the filesystem and index. Unless this
+// share's direction blocks outbound updates, it then reports back what
+// changed locally so the peer's own reconcile pass converges too.
 func (s *Session) handleIndexUpdate(ctx context.Context, msg protocol.IndexUpdate) {
 	cfg, ok := s.getShare(msg.ShareID)
 	if !ok {
@@ -1156,9 +1139,8 @@ func (s *Session) handleIndexUpdate(ctx context.Context, msg protocol.IndexUpdat
 		return
 	}
 	if cfg.Direction.InboundBlocked {
-		// Offerer of a read-only share: incoming changes are ignored
-		// outright (SPEC.md §5), including not recording the peer's
-		// reported state at all.
+		// Offerer of a read-only share: incoming changes are ignored outright
+		// (SPEC.md §5), and the peer's reported state is not recorded at all.
 		return
 	}
 
@@ -1183,30 +1165,30 @@ func (s *Session) handleIndexUpdate(ctx context.Context, msg protocol.IndexUpdat
 // already knows about the peer, without waiting for the peer to send
 // anything.
 //
-// handleIndexUpdate is otherwise the only thing that reconciles, which makes
-// "the peer sent us rows" the only trigger for noticing that a file is
-// missing. That is not the only way to end up owing work. A pull that fails
-// — the connection drops mid-transfer, the transfer stalls, the write errors
-// — leaves the peer's rows already recorded in peer_files and the file still
-// absent locally, and nothing revisits it: the offerer's index sync is
-// incremental, so on reconnect its cursor says this peer already has those
-// rows and it sends nothing at all. The reconciler never runs, and the file
-// stays missing indefinitely.
+// handleIndexUpdate is otherwise the only thing that reconciles, so "the
+// peer sent us rows" is the only trigger for noticing that a file is
+// missing. That is not the only way to end up owing work. A pull can fail
+// because the connection drops mid-transfer, the transfer stalls, or the
+// write errors. That leaves the peer's rows already recorded in peer_files
+// and the file still absent locally, and nothing revisits it. The
+// offerer's index sync is incremental, so on reconnect its cursor says
+// this peer already has those rows and it sends nothing. The reconciler
+// never runs, and the file stays missing indefinitely.
 //
-// Measured, on a 192 MiB transfer interrupted by killing the receiver: the
-// file did not arrive on its own after two minutes on a healthy reconnected
-// connection, and then arrived within five seconds of an *unrelated* file
-// being touched in the same share — because that finally produced an index
-// update. Calling this when a share becomes active on a session closes that
-// gap: reconnecting is itself a reason to re-examine.
+// Measured on a 192 MiB transfer interrupted by killing the receiver: the
+// file did not arrive on its own after two minutes on a healthy
+// reconnected connection. It arrived within five seconds of an *unrelated*
+// file being touched in the same share, because that finally produced an
+// index update. Calling this when a share becomes active on a session
+// closes that gap. Reconnecting is itself a reason to re-examine.
 func (s *Session) ReconcileShare(ctx context.Context, shareID string) error {
 	cfg, ok := s.getShare(shareID)
 	if !ok {
 		return fmt.Errorf("sync: reconcile share: %s is not active on this session", shareID)
 	}
 	if cfg.Direction.InboundBlocked {
-		// Offerer of a read-only share: it never applies anything inbound,
-		// so there is nothing for a reconcile to do (SPEC.md §5).
+		// Offerer of a read-only share: it never applies anything inbound, so a
+		// reconcile has nothing to do (SPEC.md §5).
 		return nil
 	}
 	s.reconcileMu.Lock()
@@ -1217,7 +1199,7 @@ func (s *Session) ReconcileShare(ctx context.Context, shareID string) error {
 
 // reconcileLocked is the reconcile-and-apply pass shared by handleIndexUpdate
 // and ReconcileShare. Callers must hold reconcileMu and must have already
-// recorded any newly-received peer rows. why names what prompted the pass,
+// recorded any newly received peer rows. why names what prompted the pass,
 // for the debug line.
 func (s *Session) reconcileLocked(ctx context.Context, cfg ShareConfig, why string) {
 	s.stats.reconciliations.Add(1)
@@ -1256,9 +1238,9 @@ func (s *Session) reconcileLocked(ctx context.Context, cfg ShareConfig, why stri
 		mu.Unlock()
 	})
 
-	// Every path in the share was just reconciled, so flagged is the
-	// complete current set of locally-modified files for it; anything
-	// still holding a warning from an earlier pass has converged.
+	// Every path in the share was just reconciled, so flagged is the complete
+	// current set of locally-modified files for it. Anything still holding a
+	// warning from an earlier pass has converged.
 	s.retainWarnings(shareID, flagged)
 
 	if !cfg.Direction.OutboundBlocked && len(changed) > 0 {
@@ -1268,7 +1250,7 @@ func (s *Session) reconcileLocked(ctx context.Context, cfg ShareConfig, why stri
 	}
 
 	// The delta above only reaches the peer this update came from. Every
-	// *other* peer of this share learns about it here — see
+	// *other* peer of this share learns about it here. See
 	// SetAppliedHandler for why nothing else would tell them.
 	if len(changed) > 0 {
 		s.ctrlMu.Lock()
@@ -1279,18 +1261,18 @@ func (s *Session) reconcileLocked(ctx context.Context, cfg ShareConfig, why stri
 		}
 	}
 
-	// A pass over an already-converged share produces nothing but
-	// ActionNone, and there are a great many of those — one per file, on
-	// every update from every peer. Only say anything when the pass
-	// actually did something.
+	// A pass over an already-converged share produces nothing but ActionNone,
+	// one per file, on every update from every peer. Log only when the pass
+	// did something.
 	if len(counts) > 0 {
 		s.debugf("reconciled %s (%s): %s", shareID, why, formatActionCounts(counts))
 	}
 }
 
 // runActionWorkers applies an arbitrarily large reconciliation plan with a
-// fixed number of goroutines. The caller waits for completion, but goroutine
-// count is independent of the number of peer-controlled file entries.
+// fixed number of goroutines. The caller waits for completion, and the
+// goroutine count does not depend on the number of peer-controlled file
+// entries.
 func (s *Session) runActionWorkers(ctx context.Context, cfg ShareConfig, actions []Action, consume func(Action, []index.FileRow)) {
 	workers := maxConcurrentPulls
 	if len(actions) < workers {
@@ -1322,8 +1304,8 @@ func (s *Session) runActionWorkers(ctx context.Context, cfg ShareConfig, actions
 
 // formatActionCounts renders a reconcile pass's non-ActionNone tally in a
 // stable order, e.g. "Pull=3 Delete=1" (the names come from
-// ActionKind.String). Fixed order rather than ranging the map so repeated
-// passes produce comparable, diffable lines.
+// ActionKind.String). It uses a fixed order instead of ranging the map, so
+// repeated passes produce comparable, diffable lines.
 func formatActionCounts(counts map[ActionKind]int) string {
 	order := []ActionKind{ActionPull, ActionDelete, ActionResurrect, ActionConflictCopy, ActionLocallyModified}
 	parts := make([]string, 0, len(order))
@@ -1336,16 +1318,16 @@ func formatActionCounts(counts map[ActionKind]int) string {
 }
 
 // applyAndPersist executes one Action (applyAction) and writes every row it
-// produced to the index, returning the rows that were successfully stored
-// — the ones handleIndexUpdate reports back to the peer. Failures are
-// logged, not returned: one action failing must not stop the rest of the
-// pass, and the caller has nothing to do about it beyond what's logged.
+// produced to the index. It returns the rows that were stored, which
+// handleIndexUpdate reports back to the peer. It logs failures instead of
+// returning them: one failing action must not stop the rest of the pass,
+// and the caller can do nothing about it beyond the log.
 //
-// applyAction may return a non-nil error alongside non-empty rows: a
+// applyAction may return a non-nil error alongside non-empty rows. A
 // conflict copy's two halves (a local rename and a network pull) can
-// partially succeed (see applyConflictCopy's doc comment). Persist
-// whatever rows did land, regardless of err, so a transient failure in
-// one half never orphans a file that's already correctly on disk.
+// partially succeed (see applyConflictCopy's doc comment). Persist the rows
+// that did land regardless of err, so a transient failure in one half
+// never orphans a file that is already correctly on disk.
 func (s *Session) applyAndPersist(ctx context.Context, cfg ShareConfig, a Action) []index.FileRow {
 	rows, err := s.applyAction(ctx, cfg, a)
 	if err != nil {

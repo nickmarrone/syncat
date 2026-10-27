@@ -11,7 +11,7 @@ import (
 )
 
 // Paths resolves the on-disk layout described in SPEC.md §3 (config.json in
-// place of the spec's config.toml — see the deviation note in config.go):
+// place of the spec's config.toml, see the deviation note in config.go):
 //
 //	~/.config/syncat/config.json
 //	~/.config/syncat/api.token

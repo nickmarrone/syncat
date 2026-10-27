@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/run-net-tests.sh — run syncat's real-network scenario suite.
+# scripts/run-net-tests.sh, run syncat's real-network scenario suite.
 #
 # Every scenario under scripts/net/ drives real syncat daemons over real
 # tailcat, DERP-relayed unless direct connectivity is available. Nothing here
@@ -14,8 +14,8 @@
 #   scripts/run-net-tests.sh --list
 #
 # Scenarios numbered below 20 are the fast tier. From 20 up they are soak
-# tests: they wait out real timeouts — SPEC.md §4's 90s dead-peer rule, long
-# idle windows, large transfers — and take minutes each by design, so they
+# tests. They wait out real timeouts (SPEC.md §4's 90s dead-peer rule, long
+# idle windows, large transfers) and take minutes each by design, so they
 # run only with --soak.
 #
 # Env:
@@ -87,7 +87,7 @@ if [ "$LIST" -eq 1 ]; then
 fi
 
 # Build once, so a full suite compiles one binary rather than one per
-# scenario. CGO_ENABLED=0 per SPEC.md §12 — the SQLite driver is pure Go and
+# scenario. CGO_ENABLED=0 per SPEC.md §12, the SQLite driver is pure Go and
 # the shipped binary is cgo-free, so that is the build worth testing.
 BIN="${TMPDIR:-/tmp}/syncat-test/bin/syncat"
 mkdir -p "$(dirname "$BIN")"

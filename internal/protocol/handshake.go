@@ -51,7 +51,7 @@ type HandshakeConfig struct {
 	// in Hello so that, once the pending-peer approval queue exists,
 	// approving a pending peer alone suffices to complete peering. Its
 	// embedded id must equal IdentityKey's public key, or the peer will
-	// reject us (and we reject ourselves before ever writing it — see
+	// reject us (and we reject ourselves before ever writing it, see
 	// [Handshake]).
 	Token string
 
@@ -113,7 +113,7 @@ type HandshakeResult struct {
 // conn back exactly as it handed it over. This is not merely tidy: the
 // caller keeps conn for the whole life of the session that follows, and
 // the deadline set here is an *absolute* time. Leaving it armed silently
-// poisons the connection at handshakeStart+Timeout — every later Read and
+// poisons the connection at handshakeStart+Timeout. Every later Read and
 // Write fails with os.ErrDeadlineExceeded even though the connection is
 // perfectly healthy, which reads as a peer that connects, goes quiet, and
 // gets torn down by SPEC.md §4's 90s dead rule, over and over.
@@ -242,7 +242,7 @@ func handshake(ctx context.Context, conn net.Conn, cfg HandshakeConfig, initiato
 	}
 
 	// Authenticated. Retire the ctx watcher and disarm the deadline before
-	// handing conn back — see this func's doc comment. Ordering matters:
+	// handing conn back. See this func's doc comment. Ordering matters:
 	// stopping the watcher first keeps it from re-arming the deadline
 	// behind us. (A cancel that has already been observed can still land
 	// after this, but that only happens when the node is shutting down and
@@ -265,7 +265,7 @@ func handshake(ctx context.Context, conn net.Conn, cfg HandshakeConfig, initiato
 // first, and starts a goroutine that pulls the deadline in to "now" if ctx
 // is canceled before then. It returns stopWatcher, which retires that
 // goroutine; it is idempotent and must only be called from the goroutine
-// running [Handshake]. The deadline itself is left armed — clearing it (or
+// running [Handshake]. The deadline itself is left armed. Clearing it (or
 // not, on failure) is the caller's decision.
 func armHandshakeDeadline(ctx context.Context, conn net.Conn, timeout time.Duration) (stopWatcher func(), err error) {
 	if timeout <= 0 {
@@ -477,7 +477,7 @@ func readExpected(fr *Reader, want MsgType) ([]byte, error) {
 
 // sendError best-effort notifies the peer why we're about to close the
 // connection. The caller is closing (or the caller's caller is) either
-// way, so a failure here is not itself a reportable error — the
+// way, so a failure here is not itself a reportable error, the
 // connection may already be broken, which is exactly the sort of
 // situation that leads to wanting to send an Error in the first place.
 func sendError(conn net.Conn, fw *Writer, code, msg string) {

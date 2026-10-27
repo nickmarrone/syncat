@@ -19,7 +19,7 @@ import (
 // to beat it, which a DERP-relayed tunnel comfortably clears. Its job is
 // not to police throughput but to make sure a peer that has stopped
 // draining altogether eventually breaks the connection instead of parking
-// a writer forever — before this existed, no write on a live session
+// a writer forever. Before this existed, no write on a live session
 // connection had a deadline of any kind.
 const DefaultWriteTimeout = 60 * time.Second
 
@@ -33,7 +33,7 @@ const DefaultWriteTimeout = 60 * time.Second
 //
 // The ordinary and latest-state control lanes are each bounded. Latest-state
 // keys replace their pending frame in place, while ordered control events
-// retain FIFO behavior and cancellable backpressure — see
+// retain FIFO behavior and cancellable backpressure, see
 // [StreamWriter.enqueue] and [StreamWriter.enqueueLatest].
 const (
 	urgentQueueDepth = 8
@@ -64,7 +64,7 @@ var ErrWriterAlreadyStarted = errors.New("protocol: stream writer has already be
 // The point is that no caller ever waits on a bulk write. With a shared
 // [Writer], a 1 MiB FileChunk to a peer that has stopped reading holds the
 // writer's mutex for as long as the stall lasts, and everything else
-// blocks behind it — including the Pong that internal/sync's read loop
+// blocks behind it, including the Pong that internal/sync's read loop
 // sends inline when it sees a Ping. A blocked read loop stops draining the
 // socket, which is exactly what makes the *peer's* writes stall, so two
 // nodes each transferring a large file could deadlock outright with
@@ -73,9 +73,9 @@ var ErrWriterAlreadyStarted = errors.New("protocol: stream writer has already be
 // queued behind a stream of file bytes, while bulk still progresses.
 //
 // A write failure is terminal for the whole session: StreamWriter records
-// it (see [StreamWriter.Err]), closes the connection — which EOFs the read
+// it (see [StreamWriter.Err]), closes the connection, which EOFs the read
 // loop, and so unwinds the session through the same path a peer
-// disconnecting takes — and fails every later write.
+// disconnecting takes, and fails every later write.
 //
 // Construct with [NewStreamWriter], start with [StreamWriter.Start], and
 // release with [StreamWriter.Close].
@@ -223,7 +223,7 @@ func (s *StreamWriter) Start() error {
 //
 // It returns the terminal write error, if the writer failed, or nil for a
 // clean shutdown. Close blocks until the writer goroutine has exited,
-// which requires any in-progress write to have returned — so callers that
+// which requires any in-progress write to have returned, so callers that
 // want it prompt should close the connection first (internal/sync.Session
 // does).
 func (s *StreamWriter) Close() error {
@@ -352,7 +352,7 @@ func (s *StreamWriter) writeFrameContext(ctx context.Context, typ MsgType, paylo
 // enqueue hands a built frame to the lane its type belongs on.
 //
 // The two lanes differ in what a full queue means. A full data lane is
-// normal — the network is slower than the goroutine feeding it — so the
+// normal, the network is slower than the goroutine feeding it, so the
 // caller waits, and that wait is the transfer's backpressure. A full
 // control lane is not normal: control frames are small, drained ahead of
 // everything else, and never produced in bulk, so ctrlQueueDepth of them
@@ -455,8 +455,8 @@ func (s *StreamWriter) popLatest(key string) (queuedFrame, bool) {
 func isUrgent(typ MsgType) bool { return typ == MsgPong || typ == MsgError }
 
 // isBulk reports whether typ is a bulk frame, i.e. one big enough that
-// letting a control frame queue behind it would matter. Everything else —
-// including a message type this build doesn't know about — takes the
+// letting a control frame queue behind it would matter. Everything else,
+// including a message type this build doesn't know about, takes the
 // priority lane, which is the safe default: a frame wrongly treated as
 // control costs a queue slot, while a frame wrongly treated as bulk can
 // delay a keepalive.

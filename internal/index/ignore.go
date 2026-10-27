@@ -16,7 +16,7 @@ import (
 // sync.TempFilePrefix is: the scanner, the built-in ignore list, and
 // internal/core's loader all have to agree on one spelling.
 //
-// The file is NOT synced between peers — each node keeps its own. It is in
+// The file is NOT synced between peers, each node keeps its own. It is in
 // builtinIgnorePatterns, so it never enters the index and therefore never
 // reaches the wire.
 const IgnoreFileName = ".syncatignore"
@@ -44,7 +44,7 @@ type IgnoreRules struct {
 
 	// hasNegations records whether any pattern is a '!' re-inclusion. It
 	// exists so the scanner can decide whether pruning an ignored
-	// directory is safe — see PruneDirs and Matcher.PruneDirs.
+	// directory is safe. See PruneDirs and Matcher.PruneDirs.
 	hasNegations bool
 }
 
@@ -201,7 +201,7 @@ func compileGlob(pat string, anchored bool) (*regexp.Regexp, error) {
 				// '**' crosses '/' boundaries.
 				prevSlash := i == 0 || pat[i-1] == '/'
 				if prevSlash && j < n && pat[j] == '/' {
-					// "**/" — match zero or more leading segments.
+					// "**/", match zero or more leading segments.
 					b.WriteString(`(?:.*/)?`)
 					j++ // consume the '/'
 				} else {
@@ -326,7 +326,7 @@ func (g *IgnoreRules) matchOne(p string, isDir bool) (negate, matched bool) {
 
 // HasNegations reports whether any rule re-includes a path with '!'. The
 // scanner uses it to decide whether it may prune an ignored directory
-// without descending — see Matcher.PruneDirs.
+// without descending. See Matcher.PruneDirs.
 func (g *IgnoreRules) HasNegations() bool {
 	return g != nil && g.hasNegations
 }

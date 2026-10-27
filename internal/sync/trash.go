@@ -27,12 +27,12 @@ import (
 //
 // Structural local-vs-remote enforcement: Put (the only thing that ever
 // writes into the trash) is called from exactly two places in this
-// package — applyDelete and pullAndInstall, both in apply.go, both firing
+// package: applyDelete and pullAndInstall, both in apply.go, both firing
 // only from applyAction, which in turn only ever runs from
 // handleIndexUpdate: the reconcile-and-apply pass triggered by a peer's
 // IndexUpdate. A local deletion the user makes is observed by
 // internal/index's Scanner/Watcher and persisted via
-// Store.ApplyScanResult — a code path that lives in internal/index, which
+// Store.ApplyScanResult, a code path that lives in internal/index, which
 // has no dependency on internal/sync (indeed cannot: internal/sync already
 // imports internal/index, so the reverse would be a cycle) and therefore
 // cannot reach Trash.Put even by mistake. See trash_test.go for a test
@@ -97,20 +97,20 @@ func NewTrash(root string, clock Clock) *Trash {
 	return &Trash{root: root, clock: clock, rename: os.Rename}
 }
 
-// Put moves the file or symlink at srcAbs — the current content at
-// shareID/relpath, about to be overwritten or deleted on a peer's behalf —
+// Put moves the file or symlink at srcAbs, the current content at
+// shareID/relpath, about to be overwritten or deleted on a peer's behalf,
 // into the trash. It is a no-op (nil error) if srcAbs doesn't currently
 // exist, since there is then nothing to preserve.
 //
 // Same-filesystem case: an atomic rename. Cross-filesystem case (the data
 // dir and a share directory are not guaranteed to share a mount): the
 // content is copied to the trash, fsynced, and only then is the original
-// removed — so a crash or error mid-copy leaves the original file intact
+// removed, so a crash or error mid-copy leaves the original file intact
 // rather than losing it (the partially written trash copy, if any, is
 // cleaned up on error).
 //
-// A collision — the same relpath trashed twice within the same unix
-// second — never overwrites an earlier trash entry: Put finds the next
+// A collision, meaning the same relpath trashed twice within the same unix
+// second, never overwrites an earlier trash entry: Put finds the next
 // free "<ts>-<n>" name instead.
 func (tr *Trash) Put(ctx context.Context, shareID, relpath, srcAbs string) error {
 	if ctx.Err() != nil {
@@ -216,7 +216,7 @@ func copyThenRemove(srcAbs, dest string, fi os.FileInfo) error {
 // copyFileOrSymlink durably copies src to dst: for a symlink, by
 // recreating the link at dst with the same target; for a regular file, by
 // writing the full content to a freshly created dst and fsyncing it before
-// returning. dst must not already exist (O_EXCL) — callers are expected to
+// returning. dst must not already exist (O_EXCL). Callers are expected to
 // have already picked a free path. On any error, a partially written dst
 // is removed so callers never see a half-copied file on disk.
 func copyFileOrSymlink(src, dst string, fi os.FileInfo) error {
@@ -268,7 +268,7 @@ func copyFileOrSymlink(src, dst string, fi os.FileInfo) error {
 
 // TrashEntry describes one trashed file: enough for a UI trash browser
 // (relpath, trashed-at time, size) and, opaquely, enough for Restore to
-// find the exact physical trash file to bring back — including
+// find the exact physical trash file to bring back, including
 // disambiguating two entries that happen to share both RelPath and
 // TrashedAt (a same-second collision), which is why Restore takes a
 // TrashEntry rather than a (relpath, time) pair.
@@ -342,7 +342,7 @@ func (tr *Trash) List(shareID string) ([]TrashEntry, error) {
 
 // Restore implements SPEC.md §7's restore: the trashed content named by e
 // is copied back to shareRoot/e.RelPath (the trash entry itself is left in
-// place — a restore is a copy, not a move, so the trash entry is still
+// place, since a restore is a copy, not a move, so the trash entry is still
 // there for the janitor or a later restore), and the corresponding index
 // row is written with nodeID's counter bumped over whatever version the
 // index currently holds for that path, so the restored file is strictly
@@ -350,7 +350,7 @@ func (tr *Trash) List(shareID string) ([]TrashEntry, error) {
 //
 // If shareRoot/e.RelPath is already occupied by something (any file,
 // symlink, or directory), Restore refuses and returns an error wrapping
-// ErrRestoreDestExists rather than silently clobbering it — the caller
+// ErrRestoreDestExists rather than silently clobbering it. The caller
 // must clear the path (or, in a future UI, choose to restore under a
 // different name) and retry.
 func (tr *Trash) Restore(ctx context.Context, store *index.Store, nodeID, shareRoot string, e TrashEntry) (index.FileRow, error) {
@@ -455,7 +455,7 @@ const DefaultJanitorInterval = 24 * time.Hour
 // this trash entry" (Now) and "when does the next sweep fire" (After).
 // This mirrors protocol.Clock and index.Clock exactly (each package
 // defines its own copy rather than sharing one, for the same
-// leaf-package-independence reason documented on protocol.Clock) — it is
+// leaf-package-independence reason documented on protocol.Clock). It is
 // a different, richer type from this package's own Clock (a plain
 // time.Time-returning func used only to timestamp conflict/trash names),
 // which has no After and so can't drive deterministic interval timing in
@@ -476,7 +476,7 @@ func (realJanitorClock) After(d time.Duration) <-chan time.Time { return time.Af
 var RealJanitorClock JanitorClock = realJanitorClock{}
 
 // Janitor purges trash entries older than a configured retention window
-// (config.TrashRetentionDays, default 30 — SPEC.md §7). It follows the
+// (config.TrashRetentionDays, default 30, see SPEC.md §7). It follows the
 // same injectable-clock, explicit-Close pattern as protocol.Keepalive and
 // index.Watcher.
 //
@@ -497,7 +497,7 @@ type Janitor struct {
 // <= 0). clock is used both to decide "how old" and to drive the sweep
 // timing; RealJanitorClock is used if clock is nil. onSweep, if non-nil, is
 // called after every sweep the background loop runs (including a failed
-// one) with the number of entries purged and any error — tests use it to
+// one) with the number of entries purged and any error. Tests use it to
 // observe sweeps deterministically instead of racing the background
 // goroutine.
 func NewJanitor(trash *Trash, retention time.Duration, clock JanitorClock, interval time.Duration, onSweep func(purged int, err error)) *Janitor {
@@ -519,7 +519,7 @@ func NewJanitor(trash *Trash, retention time.Duration, clock JanitorClock, inter
 
 // Start begins the janitor's periodic sweep loop in a background
 // goroutine. It does not sweep immediately; the first sweep happens after
-// one interval (matching index.Watcher's periodicLoop — a fresh daemon
+// one interval (matching index.Watcher's periodicLoop), so a fresh daemon
 // start shouldn't immediately start deleting things before its first
 // scheduled tick). Call Sweep directly for an immediate, synchronous pass
 // (e.g. right after startup, or from the CLI).
@@ -613,7 +613,7 @@ func (j *Janitor) Sweep(ctx context.Context) (int, error) {
 // trash directory doesn't accumulate forever as an empty husk. Failures
 // are ignored: this cleanup is cosmetic, never worth failing a sweep over.
 // Only a plain os.Remove is used (never RemoveAll), so a directory that
-// still has live content in it simply fails to remove and is left alone —
+// still has live content in it simply fails to remove and is left alone,
 // no risk to anything not already expired.
 func pruneEmptyDirs(root string) {
 	entries, err := os.ReadDir(root)

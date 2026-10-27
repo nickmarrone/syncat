@@ -24,7 +24,7 @@ import (
 
 // applyAction executes one reconciled Action against the filesystem,
 // returning the index.FileRow(s) that must now be persisted (empty/nil
-// if nothing changed — e.g. ActionNone, ActionLocallyModified, or a non-empty
+// if nothing changed, e.g. ActionNone, ActionLocallyModified, or a non-empty
 // directory delete that was skipped). The caller (handleIndexUpdate)
 // persists the returned rows via Store.PutFile and, unless outbound is
 // blocked, reports them back to the peer.
@@ -44,7 +44,7 @@ const TempFilePrefix = ".syncat.tmp."
 // full-size, it sits in the user's own synced directory, and it is hidden, so
 // nothing draws attention to it while it accumulates one copy per crash.
 //
-// Meant to be called at startup, before any session exists — with no transfer
+// Meant to be called at startup, before any session exists. With no transfer
 // in flight, every file matching the prefix is by definition an orphan.
 // Calling it while a transfer is running would delete that transfer's staging
 // file, so don't.
@@ -133,7 +133,7 @@ func (s *Session) applyAction(ctx context.Context, cfg ShareConfig, a Action) ([
 // applyLocallyModified executes an ActionLocallyModified: SPEC.md §1's
 // receive-only revert. A receive-only subscriber's local edit is never
 // propagated outward (that's what OutboundBlocked already prevents in
-// reconcile.go); this is the other half — reverting the local edit itself
+// reconcile.go). This is the other half, reverting the local edit itself
 // once the offerer's own copy has something new to overwrite it with.
 //
 // reconcile.go raises ActionLocallyModified in two situations, only one of
@@ -141,17 +141,17 @@ func (s *Session) applyAction(ctx context.Context, cfg ShareConfig, a Action) ([
 //
 //   - a.Source == SourceRemote: the offerer's copy is concurrently
 //     different from ours (reconcileConcurrent's receive-only branch).
-//     a.Resolved is the offerer's current content — exactly what SPEC.md
+//     a.Resolved is the offerer's current content, exactly what SPEC.md
 //     §1 says to overwrite the local edit with "after a trash copy is
 //     taken". This goes through pullAndInstall exactly like an ordinary
 //     ActionPull would, which is what actually takes the trash copy (via
 //     the same trashHook call site every other overwrite uses) before the
-//     new content lands — so the abort-on-trash-failure guarantee applies
+//     new content lands, so the abort-on-trash-failure guarantee applies
 //     here for free, with no separate code path to keep in sync.
 //   - a.Source == SourceNone (reconcileOne's !hasRemote branch): a file
 //     that exists only locally under a receive-only subscription. The
 //     offerer has no corresponding content at all yet, so there is
-//     nothing to revert *to* — SPEC.md §1 only promises a revert "when the
+//     nothing to revert *to*. SPEC.md §1 only promises a revert "when the
 //     offerer's copy next changes", which hasn't happened. This case is
 //     flagged (recorded as a warning) but left on disk untouched; a later
 //     IndexUpdate that gives the offerer's side real content for this
@@ -244,7 +244,7 @@ func (s *Session) applyDelete(ctx context.Context, cfg ShareConfig, relpath stri
 //
 // Partial success: the two sides of a conflict copy are independent
 // operations (a rename that can't fail for network reasons, and a pull
-// that can — e.g. the peer's file moved on between our reconcile pass
+// that can, e.g. the peer's file moved on between our reconcile pass
 // computing its expected version and our FileRequest reaching them, a
 // legitimate race in a system with two nodes reconciling concurrently).
 // If one half succeeds and the other doesn't, applyConflictCopy returns
@@ -264,7 +264,7 @@ func (s *Session) applyDelete(ctx context.Context, cfg ShareConfig, relpath stri
 func (s *Session) applyConflictCopy(ctx context.Context, cfg ShareConfig, a Action, now time.Time) ([]index.FileRow, error) {
 	switch {
 	case a.Source == SourceLocal && a.ConflictSource == SourceRemote:
-		// Winner is already the current local file at a.RelPath — left
+		// Winner is already the current local file at a.RelPath, left
 		// untouched, so its row is always safe to report.
 		winnerInfo := a.Resolved
 		winnerInfo.RelPath = a.RelPath
@@ -274,7 +274,7 @@ func (s *Session) applyConflictCopy(ctx context.Context, cfg ShareConfig, a Acti
 		// relpath, since that's still how the peer's own index refers to
 		// it (the peer hasn't renamed anything; only our local view is
 		// gaining a new conflict-copy path). a.ConflictInfo.Version is used
-		// verbatim as the wire version — unlike a.Resolved, ConflictInfo is
+		// verbatim as the wire version. Unlike a.Resolved, ConflictInfo is
 		// never rewritten with a merged/bumped version (see its doc
 		// comment in reconcile.go), so it's already exactly what the peer
 		// advertised.
@@ -290,7 +290,7 @@ func (s *Session) applyConflictCopy(ctx context.Context, cfg ShareConfig, a Acti
 		// Loser is our current local content at a.RelPath: preserve it by
 		// renaming it to a.ConflictRelPath *before* the winner's bytes are
 		// pulled on top of a.RelPath. Same directory, same filesystem, so
-		// this is a plain atomic rename — no temp file or hash check
+		// this is a plain atomic rename, no temp file or hash check
 		// needed, the bytes are already known-good local content, and (no
 		// network involved) it either fully succeeds or leaves nothing
 		// changed.
@@ -329,22 +329,22 @@ func (s *Session) applyConflictCopy(ctx context.Context, cfg ShareConfig, a Acti
 
 // pullAndInstall fetches wireRelPath's content from the peer (addressed on
 // the wire exactly as the peer's own index knows it) and atomically
-// installs it at share root under destRelPath — usually the same path,
+// installs it at share root under destRelPath, usually the same path,
 // except for a conflict copy's loser (see applyConflictCopy). This is
 // SPEC.md §5's "applying remote changes" sequence:
 //
 //  1. download to .syncat.tmp.<rand> in the destination directory (same
 //     filesystem as the destination, so the final rename is atomic);
-//  2. verify sha256 against what the peer advertised (info.SHA256) — a
+//  2. verify sha256 against what the peer advertised (info.SHA256); a
 //     mismatch aborts and never touches the destination;
 //  3. fsync the temp file and set its mtime/mode;
 //  4. rename(2) into place.
 //
-// wireVersion is the version named in the FileRequest — deliberately a
+// wireVersion is the version named in the FileRequest, deliberately a
 // separate parameter from info.Version, because they can legitimately
 // differ: info carries the version this content will be persisted under
 // locally (for a conflict resolution, Merge(local, remote) plus a local
-// Bump — see Action.Resolved's doc comment), while wireVersion must be the
+// Bump, see Action.Resolved's doc comment), while wireVersion must be the
 // version the peer actually advertised, or the peer's own freshness check
 // (handleFileRequest's Equal(row.Version, req.Version) in transfer.go) can
 // never match. Every caller passes the right one via Action.SourceVersion
@@ -376,7 +376,7 @@ func (s *Session) pullAndInstall(ctx context.Context, shareID, root, wireRelPath
 	committed := false
 	defer func() {
 		// Runs on every return path, including a panic unwinding through
-		// this deferred call — the temp file never survives a failed
+		// this deferred call, so the temp file never survives a failed
 		// apply.
 		_ = tmp.Close()
 		if !committed {
@@ -436,7 +436,7 @@ func (s *Session) installSymlink(ctx context.Context, shareID, destRelPath, dest
 // content is in tmp: fsync and close it, set its mode and mtime from info,
 // trash whatever currently occupies destAbs, and rename it into place
 // (steps 3 and 4 of pullAndInstall's sequence). On success tmp's path no
-// longer exists — it *is* destAbs now.
+// longer exists, it *is* destAbs now.
 func (s *Session) finalizeFile(ctx context.Context, shareID, destRelPath, destAbs string, tmp *os.File, info protocol.FileInfo) error {
 	tmpPath := tmp.Name()
 	if err := tmp.Sync(); err != nil {
@@ -458,8 +458,8 @@ func (s *Session) finalizeFile(ctx context.Context, shareID, destRelPath, destAb
 	// --- trash hook (SPEC.md §7) ---
 	// destAbs may already exist here (we're overwriting a file the peer's
 	// version dominates, resolving a conflict's winner, or reverting a
-	// receive-only subscriber's local edit). This is the other place —
-	// alongside applyDelete's — old content is discarded on a peer's
+	// receive-only subscriber's local edit). This is the other place,
+	// alongside applyDelete's, where old content is discarded on a peer's
 	// behalf, and it runs strictly before the rename below: a trash
 	// failure returns here and the rename never happens, so the original
 	// content is never destroyed just because the safety net failed.
@@ -496,9 +496,9 @@ func (s *Session) replaceWithTrashHook(ctx context.Context, shareID, relpath, de
 // content on a peer's behalf: applyDelete's os.Remove, and
 // pullAndInstall's overwrite (both the rename-into-place path and the
 // symlink-replace path via replaceWithTrashHook). destAbs may or may not
-// currently exist — Trash.Put no-ops when it doesn't.
+// currently exist. Trash.Put no-ops when it doesn't.
 //
-// If s.trash is nil (no Trash configured — e.g. a test exercising apply
+// If s.trash is nil (no Trash configured, e.g. a test exercising apply
 // logic that doesn't care about trash, or trash deliberately disabled),
 // this is a no-op, matching this hook's pre-Phase-6 behavior. Once a Trash
 // is set via SetTrash, every call site above gets real trash-can behavior

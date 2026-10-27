@@ -123,7 +123,7 @@ func Default() *Config {
 // defaults and ensures every Share.Access map is non-nil. It does not (and
 // cannot, given only a *Config) distinguish "absent from the file" from
 // "explicitly set to the zero value" for fields like Peer.Enabled whose
-// default is non-zero (true) — that distinction is handled during
+// default is non-zero (true), that distinction is handled during
 // unmarshaling, in docToConfig, before defaults collapse to a plain bool.
 func (c *Config) ApplyDefaults() {
 	if c.APIAddr == "" {
@@ -387,7 +387,7 @@ func Save(path string, cfg *Config) error {
 // chain A -> B -> C out of two distinct share IDs covering the same files on
 // B. The index is keyed by (share_id, relpath), so B would track each file
 // twice under independent version vectors, and a change arriving on one share
-// would look like a fresh local edit to the other — the two shares would
+// would look like a fresh local edit to the other, the two shares would
 // bounce edits between themselves indefinitely.
 //
 // The rule is symmetric and covers nesting in both directions, because sharing

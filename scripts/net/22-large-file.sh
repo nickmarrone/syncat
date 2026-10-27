@@ -6,7 +6,7 @@
 # many 1 MiB FileChunks (protocol.MaxFileChunkData) through the writer's bulk
 # lane, sustained for minutes.
 #
-# The interesting assertion is not that the bytes arrive — it is that the
+# The interesting assertion is not that the bytes arrive, it is that the
 # connection survives them. The writer has two lanes precisely so control
 # frames can overtake a queue of chunks; if a Ping ever queued behind the
 # bulk lane, a long transfer would starve the keepalive and the peer would

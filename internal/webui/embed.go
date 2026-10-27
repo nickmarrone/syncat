@@ -18,7 +18,7 @@ import (
 var embedded embed.FS
 
 // Assets is the embedded tree rooted at static/ itself, so "index.html"
-// (not "static/index.html") is a top-level entry — what Handler serves
+// (not "static/index.html") is a top-level entry, what Handler serves
 // at "/".
 var Assets fs.FS = mustSub(embedded, "static")
 
@@ -34,7 +34,7 @@ func mustSub(f embed.FS, dir string) fs.FS {
 
 // staticContentTypes pins the Content-Type this handler sends for each
 // extension the UI ships, rather than trusting the host's mime.types
-// file — mime.TypeByExtension merges in OS-provided mappings that vary
+// file, mime.TypeByExtension merges in OS-provided mappings that vary
 // by distro/container image, and a wrong or missing mapping for .js
 // (served as application/octet-stream, say) silently breaks ES module
 // loading in some browsers. http.ServeContent (which http.FileServer
@@ -54,15 +54,15 @@ var staticContentTypes = map[string]string{
 //
 // Path traversal: fs.FS implementations (embed.FS, and the fs.Sub view
 // over it) reject any path containing a ".." element per the fs.ValidPath
-// contract — Open returns fs.ErrInvalid rather than resolving outside the
-// tree — and http.FileServer additionally path.Cleans the incoming
+// contract, Open returns fs.ErrInvalid rather than resolving outside the
+// tree, and http.FileServer additionally path.Cleans the incoming
 // request URL before mapping it to a filesystem path, collapsing
 // "/../../etc/passwd" down to "/etc/passwd" (still inside the FS view,
 // still just a 404) long before either check would matter. There is no
 // way to reach a file outside Assets through this handler.
 //
 // Auth: intentionally unauthenticated (mounted outside the api package's
-// auth() wrapper) — a browser has no X-Syncat-Token yet when it first
+// auth() wrapper), a browser has no X-Syncat-Token yet when it first
 // loads the page; see GET /ui-token in internal/api/server.go for how
 // the page bootstraps one afterward. The daemon's loopback-only listener
 // (ListenLoopback) is what keeps this reachable only from the local

@@ -1,9 +1,9 @@
-# scripts/lib/harness.sh — shared plumbing for syncat's real-network test
+# scripts/lib/harness.sh is shared plumbing for syncat's real-network test
 # scripts. Sourced, never executed.
 #
 # Every scenario under scripts/net/ (and scripts/e2e.sh) drives real syncat
-# daemons over real tailcat — DERP-relayed unless direct connectivity is
-# available — and asserts on what actually lands on disk and in
+# daemons over real tailcat (DERP-relayed unless direct connectivity is
+# available) and asserts on what actually lands on disk and in
 # `syncat status --json`. Nothing here fakes the network. The point of these
 # scripts is precisely the behaviour the Go suite structurally cannot see:
 # real time passing, real process death, and a real relay in the middle.
@@ -79,8 +79,8 @@ info() { printf '      %s\n' "$*" >&2; }
 # the contents of every directory the scenario registered.
 #
 # The status and directory dumps are not decoration. The one real-DERP
-# failure this suite was written after — an offline conflict that never
-# converged — printed only two daemon logs that said nothing was wrong,
+# failure this suite was written after, an offline conflict that never
+# converged, printed only two daemon logs that said nothing was wrong,
 # because the interesting state was entirely in what the two nodes believed
 # and what was on their disks.
 fail() {
@@ -135,8 +135,8 @@ wait_for() {
 # wait_while TIMEOUT_SECS DESCRIPTION PREDICATE [ARGS...]
 #
 # The inverse: polls until PREDICATE stops succeeding. Used by the scenarios
-# that assert something goes away — a peer leaving "connected", a session
-# being torn down.
+# that assert something goes away, such as a peer leaving "connected" or a
+# session being torn down.
 wait_while() {
 	local timeout="$1" desc="$2"
 	shift 2
@@ -211,14 +211,14 @@ harness_init() {
 
 	WORK="${TMPDIR:-/tmp}/syncat-test/$HARNESS_NAME"
 
-	# The work dir is a fixed path per scenario — reused and wiped on every
+	# The work dir is a fixed path per scenario, reused and wiped on every
 	# run, so there is always exactly one place to look afterwards. That only
 	# works if one instance runs at a time: two concurrent runs of the same
 	# scenario share config dirs and stomp each other, and the result is
 	# baffling rather than obviously wrong (two shares with the same name, a
 	# lookup by name that returns both, and a wait that can never succeed).
 	# The runner is sequential, so this only catches a hand-started scenario
-	# racing one already in flight — which is exactly when it is confusing.
+	# racing one already in flight, which is exactly when it is confusing.
 	if pgrep -f "$WORK" >/dev/null 2>&1; then
 		echo "FAIL[$HARNESS_NAME]: another run of this scenario is still using $WORK" >&2
 		echo "  processes: $(pgrep -f "$WORK" | tr '\n' ' ')" >&2
@@ -246,7 +246,7 @@ harness_init() {
 }
 
 # harness_cleanup runs on every exit path. Thawing before killing is
-# load-bearing: a scenario that fails between node_freeze and node_thaw would
+# essential: a scenario that fails between node_freeze and node_thaw would
 # otherwise leave a SIGSTOPped daemon behind, which ignores SIGTERM and
 # survives the run.
 harness_cleanup() {
@@ -327,13 +327,13 @@ node_pid() { eval "echo \"\${NODE_$1_PID:-}\""; }
 
 # node_start launches the daemon and waits for its API. `exec` inside the
 # backgrounded subshell replaces the subshell's image with syncat itself, so
-# $! is the daemon's real PID — without it, kill would leave the actual
+# $! is the daemon's real PID, without it, kill would leave the actual
 # daemon running as an orphan and the cleanup trap's guarantee would be void.
 node_start() {
 	local name="$1"
 	[ -z "$(node_pid "$name")" ] || fail "node $name is already running"
-	# A node's log accumulates across restarts, which is what makes it useful
-	# — and also what makes it misleading without this line. Reading a
+	# A node's log accumulates across restarts, which is what makes it useful,
+	# and also what makes it misleading without this line. Reading a
 	# restart scenario's log, the previous process's final moments sit
 	# directly above the new one's first, and it is very easy to attribute
 	# both to the same daemon and conclude something impossible is happening.
@@ -372,8 +372,8 @@ node_restart() {
 
 # node_freeze SIGSTOPs the daemon: its sockets stay open and the kernel keeps
 # ACKing at the TCP level, but the process answers nothing. That is exactly
-# the black-hole condition SPEC.md §4's dead-peer rule exists for — a peer
-# that has stopped responding without hanging up — and it reproduces a pulled
+# the black-hole condition SPEC.md §4's dead-peer rule exists for, a peer
+# that has stopped responding without hanging up, and it reproduces a pulled
 # cable or a suspended laptop without root, a firewall, or a network
 # namespace.
 node_freeze() {
@@ -522,7 +522,7 @@ assert_mutually_clean() {
 }
 
 # assert_connected_since_cleared pins PeerStatus.ConnectedSince's documented
-# contract — zero unless the peer is connected — so a UI rendering "connected
+# contract, zero unless the peer is connected, so a UI rendering "connected
 # for X" from it cannot show a climbing duration for a peer that is gone.
 assert_connected_since_cleared() {
 	local a="$1" b="$2" since state
@@ -537,7 +537,7 @@ assert_connected_since_cleared() {
 
 # assert_log_lacks is how the soak scenarios assert an absence. Reconnect
 # churn and ping timeouts are both invisible in a status snapshot taken after
-# the fact — the only record that they happened at all is the daemon log.
+# the fact, the only record that they happened at all is the daemon log.
 assert_log_lacks() {
 	local name="$1" pattern="$2" what="${3:-$2}" hits
 	hits="$(grep -c -- "$pattern" "$(node_log "$name")" 2>/dev/null || true)"

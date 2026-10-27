@@ -18,12 +18,12 @@ import (
 // tags matching the wire-protocol field naming SPEC.md §4 already uses
 // (share_id, approval_required, ...), plus the conversion functions that
 // build them from a core.Status. Handlers never marshal core types
-// directly — every response goes through one of these.
+// directly, every response goes through one of these.
 //
 // Composite ids: config.Share/config.Peer are keyed by a single string
 // (share id / peer key hex) that maps directly to a REST {id}. A
 // subscription has no such field (SPEC.md §3 keys it by the pair
-// peer+share_id) — subscriptionID/parseSubscriptionID below encode that
+// peer+share_id), subscriptionID/parseSubscriptionID below encode that
 // pair as "<peer-key-hex>:<share-id>" for the {id} path segment. Both
 // halves are always plain hex, so splitting on the first ':' is
 // unambiguous.
@@ -33,7 +33,7 @@ import (
 type statusResponse struct {
 	// Version is this daemon's build, as version.String() renders it. It
 	// is read straight from the binary rather than from core.Status
-	// because it describes the build, not the node's state — nothing in
+	// because it describes the build, not the node's state, nothing in
 	// core has, or should have, an opinion about it.
 	Version string `json:"version"`
 
@@ -54,7 +54,7 @@ type statusResponse struct {
 }
 
 type peerDTO struct {
-	ID              string         `json:"id"` // full Ed25519 public key, hex — same as PeerKey
+	ID              string         `json:"id"` // full Ed25519 public key, hex, same as PeerKey
 	PeerKey         string         `json:"peer_key"`
 	ShortID         string         `json:"short_id"`
 	Name            string         `json:"name"`

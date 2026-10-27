@@ -33,7 +33,7 @@ import (
 // keys, so a nil VersionVector behaves identically to an empty one, and a
 // vector that happens to store an explicit 0 for some key is indistinguishable
 // from that key being absent. Bump never removes keys and Merge never invents
-// zero entries, so in practice explicit zeros never appear — but the
+// zero entries, so in practice explicit zeros never appear, but the
 // functions here are correct either way.
 
 // --- version vectors (SPEC.md §5) --------------------------------------
@@ -82,7 +82,7 @@ func Dominates(a, b protocol.VersionVector) bool {
 
 // Concurrent reports whether a and b are neither equal nor ordered by
 // Dominates in either direction. For any pair of vectors, exactly one of
-// Equal(a,b), Dominates(a,b), Dominates(b,a), Concurrent(a,b) holds — see
+// Equal(a,b), Dominates(a,b), Dominates(b,a), Concurrent(a,b) holds. See
 // reconcile_test.go's property check.
 func Concurrent(a, b protocol.VersionVector) bool {
 	return !Equal(a, b) && !Dominates(a, b) && !Dominates(b, a)
@@ -127,7 +127,7 @@ const (
 	// ActionNone means no local filesystem change is needed for this
 	// relpath. This is a real, deliberate outcome (equal versions, local
 	// already dominates and the peer will pull from us, or the share
-	// direction blocks inbound changes entirely) — Reconcile returns one
+	// direction blocks inbound changes entirely). Reconcile returns one
 	// Action per relpath it considered, including these no-ops, so callers
 	// and tests never have to distinguish "considered and skipped" from
 	// "never looked at".
@@ -213,7 +213,7 @@ func (s ActionSource) String() string {
 type Action struct {
 	Kind ActionKind
 
-	// RelPath is the file this action concerns — the "winner" path, i.e.
+	// RelPath is the file this action concerns, the "winner" path, i.e.
 	// the one that keeps the original name. Always set.
 	RelPath string
 
@@ -223,7 +223,7 @@ type Action struct {
 	// ActionConflictCopy it is the winning side's FileInfo; for
 	// ActionLocallyModified it is what the peer currently holds (for a
 	// future revert). Resolved.Version is already the correct version to
-	// persist — for ActionPull/ActionDelete this is simply the peer's
+	// persist. For ActionPull/ActionDelete this is simply the peer's
 	// version as received; for ActionResurrect/ActionConflictCopy it is
 	// Merge(local, remote) plus a local Bump, per SPEC.md §5. Zero value
 	// (unused) for ActionNone.
@@ -245,13 +245,13 @@ type Action struct {
 	// SourceVersion is identical to it. But for
 	// ActionResurrect/ActionConflictCopy, Resolved.Version has been
 	// rewritten to Merge(local, remote) plus a local Bump (per SPEC.md §5)
-	// — the version we're about to persist locally, reflecting that *we*
+	// This is the version we're about to persist locally, reflecting that *we*
 	// have now resolved the conflict. The peer never has that value; they
 	// only ever have what they last told us about. A FileRequest must
 	// carry SourceVersion, or the peer's Equal(row.Version, req.Version)
 	// freshness check (handleFileRequest in transfer.go) can never match,
 	// and the pull always fails with "version_changed" on its first
-	// attempt — see apply.go's pullAndInstall, the only consumer of this
+	// attempt. See apply.go's pullAndInstall, the only consumer of this
 	// field. Zero/unused when Source != SourceRemote.
 	SourceVersion protocol.VersionVector
 
@@ -263,7 +263,7 @@ type Action struct {
 	// ConflictRelPath (SPEC.md §5 conflict-filename format).
 	ConflictRelPath string
 	// ConflictInfo is the losing side's FileInfo, verbatim (its own
-	// version, size, sha256, mtime — not merged or bumped: the conflict
+	// version, size, sha256, mtime, not merged or bumped. The conflict
 	// copy is a brand-new file as far as the index is concerned, and syncs
 	// onward from there like any other file).
 	ConflictInfo protocol.FileInfo
@@ -277,7 +277,7 @@ type Action struct {
 	LocallyModified bool
 
 	// Reason is a short, human-readable explanation of why this action was
-	// chosen — useful for logs, the UI, and test assertions.
+	// chosen, useful for logs, the UI, and test assertions.
 	Reason string
 }
 
@@ -346,15 +346,15 @@ const conflictTimeLayout = "20060102-150405"
 //
 // Dotfiles are handled specially so this doesn't misfire on them: a name
 // whose only dot is a single leading one (".bashrc") is treated as having
-// no extension at all, producing ".bashrc.sync-conflict-<ts>-<id>" — naively
+// no extension at all, producing ".bashrc.sync-conflict-<ts>-<id>". Naively
 // using the last-dot rule on the whole string would treat ".bashrc" itself
 // as the "extension" and leave an empty base. ".config.json" (a dotfile
 // *with* a real extension) still splits into ".config" + ".json" as
 // expected. Extensionless files (e.g. "README") simply get no trailing
 // <ext>.
 //
-// If relpath already carries a ".sync-conflict-...-<id>" marker — a
-// conflict copy that itself conflicted again — that marker is stripped
+// If relpath already carries a ".sync-conflict-...-<id>" marker (a
+// conflict copy that itself conflicted again), that marker is stripped
 // before the new one is appended, so repeated conflicts on the same file
 // never grow the filename without bound: the result always carries at most
 // one marker, always the most recent.
@@ -396,7 +396,7 @@ type Clock func() time.Time
 //
 // nodeID is this node's ShortID (config.IdentityKey.ShortID), used to bump
 // the local counter when a conflict is resolved. dir reflects the share's
-// permission (as offerer) or subscription mode (as subscriber) — build it
+// permission (as offerer) or subscription mode (as subscriber). Build it
 // with DirectionFor. clock supplies the timestamp for any conflict
 // filenames generated; if nil, time.Now is used.
 //
@@ -473,7 +473,7 @@ func isDirEntry(l protocol.FileInfo, hasLocal bool, r protocol.FileInfo, hasRemo
 }
 
 // indexByPath keys files by RelPath. If the input slice has duplicate
-// relpaths (it shouldn't — an index has at most one row per relpath), the
+// relpaths (it shouldn't, an index has at most one row per relpath), the
 // last occurrence silently wins.
 func indexByPath(files []protocol.FileInfo) map[string]protocol.FileInfo {
 	m := make(map[string]protocol.FileInfo, len(files))
@@ -499,7 +499,7 @@ func reconcileOne(relpath string, l protocol.FileInfo, hasLocal bool, r protocol
 	if !hasRemote {
 		// Local-only: the peer has never told us about this path. Treat it
 		// like local strictly dominating an (implicit) empty remote vector:
-		// nothing to pull, the peer will pull from us — unless we must
+		// nothing to pull, the peer will pull from us, unless we must
 		// never propose outbound changes, in which case this is exactly
 		// the kind of local content a receive-only subscription must flag.
 		if dir.OutboundBlocked {
@@ -549,13 +549,13 @@ func reconcileOne(relpath string, l protocol.FileInfo, hasLocal bool, r protocol
 func reconcileConcurrent(relpath string, l, r protocol.FileInfo, nodeID string, dir Direction, clock Clock) Action {
 	// Under a receive-only subscription, a concurrent divergence caused by
 	// *our own* live content (l.Deleted == false) is never resolved via a
-	// conflict copy — SPEC.md §1: local modifications on a receive-only
+	// conflict copy. SPEC.md §1: local modifications on a receive-only
 	// copy are "detected, logged as warnings... and overwritten... after a
 	// trash copy is taken" the next time the offerer changes the file. The
 	// actual revert-via-trash happens in apply.go; here we only raise the
 	// flag, carrying what the peer currently holds for it to apply. (If
 	// l.Deleted is true instead, the peer holding live content is a
-	// legitimate incoming resurrect, not a local misdeed — that falls
+	// legitimate incoming resurrect, not a local misdeed, that falls
 	// through to the normal handling below.)
 	if dir.OutboundBlocked && !l.Deleted {
 		return Action{Kind: ActionLocallyModified, RelPath: relpath, Resolved: r, Source: SourceRemote,
@@ -573,7 +573,7 @@ func reconcileConcurrent(relpath string, l, r protocol.FileInfo, nodeID string, 
 		}
 		// Capture the winner's real, as-advertised version before
 		// overwriting Resolved.Version with the merged+bumped value below
-		// — SourceVersion (used only when source == SourceRemote) must stay
+		// so SourceVersion (used only when source == SourceRemote) must stay
 		// the version the peer actually has, or the FileRequest this
 		// resurrect issues can never match on the peer's side. See
 		// SourceVersion's doc comment above.
@@ -587,7 +587,7 @@ func reconcileConcurrent(relpath string, l, r protocol.FileInfo, nodeID string, 
 	if l.Deleted { // && r.Deleted, by the check above
 		// Both sides already agree the file is gone; only the version
 		// vectors disagree (e.g. two nodes each deleted it independently
-		// before ever syncing). Nothing to move — just reconcile the
+		// before ever syncing). Nothing to move, just reconcile the
 		// vector.
 		resolved := r
 		resolved.Version = merged
@@ -635,7 +635,7 @@ func reconcileConcurrent(relpath string, l, r protocol.FileInfo, nodeID string, 
 // reconcileIdenticalContent handles the concurrent-but-same-bytes case
 // (bytes.Equal(l.SHA256, r.SHA256)). This concurrency isn't a real
 // divergence to preserve, only version-vector bookkeeping that hasn't
-// caught up yet — overwhelmingly because both peers just independently
+// caught up yet, overwhelmingly because both peers just independently
 // resolved this very conflict on their own (each bumping its own counter
 // per SPEC.md §5's "element-wise max + local bump"), which leaves their two
 // results *mutually concurrent with each other* even though the bytes they
@@ -646,7 +646,7 @@ func reconcileConcurrent(relpath string, l, r protocol.FileInfo, nodeID string, 
 // through to reconcileConcurrent's generic conflict-copy handling:
 //
 //  1. Correctness: a conflict copy of content that's identical to the
-//     winner is a no-op at best. At worst it's actively destructive —
+//     winner is a no-op at best. At worst it's actively destructive:
 //     ConflictRelPath is a deterministic function of (relpath, nodeID,
 //     second), so a second pass through this branch within the same
 //     second computes the *same* path as this node's own earlier,
@@ -657,7 +657,7 @@ func reconcileConcurrent(relpath string, l, r protocol.FileInfo, nodeID string, 
 //     counter every time it reconciles the other's already-resolved
 //     result, which (unlike the merged+bump growing past the *other*
 //     side's last-known value and settling into a normal dominates
-//     relationship) has no guarantee of ever converging — under
+//     relationship) has no guarantee of ever converging. Under
 //     symmetric timing both sides can keep leapfrogging each other's
 //     bump indefinitely. Folding the vectors with a plain Merge (no
 //     extra local Bump) instead is deterministic and commutative: both
@@ -677,11 +677,11 @@ func reconcileIdenticalContent(relpath string, l, r protocol.FileInfo) Action {
 // conflictWinnerIsRemote applies SPEC.md §5's conflict tie-break: the
 // larger mtime_ns wins; if mtimes are equal, the larger sha256 wins,
 // compared with bytes.Compare over the raw digest bytes (an unsigned,
-// left-to-right byte comparison — there is no numeric interpretation of the
+// left-to-right byte comparison, there is no numeric interpretation of the
 // digest implied, it's simply a total order that both sides can compute
-// identically). If both mtime and sha256 are exactly equal — the content is
+// identically). If both mtime and sha256 are exactly equal, the content is
 // byte-identical, so the vectors' concurrency reflects two independent
-// no-op edits rather than any real divergence — there is nothing left to
+// no-op edits rather than any real divergence, there is nothing left to
 // break the tie on; we deterministically prefer local. This never arises
 // for genuinely different content, since sha256 collisions aren't a
 // practical concern.

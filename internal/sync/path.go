@@ -11,7 +11,7 @@ import (
 // FileChunkHeader.RelPath. ValidateRelPath is the single function that
 // decides whether such a string is safe to ever use in building a
 // filesystem path. JoinSharePath is the only function in this package that
-// actually builds one, and it always calls ValidateRelPath itself first —
+// actually builds one, and it always calls ValidateRelPath itself first,
 // so a caller cannot construct a share-relative filesystem path through this
 // package without going through validation, even if it forgets to call
 // ValidateRelPath explicitly.
@@ -22,7 +22,7 @@ import (
 // FileRequest, FileChunkHeader) that flows into a filesystem call
 // (os.Open, os.Create, os.Rename, os.MkdirAll, filepath.Join, ...) and
 // confirm each one is downstream of a sync.JoinSharePath call rather than
-// building the path by hand — e.g. `grep -rn 'RelPath' --include=*.go .`
+// building the path by hand, e.g. `grep -rn 'RelPath' --include=*.go .`
 // cross-checked against `grep -rn 'JoinSharePath\|ValidateRelPath'`. No
 // other function in internal/sync (or elsewhere) should call filepath.Join
 // with a share root and a wire-sourced relpath.
@@ -120,7 +120,7 @@ func ValidateRelPath(relpath string) error {
 
 // JoinSharePath validates relpath and joins it onto shareRoot (an absolute
 // local filesystem path), returning the resulting absolute path. It always
-// validates relpath itself — see the package-level doc comment above for
+// validates relpath itself. See the package-level doc comment above for
 // why callers should use this instead of validating and joining separately.
 func JoinSharePath(shareRoot, relpath string) (string, error) {
 	if err := ValidateRelPath(relpath); err != nil {

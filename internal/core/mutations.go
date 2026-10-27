@@ -17,8 +17,8 @@ import (
 // (internal/api) and the CLI call to change what this node peers with,
 // offers, and subscribes to. Every entry point resolves its human-typed
 // references (see resolve.go), mutates a clone of the config under cfgMu,
-// persists it, and only then applies the live effects — watchers started
-// or stopped, sessions re-synced — with cfgMu released.
+// persists it, and only then applies the live effects: watchers started
+// or stopped, sessions re-synced, with cfgMu released.
 //
 // Lock ordering: config mutations always clone-mutate-swap under cfgMu;
 // live effects (which take peerConn.mu) are applied after cfgMu is
@@ -48,7 +48,7 @@ func cloneConfig(cfg *config.Config) *config.Config {
 }
 
 // mutateConfig applies fn to a clone of the current config, persists the
-// clone (config.Save, which also validates), and — only on success —
+// clone (config.Save, which also validates), and, only on success,
 // swaps it in as the live config. Callers apply live effects (starting/
 // stopping watchers and sessions) after mutateConfig returns successfully,
 // outside cfgMu, matching every mutation method in this file.
@@ -97,7 +97,7 @@ func findSubscriptionIndex(cfg *config.Config, peerKeyHex, shareID string) int {
 
 // AddPeer adds a peer by its pasted sc1 token (SPEC.md §2), persists it,
 // and starts dialing it immediately. It returns the peer's canonical
-// identifier (its full Ed25519 public key, hex-encoded) — every other
+// identifier (its full Ed25519 public key, hex-encoded). Every other
 // peer-scoped method in this package's API takes that same identifier.
 func (n *Node) AddPeer(name, token string) (string, error) {
 	tok, err := config.ParseToken(token)
@@ -155,15 +155,15 @@ func (n *Node) activatePeer(p config.Peer, peerKeyHex string) error {
 // the share (config.Subscription.Peer): once that peer is gone there is no
 // node left to sync it with, so leaving it configured would keep a watcher
 // running and keep it listed by `syncat status` forever, permanently
-// stuck. Removal is config-only, matching RemoveSubscription — the local
+// stuck. Removal is config-only, matching RemoveSubscription. The local
 // copy of the files stays on disk, it just stops being synced.
 //
 // The access entries go because config.Share.Access is keyed by the peer's
 // Ed25519 public key, and buildShareList reads that map directly with no
 // reference to whether the key still belongs to a configured peer. A
 // leftover "granted" is therefore not just clutter: re-adding that same
-// key later — the obvious thing to do after removing a peer by mistake, or
-// to re-pair after one side is rebuilt — would silently restore its
+// key later (the obvious thing to do after removing a peer by mistake, or
+// to re-pair after one side is rebuilt) would silently restore its
 // previous access to every share, with no new approval and nothing shown
 // to the user. Removing a peer should mean it starts from nothing if it
 // ever comes back.
@@ -454,8 +454,8 @@ func (n *Node) SetShareAccess(shareRef, peerRef, access string) error {
 	// a subscription it already has, while the access it shows for an
 	// offered share comes from the ShareList and nowhere else. Without this,
 	// a share we just granted keeps reading as "no access" on the peer's
-	// side — and a grant made before the peer ever subscribes reaches it
-	// with nothing at all — until the next reconnect.
+	// side, and a grant made before the peer ever subscribes reaches it
+	// with nothing at all until the next reconnect.
 	n.sendShareList(sess, peerKeyHex)
 	if access == protocol.AccessGranted {
 		if err := sess.SyncShare(n.ctx, shareID); err != nil {
@@ -476,7 +476,7 @@ func (n *Node) SetShareAccess(shareRef, peerRef, access string) error {
 // AddSubscription subscribes to a peer's share (SPEC.md §1/§6): validates
 // the peer and share ids and the local path (CheckSubscriptionPath),
 // creates the local path if needed, persists the subscription, starts
-// watching the local copy, and — if already connected to the peer — sends
+// watching the local copy, and, if already connected to the peer, sends
 // SubscribeRequest immediately.
 //
 // peerRef and shareRef are references in the sense of matchRef: a
@@ -608,7 +608,7 @@ func (n *Node) PauseSubscription(peerRef, shareRef string, paused bool) error {
 
 // RenameNode changes this node's display name, persisting it and
 // recomputing the cached sc1 token (which embeds the name as a
-// "suggested display name" — SPEC.md §2).
+// "suggested display name" in SPEC.md §2).
 func (n *Node) RenameNode(name string) error {
 	if _, err := n.mutateConfig(func(cfg *config.Config) error {
 		cfg.NodeName = name

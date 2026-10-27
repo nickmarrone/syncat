@@ -40,7 +40,7 @@ log "Taking BOTH nodes offline and diverging them"
 # Both, not just bob. A conflict only exists if each side has *indexed* its
 # own edit before the two talk again. A node left running indexes through
 # its watcher's 1s debounce, which races the other node restarting and
-# reconnecting — and when it loses that race the incoming version simply
+# reconnecting, and when it loses that race the incoming version simply
 # dominates: the local edit is overwritten (into the trash, so recoverable,
 # but out of the working tree) and no conflict copy is ever created. That is
 # a real property of an index-based reconciler, not something a test should
@@ -59,7 +59,7 @@ echo "only alice" >"$ALICE_SHARE/alice.txt"
 rm "$ALICE_SHARE/gone.txt"
 echo "bob edit" >"$BOB_SYNC/both.txt"
 echo "only bob" >"$BOB_SYNC/bob.txt"
-# Proof, below, that the index exchange actually ran — so "no conflict copy"
+# Proof, below, that the index exchange actually ran, so "no conflict copy"
 # can never be mistaken for "the two nodes never talked".
 echo "tracer" >"$ALICE_SHARE/tracer.txt"
 

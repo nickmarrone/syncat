@@ -128,7 +128,7 @@ func printJSON(v any) error {
 }
 
 // These mirror internal/api's JSON response shapes just closely
-// enough for the CLI to render them — a separate, intentionally decoupled
+// enough for the CLI to render them, a separate, intentionally decoupled
 // copy, since the CLI is a thin HTTP client (SPEC.md §1) and must not
 // import internal/api or internal/core directly.
 

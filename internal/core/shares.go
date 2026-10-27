@@ -12,14 +12,14 @@ import (
 	syncsvc "github.com/nickmarrone/syncat/internal/sync"
 )
 
-// This file wires each locally-relevant directory — a share we offer, or a
-// subscription's local copy — to internal/index's Scanner/Watcher and
+// This file wires each locally-relevant directory, a share we offer or a
+// subscription's local copy, to internal/index's Scanner/Watcher and
 // keeps the index in sync with disk (SPEC.md §5 "Scanning"), independent
 // of which (if any) peers are currently connected. rescanShare is the
 // bridge from "the filesystem changed" to "our peers find out": it scans,
 // bumps the version vector for whatever actually changed locally (SPEC.md
-// §5: "local modification bumps the local counter"), persists it, and —
-// only if something changed — re-syncs the share on every session that
+// §5: "local modification bumps the local counter"), persists it, and
+// only if something changed, re-syncs the share on every session that
 // currently has it active (propagateShare).
 
 // shareWatch is one local directory Node keeps indexed: either a share we
@@ -43,7 +43,7 @@ type shareWatch struct {
 
 // startShareWatch begins watching root for shareID: an initial fsnotify
 // watch tree plus the periodic full rescan that remains the source of
-// truth (SPEC.md §5). It does not itself perform the first scan — callers
+// truth (SPEC.md §5). It does not itself perform the first scan. Callers
 // that want one immediately (Open, AddShare, AddSubscription) call
 // rescanShare explicitly afterward.
 func (n *Node) startShareWatch(shareID, root string) (*shareWatch, error) {
@@ -78,7 +78,7 @@ func (n *Node) startShareWatch(shareID, root string) (*shareWatch, error) {
 	n.sharesMu.Lock()
 	if old, ok := n.shareWatches[shareID]; ok {
 		// Replacing an existing watch (e.g. AddShare called again for a
-		// share id that somehow already had one — shouldn't happen given
+		// share id that somehow already had one. It shouldn't happen given
 		// config validation, but never leak the old watcher's goroutines).
 		n.sharesMu.Unlock()
 		old.watcher.Close()
@@ -95,7 +95,7 @@ func (n *Node) startShareWatch(shareID, root string) (*shareWatch, error) {
 // unchanged since the last load, and the global list has not been
 // swapped, nothing is rebuilt.
 //
-// Reloading here — from rescanShare — rather than from a dedicated watcher
+// Reloading here, from rescanShare, rather than from a dedicated watcher
 // hook is deliberate. rescanShare is the single funnel every trigger
 // already passes through (startup, the fsnotify debounce, and the periodic
 // scan that SPEC.md §5 calls the source of truth), and editing
@@ -214,7 +214,7 @@ func (n *Node) rescanShareAsync(shareID string) {
 
 // rescanShare runs one full scan of shareID's directory (SPEC.md §5),
 // bumps the local version-vector counter for every row that actually
-// changed content (Added/ContentChanged/Deleted — not MetadataOnly, which
+// changed content (Added/ContentChanged/Deleted, not MetadataOnly, which
 // carries no content change: see index.Scanner.Scan's doc comment),
 // persists the result, and propagates it to every session currently
 // syncing this share.
@@ -267,7 +267,7 @@ func (n *Node) rescanShare(ctx context.Context, shareID string) error {
 		return nil
 	}
 	// Only reached when the scan found a real content change, so this does
-	// not fire on the idle periodic rescan — but a busy share still rescans
+	// not fire on the idle periodic rescan, but a busy share still rescans
 	// on every fsnotify batch, which is why it is behind the debug flag.
 	// The counts are the useful part: they are exactly what is about to be
 	// pushed to every peer, so a share that keeps re-scanning the same file
@@ -280,7 +280,7 @@ func (n *Node) rescanShare(ctx context.Context, shareID string) error {
 }
 
 // propagateShare re-sends a full IndexUpdate for shareID (Session.SyncShare
-// only offers a full-snapshot resend, not a delta — see its doc comment)
+// only offers a full-snapshot resend, not a delta; see its doc comment)
 // to every currently-connected session that has this share active, i.e.
 // every peer with granted access to a share we offer, or the single
 // offerer of a subscription (SPEC.md §5 "Fan-out": a share offered to
@@ -296,7 +296,7 @@ func (n *Node) propagateShare(ctx context.Context, shareID string) {
 //
 // This is the other half of SPEC.md §5's fan-out rule. A change that
 // originates locally reaches every peer through rescanShare, but a change
-// *pulled* from one peer reaches the rest only through here — see
+// *pulled* from one peer reaches the rest only through here. See
 // syncsvc.Session.SetAppliedHandler for why no rescan will do it, and
 // scripts/net/08-three-node-fanout.sh for the case that proves it.
 func (n *Node) propagateShareExcept(ctx context.Context, shareID string, except *peerConn) {

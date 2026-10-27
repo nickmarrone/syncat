@@ -307,8 +307,8 @@ func TestTrash_RestoreRefusesToClobberExistingFile(t *testing.T) {
 }
 
 // 6. Trash failure aborts the apply: trashHook (the exact call every
-// destructive apply.go path makes immediately before its destructive step
-// — see applyDelete and pullAndInstall) must return an error without
+// destructive apply.go path makes immediately before its destructive step,
+// see applyDelete and pullAndInstall) must return an error without
 // touching the original file when the underlying Trash.Put fails, so the
 // caller never reaches its rename/remove.
 func TestTrash_FailureAbortsApply(t *testing.T) {
@@ -354,7 +354,7 @@ func TestTrash_FailureAbortsApply(t *testing.T) {
 }
 
 // 7. Structural local-vs-remote distinction: a local delete the user makes
-// (observed by the scanner, applied via index.ApplyScanResult — a code
+// (observed by the scanner, applied via index.ApplyScanResult, a code
 // path with zero dependency on this package) must never trash anything. A
 // remote-initiated delete, going through applyDelete, must.
 func TestTrash_LocalDeleteIsNeverTrashed_RemoteDeleteIs(t *testing.T) {
@@ -476,7 +476,7 @@ func openTestTrashStore(t *testing.T) *index.Store {
 
 // fakeJanitorClock is a manually-advanced JanitorClock: Now() returns
 // whatever it's set to, and After(d) delivers on a channel only when the
-// test explicitly Fires it — so the janitor's background loop never
+// test explicitly Fires it, so the janitor's background loop never
 // depends on a real timer or a real sleep.
 type fakeJanitorClock struct {
 	now   time.Time
@@ -511,7 +511,7 @@ func (c *fakeJanitorClock) tick(t *testing.T, advance time.Duration) {
 
 // trashFileAt seeds a trash entry directly on disk, named exactly the way
 // Trash.Put would (<relpath>.<unix-ts>), but at an explicit timestamp
-// rather than whatever tr's configured clock reports — so a single Trash
+// rather than whatever tr's configured clock reports, so a single Trash
 // can be seeded with entries of several different ages for the janitor
 // tests below, independent of Put's own clock.
 func trashFileAt(t *testing.T, tr *Trash, shareID, relpath string, ts int64) {
@@ -693,8 +693,8 @@ func TestJanitor_BackgroundLoopRunsOnFakeClockAndStopsCleanly(t *testing.T) {
 
 // TestSweepTempFiles covers the cleanup for staging files a killed daemon
 // could not remove itself. Apply only renames a download into place once its
-// content verifies, so an interrupted transfer leaves a full-size file behind
-// — hidden, inside the user's own synced directory, one per crash.
+// content verifies, so an interrupted transfer leaves a full-size file behind,
+// hidden, inside the user's own synced directory, one per crash.
 func TestSweepTempFiles(t *testing.T) {
 	root := t.TempDir()
 	nested := filepath.Join(root, "sub", "deeper")
@@ -702,7 +702,7 @@ func TestSweepTempFiles(t *testing.T) {
 		t.Fatalf("mkdir: %v", err)
 	}
 
-	// Two orphans, one of them in a subdirectory — staging files are written
+	// Two orphans, one of them in a subdirectory, staging files are written
 	// beside their destination, so a nested tree leaves them nested too.
 	orphans := []string{
 		filepath.Join(root, TempFilePrefix+"123"),

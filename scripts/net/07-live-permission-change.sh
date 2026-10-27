@@ -4,7 +4,7 @@
 # SPEC.md §6 says the decision is pushed to the peer via AccessUpdate, so
 # demoting a read-write share to read-only has to take effect on a connected
 # subscriber without either side restarting. The subscriber keeps everything
-# it has already synced — revocation stops sync, it does not claw data back —
+# it has already synced, revocation stops sync, it does not claw data back,
 # and the offerer's own changes keep flowing outward.
 #
 # The negative half of that needs care. "Bob's write did not arrive" is only

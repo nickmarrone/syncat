@@ -53,7 +53,7 @@ type WatcherOptions struct {
 	// the most recent fsnotify event in a batch. DefaultDebounce if <= 0.
 	Debounce time.Duration
 	// RescanInterval is how often OnPeriodic fires regardless of watcher
-	// activity — the source-of-truth full rescan (SPEC.md §5).
+	// activity, the source-of-truth full rescan (SPEC.md §5).
 	// DefaultRescanInterval if <= 0.
 	RescanInterval time.Duration
 	// OnDirty is called after the debounce window with the batch of
@@ -67,7 +67,7 @@ type WatcherOptions struct {
 	OnWarn func(format string, args ...any)
 	// Ignore, if non-nil, reports whether a share-relative path is
 	// excluded by the share's ignore rules. It is used only to avoid
-	// placing filesystem watches inside ignored directories — a large
+	// placing filesystem watches inside ignored directories, a large
 	// node_modules under an ignore rule would otherwise consume thousands
 	// of watch descriptors to report changes that are then discarded.
 	//
@@ -87,7 +87,7 @@ type WatcherOptions struct {
 // share tree via fsnotify, plus the periodic full rescan that remains the
 // source of truth (SPEC.md §5). It adds watches recursively, including for
 // subdirectories created after the watcher starts, and debounces bursts of
-// events into a single targeted rescan callback — a `git checkout`
+// events into a single targeted rescan callback. A `git checkout`
 // touching thousands of files fires OnDirty once, not thousands of times.
 //
 // If establishing filesystem watches fails or hits an OS limit (e.g.
@@ -310,7 +310,7 @@ func (w *Watcher) addTreeWatches(fsw *fsnotify.Watcher, dir string) error {
 		if w.isIgnoredDir(p) {
 			// Nothing under an ignored directory can ever sync, so the
 			// whole subtree is not worth a watch descriptor. Purely an
-			// optimization — see WatcherOptions.Ignore.
+			// optimization. See WatcherOptions.Ignore.
 			return fs.SkipDir
 		}
 		if err := fsw.Add(p); err != nil {
@@ -329,7 +329,7 @@ func (w *Watcher) addTreeWatches(fsw *fsnotify.Watcher, dir string) error {
 // debouncer collapses a stream of dirty-path marks arriving within
 // `window` of each other into a single onFlush call carrying the
 // accumulated, de-duplicated set. It is pure quiet-period debounce logic
-// driven entirely by an injected Clock — no fsnotify, no real sleeping —
+// driven entirely by an injected Clock, no fsnotify, no real sleeping,
 // which is what makes it possible to test the "a burst collapses into one
 // rescan" behavior deterministically (see watcher_test.go's fakeClock):
 // the timing-sensitive logic lives here, isolated from the real OS/
@@ -403,7 +403,7 @@ func (d *debouncer) run(wg *sync.WaitGroup) {
 			// Re-registering on every mark is the whole debounce
 			// mechanism: whichever registration is still "current" when
 			// it fires wins, and any earlier ones this replaced just go
-			// unread (like any discarded time.After result — bounded,
+			// unread (like any discarded time.After result, bounded,
 			// GC'd, not a leak).
 			timer = d.clock.After(d.window)
 		case <-timer:

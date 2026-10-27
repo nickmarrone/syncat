@@ -401,7 +401,7 @@ func TestConcurrentReadersAndWriter(t *testing.T) {
 
 // TestApplyScanResultIgnoredParksWithoutJournal is the store half of the
 // no-tombstone rule. A newly-ignored row must disappear from every listing
-// that feeds the wire, and — the part that actually protects the peers —
+// that feeds the wire, and, the part that actually protects the peers,
 // must leave change_journal and share_state.next_seq untouched, so nothing
 // about it ever reaches a peer as a change.
 func TestApplyScanResultIgnoredParksWithoutJournal(t *testing.T) {
@@ -432,7 +432,7 @@ func TestApplyScanResultIgnoredParksWithoutJournal(t *testing.T) {
 		t.Fatalf("ApplyScanResult: %v", err)
 	}
 
-	// The row is gone outright — not left behind as a tombstone.
+	// The row is gone outright, not left behind as a tombstone.
 	all, err := s.ListShare(ctx, "s1", true)
 	if err != nil {
 		t.Fatalf("ListShare: %v", err)
@@ -455,7 +455,7 @@ func TestApplyScanResultIgnoredParksWithoutJournal(t *testing.T) {
 
 // TestIgnoredRowIsParkedNotDeleted pins why an ignored row is kept at all.
 // Deleting it would restart the file's version vector if the rule were
-// ever removed, producing a version the peer already holds — the two sides
+// ever removed, producing a version the peer already holds, the two sides
 // would compare equal while their contents differed, and would never
 // converge again. Parking keeps the vector; only the scanner can see it.
 func TestIgnoredRowIsParkedNotDeleted(t *testing.T) {

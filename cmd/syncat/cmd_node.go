@@ -33,7 +33,7 @@ import (
 // existing keys, the api token, or an existing config.json's node name.
 // With --reset it first deletes every file this node owns (see
 // resetTargets) and then runs that same path over a clean slate, so the
-// node comes back with a new identity — and --name means something again,
+// node comes back with a new identity, and --name means something again,
 // since the config it would otherwise defer to is gone.
 func cmdInit(paths *config.Paths, args []string) error {
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
@@ -164,7 +164,7 @@ func resetState(paths *config.Paths, in io.Reader, out io.Writer, assumeYes bool
 // The case this exists for is the packaged install (README, "System-wide
 // service"): state under /etc/syncat and /var/lib/syncat owned by a
 // dedicated `syncat` user, and a reset run as root instead. Nothing stops
-// root from doing it — that is the problem. EnsureDirs and
+// root from doing it. That is the problem. EnsureDirs and
 // writeFileAtomic create as whoever is running, so the reset deletes
 // syncat-owned files and puts root-owned ones back, and the daemon
 // (User=syncat) can no longer read its own config or keys. It fails to
@@ -259,8 +259,8 @@ func resetTargets(p *config.Paths) []string {
 	return append(targets, tmps...)
 }
 
-// keptPaths lists the directories holding actual files — this node's
-// shares and its subscriptions' local copies — none of which a reset
+// keptPaths lists the directories holding actual files (this node's
+// shares and its subscriptions' local copies), none of which a reset
 // touches. It exists so the prompt can name them instead of just
 // promising they are safe. Callers must build this before deleting
 // config.json, which is the only record of where they are.
@@ -280,7 +280,7 @@ func keptPaths(cfg *config.Config) []string {
 }
 
 // confirmReset prints what is about to happen and requires the user to
-// type resetConfirmWord. Any other input — including EOF — is an error,
+// type resetConfirmWord. Any other input, including EOF, is an error,
 // so a caller that ignores nothing deletes nothing.
 func confirmReset(in io.Reader, out io.Writer, targets, kept []string) error {
 	fmt.Fprintln(out, "This will PERMANENTLY delete:")
@@ -328,7 +328,7 @@ func removeState(targets []string) error {
 // stdinIsTerminal reports whether stdin is a character device, i.e. that
 // there is a person on the other end to answer the prompt. Without this a
 // redirect (`init --reset < /dev/null`) would read EOF, and a reset that
-// nobody confirmed is exactly what the prompt exists to prevent — so a
+// nobody confirmed is exactly what the prompt exists to prevent, so a
 // non-interactive stdin has to say --yes and mean it.
 func stdinIsTerminal() bool {
 	info, err := os.Stdin.Stat()
@@ -339,8 +339,8 @@ func stdinIsTerminal() bool {
 }
 
 // daemonRunning reports whether anything answers on this node's API
-// address, which is the closest thing to a liveness check syncat has —
-// the daemon writes no pid file and takes no lock, so the bound port is
+// address, which is the closest thing to a liveness check syncat has.
+// The daemon writes no pid file and takes no lock, so the bound port is
 // the only trace it leaves (README: "writes no PID file").
 //
 // It dials rather than calling GET /api/status through newAPIClient
@@ -414,7 +414,7 @@ func cmdToken(paths *config.Paths, args []string) error {
 }
 
 // cmdVersion implements `syncat version`. Like `syncat token` it touches
-// no daemon and no network — the version is a property of this binary, so
+// no daemon and no network. The version is a property of this binary, so
 // it is answerable even on a node that has never been initialised.
 func cmdVersion(paths *config.Paths, args []string) error {
 	fs := flag.NewFlagSet("version", flag.ContinueOnError)
@@ -439,7 +439,7 @@ const shutdownGrace = 15 * time.Second
 // cmdDaemon implements `syncat daemon [--api ADDR]` (SPEC.md §1/§8): it
 // constructs the core.Node, starts the REST API server on a loopback-only
 // listener, and runs until SIGINT/SIGTERM, at which point it shuts both
-// down in order — stop accepting new API requests, then close the node
+// down in order: stop accepting new API requests, then close the node
 // (which itself waits for every background goroutine, including the
 // trash janitor and peer sessions, before returning).
 func cmdDaemon(paths *config.Paths, args []string) error {
@@ -479,7 +479,7 @@ func cmdDaemon(paths *config.Paths, args []string) error {
 // systemd sets JOURNAL_STREAM when a service's stdout/stderr is connected
 // directly to the journal, and journald stamps every entry it receives with
 // its own timestamp and the unit's syslog identifier. Our own prefix and
-// LstdFlags are pure duplication there — `journalctl` shows
+// LstdFlags are pure duplication there, since `journalctl` shows
 //
 //	Sep 07 11:17:31 host syncat[98783]: syncat: 2026/09/07 11:17:31 api: ...
 //
@@ -563,7 +563,7 @@ func startDaemon(nodeCtx context.Context, paths *config.Paths, apiAddr string, l
 
 // waitAndShutdown does cmdDaemon's run-and-stop half: block until
 // SIGINT/SIGTERM arrives or the API server's Serve returns on its own
-// (serveErrCh), then shut down in order — stop accepting new API requests
+// (serveErrCh), then shut down in order: stop accepting new API requests
 // (bounded by shutdownGrace), then close the node, which itself waits for
 // every background goroutine before returning.
 func waitAndShutdown(n *core.Node, httpServer *http.Server, serveErrCh <-chan error, logger *log.Logger) {
@@ -715,7 +715,7 @@ var configFields = map[string]configField{
 }
 
 // cmdConfig implements `syncat config set FIELD VALUE` (SPEC.md §8-adjacent:
-// direct field edits for the scalar settings in config.json — peers,
+// direct field edits for the scalar settings in config.json, since peers,
 // shares, and subscriptions keep their own add/ls/rm/set commands). It
 // edits config.json directly rather than going through the API, since some
 // fields (e.g. debug) only take effect on the next `syncat daemon` start

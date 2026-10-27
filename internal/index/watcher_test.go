@@ -282,16 +282,16 @@ func TestWatcherAddsWatchesForNewSubdirectories(t *testing.T) {
 // containing want arrives on dirty, and returns it.
 //
 // A single filesystem operation can legitimately produce more than one
-// fsnotify event — os.WriteFile, for instance, is open(O_CREATE)+write+
+// fsnotify event, os.WriteFile, for instance, is open(O_CREATE)+write+
 // close, which is commonly delivered as separate CREATE and WRITE events
 // for the same path. That means a "new timer registered" signal on the
 // fake clock isn't necessarily the one Advance is meant to fire: if the
 // second event's markDirty call reaches the debouncer's select in the same
 // instant Advance fires the current timer, Go's select is free to pick
 // either ready case. Picking the incoming mark over the already-fired
-// timer is not a bug — the debouncer is meant to treat that as "activity
+// timer is not a bug, the debouncer is meant to treat that as "activity
 // within the window" and extend it (see the debouncer's re-registration
-// comment, and SPEC.md §5: "batches of events collapse into one scan") —
+// comment, and SPEC.md §5: "batches of events collapse into one scan"),
 // but it means the fired timer's flush is superseded rather than
 // delivered, and waiterCount is right back at baseline+1 with a *new*
 // timer to wait for. So instead of assuming one Advance always yields one
@@ -407,7 +407,7 @@ func TestWatcherCloseStopsAllGoroutines(t *testing.T) {
 // runtime a brief, bounded chance to finish tearing down goroutines that
 // already logically exited (e.g. a Close that returned but whose deferred
 // wg.Done() hasn't been scheduled yet). This is a leak-detection heuristic,
-// not a debounce-timing mechanism — the debounce behavior itself is tested
+// not a debounce-timing mechanism, the debounce behavior itself is tested
 // exclusively via fakeClock above, with no sleeping.
 func goroutineCountSettled() int {
 	runtime.GC()
@@ -421,8 +421,8 @@ func goroutineCountSettled() int {
 
 // TestWatcherSkipsIgnoredSubtrees pins the inotify-budget optimization: a
 // directory the share's ignore rules exclude gets no watch, so changes
-// inside it are never even reported. It is only an optimization — the
-// scanner enforces the rules regardless — but a node_modules under an
+// inside it are never even reported. It is only an optimization, the
+// scanner enforces the rules regardless, but a node_modules under an
 // ignore rule is exactly the case that would otherwise consume thousands
 // of watch descriptors to report changes that are then discarded.
 func TestWatcherSkipsIgnoredSubtrees(t *testing.T) {

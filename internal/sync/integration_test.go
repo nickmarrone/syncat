@@ -34,8 +34,8 @@ import (
 // reaching for the real fsnotify/Scanner pipeline (already covered by its
 // own tests), local "edits" here go straight through the index Store:
 // write the bytes, then record a hashed, version-bumped FileRow for them.
-// That keeps these tests focused on what 5b actually owns — reconcile
-// execution, transfer, and atomic apply — without re-testing scanning.
+// That keeps these tests focused on what 5b actually owns, reconcile
+// execution, transfer, and atomic apply, without re-testing scanning.
 
 const testShareID = "share1"
 
@@ -80,7 +80,7 @@ func writeFile(t *testing.T, root, relpath, content string) string {
 
 // indexFile stats+hashes root/relpath (already written via writeFile) and
 // upserts a FileRow for it, bumping nodeID's counter on top of whatever
-// version the store already has for that relpath (0 if none) — standing
+// version the store already has for that relpath (0 if none), standing
 // in for what internal/index's scanner+ApplyScanResult would have
 // recorded after a real local edit.
 func indexFile(t *testing.T, store *index.Store, nodeID, relpath string, root string) index.FileRow {
@@ -217,7 +217,7 @@ func mustSync(t *testing.T, s *Session, shareID string) {
 }
 
 // snapshotTree walks root and returns relpath -> sha256 for every regular
-// file (symlinks/dirs excluded — none of these tests need them).
+// file (symlinks/dirs excluded, none of these tests need them).
 func snapshotTree(t *testing.T, root string) map[string][32]byte {
 	t.Helper()
 	out := map[string][32]byte{}
@@ -274,8 +274,8 @@ func treesEqual(a, b map[string][32]byte) bool {
 // file. It was raised from an original 5s (10s for the one test that
 // deliberately serializes 10 files through a 4-slot pull semaphore) after
 // two rounds of diagnosis on a flake that only ever showed up under
-// `go test ./...` for the whole repo — never in isolation, never with
-// `-race` on this package alone — because the whole-repo run puts every
+// `go test ./...` for the whole repo, never in isolation, never with
+// `-race` on this package alone, because the whole-repo run puts every
 // package's tests (including internal/transport's real network I/O) on CPU
 // at once:
 //
@@ -285,24 +285,24 @@ func treesEqual(a, b map[string][32]byte) bool {
 //     *merged, locally-bumped* version instead of the version the peer
 //     actually advertised, so the peer's freshness check (session.go's
 //     handleFileRequest) could never match. This wasted one full request/
-//     error round trip on *every* such resolution, unconditionally — not a
+//     error round trip on *every* such resolution, unconditionally, not a
 //     race, reproduced deterministically pre-fix. See Action.SourceVersion.
 //  2. A genuine test-harness synchronization gap (fixed via waitForFile):
 //     several tests wait only for a file's *content* to land, then
 //     immediately read or Bump that same node's *index row* for it
-//     (indexFile/indexDelete/a direct assertion) — but the row is written
+//     (indexFile/indexDelete/a direct assertion), but the row is written
 //     by a separate store.PutFile call strictly after the content lands
 //     (session.go's handleIndexUpdate), so under scheduling pressure the
 //     row can still lag behind what's already on disk. Reproduced under
 //     synthetic CPU load as both silent version-vector corruption
 //     (indexFile bumping on a stale/absent row) and hard "not found"
-//     failures — not merely as slow convergence.
+//     failures, not merely as slow convergence.
 //
 // With both fixed, dozens of `go test -race -count=1 ./...` repeats under
 // synthetic whole-machine CPU load (many more concurrent busy processes
 // than a real `go test ./...` run creates) still occasionally needed more
-// than 5s of *genuine* wall-clock convergence time — no crashes, no wrong
-// state, just scheduling delay — which is what this constant now budgets
+// than 5s of *genuine* wall-clock convergence time, no crashes, no wrong
+// state, just scheduling delay, which is what this constant now budgets
 // for. It's a deliberately generous, still-bounded ceiling (a real hang
 // fails a CI run in 20s, not silently); waitFor's polling loop itself
 // already reacts within 10ms of the real condition, so raising this number
@@ -331,19 +331,19 @@ func waitFor(t *testing.T, timeout time.Duration, cond func() bool) {
 //
 // A plain "is it on disk yet" check (what the bare waitFor calls elsewhere
 // in this file use) is enough on its own only when nothing afterward reads
-// that node's *store* — e.g. a final assertion at the end of a test. But
+// that node's *store*, e.g. a final assertion at the end of a test. But
 // several tests immediately follow such a wait with indexFile/indexDelete
 // on the very same store, to simulate the node's own next local edit; those
 // helpers (see putIndexRow) read the store's *current* row for the path
 // and Bump on top of it. The corresponding index row is written by a
-// separate call — session.go's handleIndexUpdate persists it via
+// separate call, session.go's handleIndexUpdate persists it via
 // store.PutFile only after applyAction (which does the actual rename) has
-// already returned — so under load the row can still lag behind what's
+// already returned, so under load the row can still lag behind what's
 // already readable on disk. A test that doesn't also wait for the row can
 // have indexFile silently Bump on top of a stale or absent row (mistaken
-// for "no prior version" — see putIndexRow's ErrNotFound handling) instead
+// for "no prior version", see putIndexRow's ErrNotFound handling) instead
 // of the version it just received, corrupting the version vector for the
-// rest of that test with no visible error at the call site itself — it
+// rest of that test with no visible error at the call site itself, it
 // only surfaces later as a mysteriously-unconverged waitFor, or as a
 // "not found" a few lines on. This showed up exactly that way under a
 // loaded machine (many packages' tests running in parallel): the two
@@ -427,7 +427,7 @@ func TestIntegration_EditPropagatesBothWays(t *testing.T) {
 
 	// Also wait for B's index row, not just the file content: B's next
 	// edit (below) reads and bumps B's own current row for this path, and
-	// that row is what B just received from A via the pull above — see
+	// that row is what B just received from A via the pull above, see
 	// waitForFile's doc comment for why the plain content-only wait isn't
 	// enough here.
 	waitForFile(t, integrationWaitTimeout, b.store, testShareID, b.root, "notes.txt", "version 2 from A")
@@ -610,7 +610,7 @@ func TestIntegration_ReadOnlyShareIsOneWay(t *testing.T) {
 }
 
 // 7. Hostile relpath ("../../etc/passwd") from a peer is rejected, and
-// nothing is written outside the share root — asserted on the filesystem.
+// nothing is written outside the share root, asserted on the filesystem.
 func TestIntegration_HostileRelPathRejected(t *testing.T) {
 	a := newTestNode(t, "aaaaaaaaaaaaaaaa")
 	b := newTestNode(t, "bbbbbbbbbbbbbbbb")
@@ -786,7 +786,7 @@ func TestIntegration_ReceiveOnlyRevertsLocalEditViaTrash(t *testing.T) {
 	indexFile(t, subscriber.store, subscriber.id, "notes.txt", subscriber.root)
 	mustSync(t, sSubscriber, testShareID) // no-op under receive-only; asserts nothing breaks calling it anyway
 
-	// The offerer's own copy now changes — this is the trigger SPEC.md §1
+	// The offerer's own copy now changes, this is the trigger SPEC.md §1
 	// promises the revert on. Sending it reaches the subscriber as a
 	// concurrent divergence (offerer's new version doesn't know about the
 	// subscriber's local bump, and vice versa).
@@ -855,8 +855,8 @@ func TestIntegration_RestorePropagatesAsNewChange(t *testing.T) {
 	// A.
 	waitForFile(t, integrationWaitTimeout, b.store, testShareID, b.root, "keepme.txt", "original content")
 
-	// B deletes the file and that delete propagates to A, which — being a
-	// remote-initiated delete — trashes A's copy first.
+	// B deletes the file and that delete propagates to A, which, being a
+	// remote-initiated delete, trashes A's copy first.
 	if err := os.Remove(filepath.Join(b.root, "keepme.txt")); err != nil {
 		t.Fatal(err)
 	}
@@ -894,7 +894,7 @@ func TestIntegration_RestorePropagatesAsNewChange(t *testing.T) {
 
 	// Propagate the restore, exactly as a real daemon's own
 	// change-detection (internal/index's watcher/scanner, not wired into this
-	// package's own tests — see indexFile's doc comment) would trigger a
+	// package's own tests, see indexFile's doc comment) would trigger a
 	// SyncShare after noticing the local change.
 	mustSync(t, sa, testShareID)
 
@@ -920,7 +920,7 @@ func TestIntegration_RestorePropagatesAsNewChange(t *testing.T) {
 // handleIndexUpdate was the only thing that reconciled, so "the peer sent us
 // rows" was the only trigger for noticing a file is missing. A pull that
 // fails leaves the peer's rows already recorded in peer_files and the file
-// still absent locally — and on reconnect the peer sends nothing, because its
+// still absent locally, and on reconnect the peer sends nothing, because its
 // index sync is incremental and its cursor says we already have those rows.
 // Nothing revisited it, so the file stayed missing indefinitely.
 //
@@ -928,7 +928,7 @@ func TestIntegration_RestorePropagatesAsNewChange(t *testing.T) {
 // because a previous session recorded it in peer_files, but has neither the
 // file nor a local index row, because apply is atomic and the interrupted
 // pull never got as far as installing anything. No index update is sent here
-// at all — that is the point, and it is what the reconnected peer would
+// at all, that is the point, and it is what the reconnected peer would
 // (not) send.
 func TestReconcileShareRecoversAfterAFailedPull(t *testing.T) {
 	ctx := context.Background()
@@ -972,13 +972,13 @@ func ignoreMatching(paths ...string) func(string, bool) bool {
 
 // TestIntegration_IgnoredFileIsNeitherSentNorRequested is the headline
 // bidirectional case: a file A ignores never reaches B, while a
-// non-ignored sibling does — the sibling being what stops this test from
+// non-ignored sibling does, the sibling being what stops this test from
 // passing trivially if sync were broken outright.
 func TestIntegration_IgnoredFileIsNeitherSentNorRequested(t *testing.T) {
 	a := newTestNode(t, "aaaaaaaaaaaaaaaa")
 	b := newTestNode(t, "bbbbbbbbbbbbbbbb")
 
-	// A has both files indexed — the ignore rule arrived after they were
+	// A has both files indexed, the ignore rule arrived after they were
 	// scanned, which is exactly when the wire-level filters have to work.
 	writeFile(t, a.root, "secret.log", "do not share")
 	indexFile(t, a.store, a.id, "secret.log", a.root)
@@ -1003,7 +1003,7 @@ func TestIntegration_IgnoredFileIsNeitherSentNorRequested(t *testing.T) {
 
 // TestIntegration_IgnoredRemoteFileIsNotPulled is the receive side, and
 // the flap loop: B ignores a path that A is legitimately sharing, so B
-// must never fetch it — not on the first sync, and not on a second one.
+// must never fetch it, not on the first sync, and not on a second one.
 func TestIntegration_IgnoredRemoteFileIsNotPulled(t *testing.T) {
 	a := newTestNode(t, "aaaaaaaaaaaaaaaa")
 	b := newTestNode(t, "bbbbbbbbbbbbbbbb")
@@ -1028,7 +1028,7 @@ func TestIntegration_IgnoredRemoteFileIsNotPulled(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(b.root, "build/out.o")); !os.IsNotExist(err) {
 		t.Errorf("ignored remote file was pulled to disk (stat err = %v)", err)
 	}
-	// A's copy must be untouched — the flap loop's final act was to
+	// A's copy must be untouched, the flap loop's final act was to
 	// propagate a tombstone back and delete it here.
 	if data, err := os.ReadFile(filepath.Join(a.root, "build/out.o")); err != nil || string(data) != "artifact" {
 		t.Errorf("the sharing node's own copy was disturbed: data=%q err=%v", data, err)

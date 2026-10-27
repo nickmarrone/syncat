@@ -108,7 +108,7 @@ func printUsage(w *os.File) {
 // before flags for several subcommands (`share add PATH --name N`,
 // `subscribe PEER SHARE LOCALPATH --mode M`, ...), but the stdlib flag
 // package's FlagSet.Parse only recognizes flags that appear before the
-// first positional argument — it stops at the first non-flag token and
+// first positional argument, it stops at the first non-flag token and
 // treats everything after it (flags included) as positional. Callers
 // pre-split with this helper, then hand only rest to fs.Parse.
 //

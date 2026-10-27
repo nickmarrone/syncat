@@ -14,7 +14,7 @@ import (
 // subscriber side reacts to the offerer's answer; and the announcement
 // helpers (re)send our share list and subscription requests. peer.go is
 // the per-connection state machine and mutations.go the config-mutation
-// API — both call into here.
+// API. Both call into here.
 
 // --- offerer side: a peer wants access to a share we offer ----------------
 
@@ -22,13 +22,13 @@ import (
 // synchronous half of handling a SubscribeRequest: it must run on the
 // session's read-loop goroutine (called directly from handleControl,
 // never from a spawned goroutine), because it establishes sess's local
-// share config — via sess.AddShare — before the read loop advances to
+// share config, via sess.AddShare, before the read loop advances to
 // read whatever frame the peer sends next. Once granted, this node itself
 // sends an IndexUpdate for this share moments later (finishSubscribeRequest,
 // via SetShareAccess -> Session.SyncShare) on the SAME connection, and if
 // the peer's own inbound traffic interleaves with that, Session's read
 // loop must already know about this share by the time it dispatches
-// anything referencing it — a race that showed up in practice as
+// anything referencing it, a race that showed up in practice as
 // Session logging "index update for unknown share" when the two halves of
 // this handling ran on independent, unordered goroutines.
 //
@@ -67,7 +67,7 @@ func (n *Node) provisionShareForRequest(pc *peerConn, sess *syncsvc.Session, sha
 // finishSubscribeRequest is the asynchronous remainder of handling a
 // SubscribeRequest: persisting the grant and notifying the peer
 // (SetShareAccess also re-applies the same sess.AddShare provisionShareForRequest
-// already did — a harmless idempotent overwrite — since SetShareAccess is
+// already did, a harmless idempotent overwrite, since SetShareAccess is
 // also the REST API's direct entry point and shouldn't have a
 // provision-already-done special case).
 func (n *Node) finishSubscribeRequest(pc *peerConn, share config.Share, access string) {
@@ -78,7 +78,7 @@ func (n *Node) finishSubscribeRequest(pc *peerConn, share config.Share, access s
 
 // --- subscriber side: the offerer answered our SubscribeRequest -----------
 
-// provisionAccessUpdate is AccessUpdate's synchronous half — see
+// provisionAccessUpdate is AccessUpdate's synchronous half, see
 // provisionShareForRequest's doc comment for why sess.AddShare must run
 // here, on the read-loop goroutine, rather than in a spawned goroutine:
 // the offerer sends its own IndexUpdate for this share immediately after
@@ -198,7 +198,7 @@ func (n *Node) broadcastShareList() {
 }
 
 // neuterShareOnSessions blocks a share on every currently-connected
-// session and stops counting it as active for propagation — see
+// session and stops counting it as active for propagation, see
 // peerConn.neuterShare for what that means and why it is safe.
 func (n *Node) neuterShareOnSessions(shareID string) {
 	for _, pc := range n.snapshotPeers() {

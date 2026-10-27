@@ -86,7 +86,7 @@ func mustNonce(t *testing.T) []byte {
 func acceptAll(ed25519.PublicKey) bool { return true }
 
 // runBothHandshakes runs Handshake concurrently on both ends of a
-// connected pair — concurrently matters here, not just for speed: each
+// connected pair, concurrently matters here, not just for speed: each
 // side's Handshake blocks reading the other's Hello, so running them
 // sequentially would have the first call time out waiting for a peer
 // that hasn't sent anything yet, masking whatever behavior the test
@@ -284,8 +284,8 @@ func TestHandshakeRejectsForgedSignature(t *testing.T) {
 
 // TestHandshakeRejectsReflectedSignature simulates a reflection attack:
 // an attacker with no private key of her own connects to Alice, claims
-// (in her Hello) to *be* Alice — pubkey and token are not secret, only
-// gating connection attempts (SPEC.md §2) — and then, instead of
+// (in her Hello) to *be* Alice, pubkey and token are not secret, only
+// gating connection attempts (SPEC.md §2), and then, instead of
 // producing a signature (which she cannot, lacking Alice's key), simply
 // echoes Alice's own just-received Auth signature straight back as if it
 // were her own.
@@ -685,7 +685,7 @@ func (c *deadlineRecorder) state() (current time.Time, sawArmed bool) {
 // Left armed, it silently poisoned the connection 30s in: every Read and
 // Write started failing with os.ErrDeadlineExceeded on a perfectly healthy
 // link, the session's read loop exited without logging anything, and the
-// peer was torn down by SPEC.md §4's 90s dead rule and redialed — forever,
+// peer was torn down by SPEC.md §4's 90s dead rule and redialed, forever,
 // at a steady ~90s period.
 //
 // Nothing caught it because the deadline is 30s out by default and no test

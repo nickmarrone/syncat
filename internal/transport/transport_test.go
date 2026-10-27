@@ -90,7 +90,7 @@ func TestBackoffJitterDisabledByNilRand(t *testing.T) {
 }
 
 // fakeClock is a Clock whose After always returns the same channel, fed
-// manually by the test — so Supervisor.Run's waits are driven by explicit
+// manually by the test, so Supervisor.Run's waits are driven by explicit
 // sends rather than real time passing.
 type fakeClock struct {
 	ch chan time.Time
@@ -147,7 +147,7 @@ func TestSupervisorRunRetriesAndStopsOnCancel(t *testing.T) {
 // TestSupervisorRunResetsFailuresAfterSuccess checks that a successful dial
 // resets the retry loop: after attempt 1 fails (one wait on the fake
 // clock) and attempt 2 succeeds, attempt 3 must run immediately with no
-// second wait — if the failure count weren't reset, Run would try to
+// second wait, if the failure count weren't reset, Run would try to
 // consume the fake clock's channel again first and this test would time
 // out waiting for `done`.
 func TestSupervisorRunResetsFailuresAfterSuccess(t *testing.T) {

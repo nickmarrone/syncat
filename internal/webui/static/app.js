@@ -1,24 +1,24 @@
-// syncat web UI — hand-written vanilla JS, no framework, no build step
+// syncat web UI. Hand-written vanilla JS, no framework, no build step
 // (SPEC.md §9). Hash-routed single page app that polls GET /api/status
-// every 2s (there is no SSE endpoint in this build — see the README/
+// every 2s (there is no SSE endpoint in this build, see the README/
 // SPEC.md §8 note about /api/events being deferred).
 //
-// XSS: every piece of data rendered here — peer names, share names, file
-// paths, error strings — can originate from another machine and is fully
+// XSS: every piece of data rendered here (peer names, share names, file
+// paths, error strings) can originate from another machine and is fully
 // attacker-controlled. This file never uses innerHTML/outerHTML with
 // interpolated data anywhere; the `el()` helper below builds the DOM with
 // document.createElement/textContent/Text nodes exclusively, and the only
 // place a raw string becomes an *attribute* value is through
 // Element.setAttribute with attribute names we choose ourselves (never
 // attacker data), which cannot execute script. Search this file for
-// "innerHTML" — it should not appear.
+// "innerHTML", it should not appear.
 
 'use strict';
 
 // --- tiny safe DOM builder ---------------------------------------------
 
 /** Build an element. attrs values are set via setAttribute/className/
- * addEventListener — never innerHTML. children may be strings (wrapped
+ * addEventListener, never innerHTML. children may be strings (wrapped
  * in a Text node, so never parsed as HTML), Nodes, or nested arrays. */
 function el(tag, attrs, children) {
   const node = document.createElement(tag);
@@ -67,7 +67,7 @@ const trashState = { shareId: null, entries: [], error: null };
 
 // Purely presentational state: which disclosures are open. It lives
 // outside `state` because nothing here comes from (or goes back to) the
-// daemon — it only has to survive the 2s poll re-render, which rebuilds
+// daemon, it only has to survive the 2s poll re-render, which rebuilds
 // the whole view from scratch.
 const ui = {
   tokenExpanded: false,
@@ -337,7 +337,7 @@ function renderNodeCard(status) {
   return card;
 }
 
-// The node token is ~90 chars of base32 — long enough that showing it in
+// The node token is ~90 chars of base32, long enough that showing it in
 // full used to give the card its own horizontal scrollbar. Collapsed, we
 // show the head of it and an ellipsis; expanded, it wraps over as many
 // lines as it needs. Either way Copy copies the whole thing.
@@ -425,7 +425,7 @@ function renderAddPeerForm() {
 }
 
 /** The shares this peer offers us, and the shares of ours they hold
- * access to — the two sides of the relationship, gathered once so the
+ * access to. These are the two sides of the relationship, gathered once so the
  * collapsed row can count them and the expanded body can list them. */
 function peerRelations(peer, status) {
   const offered = (status.remote_shares || []).filter((rs) => rs.peer_key === peer.peer_key);
@@ -493,8 +493,8 @@ function renderPeerRow(peer, status) {
 }
 
 /** The expanded half of a peer row: everything that would be noise in a
- * list — the full key, connection history, both share directions, and
- * the destructive Remove, kept at the bottom where it can't be hit by
+ * list: the full key, connection history, both share directions, and
+ * the destructive Remove, which sits at the bottom where it can't be hit by
  * accident. */
 function renderPeerDetail(peer, rel) {
   const body = el('div', { class: 'peer-detail' });
@@ -913,7 +913,7 @@ function updateNavHighlight() {
 
 // The version comes from the daemon's own /api/status, not from anything
 // baked into these assets, so what the header shows is the build actually
-// serving the page — which is the point of showing it at all.
+// serving the page, which is the point of showing it at all.
 function updateVersion() {
   const slot = document.getElementById('version');
   if (!slot) return;

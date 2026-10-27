@@ -5,7 +5,7 @@
 # the restart are *not* resumed ... a file that was half-transferred starts
 # over from byte 0 on reconnect." Resume is specified (SPEC.md §4's
 # FileRequest carries an offset) but not implemented, so what this pins down
-# is that the *recovery* works — the interrupted transfer is retried and
+# is that the *recovery* works, the interrupted transfer is retried and
 # completes, and the half-written file never appears as if it were whole.
 #
 # That last part is the one worth guarding. Apply is atomic: content lands in
@@ -45,7 +45,7 @@ log "Waiting for the transfer to be genuinely under way"
 #
 # Busy-polled, and deliberately not waiting for any particular size. When the
 # two nodes find a direct path rather than a relay, hundreds of megabytes
-# cross in a couple of seconds — a once-a-second poll misses the window
+# cross in a couple of seconds, a once-a-second poll misses the window
 # outright and then times out waiting for a transfer that has already
 # finished, which is a bug in the test and looks exactly like a bug in the
 # product.

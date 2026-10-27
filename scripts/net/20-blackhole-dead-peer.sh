@@ -6,7 +6,7 @@
 # a peer that closes: there is no EOF, no reset, nothing for the read loop to
 # notice. It is what a pulled cable, a suspended laptop, and a black-holing
 # relay all look like from the other end, and the only thing that recovers
-# from it is SPEC.md §4's rule — 90s without received traffic means the
+# from it is SPEC.md §4's rule, 90s without received traffic means the
 # connection is dead. That rule is the reason the keepalive exists, and until
 # now nothing exercised it end to end: internal/protocol tests the timer on a
 # fake clock, and no test had ever let 90 real seconds pass.

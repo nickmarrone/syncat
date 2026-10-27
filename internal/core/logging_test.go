@@ -102,7 +102,7 @@ func TestDialFailureRedactsAddressAndSanitizesStatusAndLogs(t *testing.T) {
 // TestConnectionLifecycleIsLogged is the gap this logging exists to close.
 // Every other line in peer.go is an error path, so a node whose peer flaps
 // every thirty seconds and one that has been stably connected for a week
-// produced near-identical logs — the flapping one simply had less in it.
+// produced near-identical logs, the flapping one simply had less in it.
 // Connect and disconnect must each say so, and the disconnect must carry
 // how long the connection lasted, since that is the only thing that
 // distinguishes a flap from an orderly shutdown.

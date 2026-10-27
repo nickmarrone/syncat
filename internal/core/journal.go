@@ -1,4 +1,4 @@
-// journal.go holds the retention sweep for index.Store's change journal —
+// journal.go holds the retention sweep for index.Store's change journal,
 // the append-only log of file changes that internal/sync replays to bring
 // a reconnecting peer up to date without re-sending the whole share index.
 // The journal is the one table in the database with no natural ceiling:
@@ -14,9 +14,9 @@ import (
 //
 // The window trades disk and query cost against how long a peer can be
 // away and still get an incremental resync. A peer whose cursor predates
-// the oldest surviving entry is not stranded — internal/sync's
+// the oldest surviving entry is not stranded, internal/sync's
 // canAnswerWithDeltas notices and answers with a full snapshot instead,
-// which re-anchors it — so the only cost of pruning too eagerly is one
+// which re-anchors it, so the only cost of pruning too eagerly is one
 // snapshot for a peer that has been offline longer than this. A week is
 // comfortably longer than the outages incremental sync exists to
 // smooth over (a reboot, a laptop lid, a flaky link) and short enough

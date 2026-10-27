@@ -3,7 +3,7 @@
 # it: SIGTERM, a clean protocol shutdown, then start again.
 #
 # Two things are being pinned. First, that the surviving node notices
-# *promptly* — a clean shutdown ends the peer's read loop, so detection must
+# *promptly*, a clean shutdown ends the peer's read loop, so detection must
 # not wait out SPEC.md §4's 90s dead timer, which is the backstop for silence
 # and not the mechanism for a hangup. Second, that recovery is automatic:
 # the restarted node reconnects and sync resumes in both directions with

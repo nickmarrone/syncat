@@ -10,8 +10,8 @@ import (
 )
 
 // Version is this build's release version, and the one place the number
-// lives. Everything that reports a version — `syncat version`, GET
-// /api/status's "version" field, the web UI's footer — reads it from here.
+// lives. Everything that reports a version, `syncat version`, GET
+// /api/status's "version" field, the web UI's footer, reads it from here.
 //
 // It is deliberately not a protocol or format version. syncat already has
 // three of those, each independent of this one and of each other:
@@ -27,8 +27,8 @@ const Version = "0.4.0"
 // The commit comes from the Go toolchain, which stamps it into the binary
 // automatically when building from a git checkout, so there is nothing to
 // pass at build time and no linker flags to keep in sync. It is genuinely
-// absent from some builds, though — `go run`, `go test`, and
-// `-buildvcs=false` all produce binaries with no VCS stamp — so a bare
+// absent from some builds, though, `go run`, `go test`, and
+// `-buildvcs=false` all produce binaries with no VCS stamp, so a bare
 // release version is a normal result here, not a failure to report.
 var String = sync.OnceValue(func() string {
 	info, ok := debug.ReadBuildInfo()

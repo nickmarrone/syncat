@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # The ugly restart: SIGKILL. No graceful shutdown, no protocol close, no
-# TCP drain — the peer is left holding a connection to a process that no
+# TCP drain, the peer is left holding a connection to a process that no
 # longer exists.
 #
 # The interesting half is what happens on the *survivor*. If it is still
-# holding that corpse when the restarted node dials back in, the inbound
+# holding that dead connection when the restarted node dials back in, the inbound
 # connection is authenticated but rejected by the dedup rule, and it is
-# notePeerRedialed that has to read that for what it is — a peer only dials
+# notePeerRedialed that has to read that for what it is, a peer only dials
 # when it holds no session, so if it has none while we think we have one,
-# ours is dead — and tear the corpse down. Without that inference the
+# ours is dead, and tear the dead connection down. Without that inference the
 # survivor waits out the full 90s dead timer instead, and which node pays
 # that wait depends on nothing but how the two keys happened to compare.
 
@@ -37,7 +37,7 @@ node_start bob
 
 # The recovery must not need the dead timer. staleInboundGrace gives a freshly
 # adopted connection 15s of immunity, and a redial has to get through DERP
-# first, so allow for that — but stay well under DEAD_PEER_SECONDS, because
+# first, so allow for that, but stay well under DEAD_PEER_SECONDS, because
 # waiting that out is precisely the failure this covers.
 wait_for "$CONNECT_TIMEOUT" "bob to reconnect after the hard kill" peer_connected bob alice
 wait_for "$DEAD_PEER_SECONDS" "alice to converge on the new connection without waiting out the dead timer" \

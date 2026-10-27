@@ -33,7 +33,7 @@ import (
 // <datadir>/db/index.db (SPEC.md §3, §5). It holds this node's own view of
 // each share's files (the `files` table), the latest IndexUpdate mirrored
 // from each peer (`peer_files`), and resumable-transfer bookkeeping
-// (`pending_transfers`, schema only — nothing writes it yet; see
+// (`pending_transfers`, schema only, nothing writes it yet; see
 // migrateV1).
 //
 // Concurrency model: a single *sql.DB in WAL mode (see openPragmas), shared
@@ -55,7 +55,7 @@ type Store struct {
 
 // currentSchemaVersion is bumped whenever migrations is extended. Stored
 // in SQLite's own PRAGMA user_version (an integer baked into the database
-// file header) rather than a table we'd have to query separately — it's
+// file header) rather than a table we'd have to query separately. It's
 // exactly what PRAGMA user_version exists for, and it's readable/writable
 // in the same connection setup step as the other pragmas below.
 const currentSchemaVersion = 3
@@ -114,7 +114,7 @@ func migrateV2(ctx context.Context, tx *sql.Tx) error {
 			version_json TEXT NOT NULL,
 			deleted INTEGER NOT NULL,
 			PRIMARY KEY(peer_key,share_id,snapshot_id,relpath))`,
-		// dirty_paths is dropped again by migrateV3 — it is kept here so
+		// dirty_paths is dropped again by migrateV3. It is kept here so
 		// this step still describes what a v2 database looked like.
 		`CREATE TABLE dirty_paths (
 			peer_key TEXT NOT NULL,
@@ -134,7 +134,7 @@ func migrateV2(ctx context.Context, tx *sql.Tx) error {
 
 // Open opens (creating if necessary) the SQLite database at path and
 // migrates it to currentSchemaVersion. It is safe to call repeatedly
-// against the same path (e.g. across daemon restarts) — migration is
+// against the same path (e.g. across daemon restarts). Migration is
 // idempotent and a no-op once the schema is current.
 func Open(ctx context.Context, path string) (*Store, error) {
 	// modernc.org/sqlite accepts the same DSN query-parameter pragmas as
@@ -144,7 +144,7 @@ func Open(ctx context.Context, path string) (*Store, error) {
 	// here) so a writer that does briefly block waits up to 5s instead of
 	// failing immediately. _pragma=foreign_keys(1) turns on FK
 	// enforcement; this schema doesn't declare any FKs yet (share_id is
-	// just a string, not a reference to a shares table — shares live in
+	// just a string, not a reference to a shares table. Shares live in
 	// config.toml, not this database), but it's set from the start so
 	// enforcement is never silently off for whichever later migration
 	// adds one (e.g. pending_transfers referencing files).
@@ -229,7 +229,7 @@ func (s *Store) migrate(ctx context.Context) error {
 // ApplyPeerDelta wrote it, nothing ever read it, and nothing ever deleted
 // from it. Reconciliation instead re-walks a share in full each pass
 // (internal/sync.Session.reconcileLocked over ListShare + ListPeerFiles),
-// so there was no reader to wire up — only an unbounded table, one row per
+// so there was no reader to wire up, only an unbounded table, one row per
 // path per share, growing on every snapshot commit and delta.
 //
 // Unlike pending_transfers (migrateV1), which is inert schema reserved for
@@ -319,8 +319,8 @@ func (s *Store) Close() error {
 // deleted, updated_at). Callers that need the wire shape use [FileRow.Info];
 // callers building a row from a wire message use [FileRowFromInfo].
 //
-// Keeping this as an explicit, richer type — rather than reusing
-// protocol.FileInfo directly as the row shape — means a schema change here
+// Keeping this as an explicit, richer type, rather than reusing
+// protocol.FileInfo directly as the row shape, means a schema change here
 // (e.g. adding a local-only column) never risks leaking onto the wire, and
 // vice versa; the conversion between the two is small and tested (see
 // store_test.go).
@@ -337,7 +337,7 @@ type FileRow struct {
 	UpdatedAt time.Time
 
 	// Ignored marks a "parked" row: the path matches an ignore rule, so
-	// it is excluded from syncing entirely — not listed, not served, never
+	// it is excluded from syncing entirely: not listed, not served, never
 	// on the wire. The row is kept rather than deleted solely to preserve
 	// Version, so that if the rule is later removed the file resurrects
 	// with a vector that still dominates the peer's copy instead of
@@ -542,11 +542,11 @@ func (s *Store) ListShareMap(ctx context.Context, shareID string) (map[string]Fi
 // what the scanner reported), and every newly-ignored row is parked
 // (ignored=1). Applying is a separate, explicit step from scanning (see
 // scanner.go's doc comment) so a caller can inspect or filter a ScanResult
-// — e.g. skip files ignored mid-flight, or hand it to internal/sync's
-// reconciler first — before it becomes durable.
+// (for example, skip files ignored mid-flight, or hand it to internal/sync's
+// reconciler first) before it becomes durable.
 //
 // The Ignored bucket is the one place in this package where a row changes
-// WITHOUT a change_journal entry, and that asymmetry is deliberate — see
+// WITHOUT a change_journal entry, and that asymmetry is deliberate. See
 // the comment at the park itself.
 func (s *Store) ApplyScanResult(ctx context.Context, result *ScanResult) error {
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -569,7 +569,7 @@ func (s *Store) ApplyScanResult(ctx context.Context, result *ScanResult) error {
 		}
 	}
 
-	// Newly-ignored rows are PARKED, not tombstoned — and deliberately not
+	// Newly-ignored rows are PARKED, not tombstoned, and deliberately not
 	// journalled. Everything else here goes through putFileAndJournal,
 	// which appends to change_journal and bumps share_state.next_seq so
 	// that peers learn about the change; this is the one write that must
@@ -577,7 +577,7 @@ func (s *Store) ApplyScanResult(ctx context.Context, result *ScanResult) error {
 	// A journalled tombstone would reach every peer as a delete and move
 	// their copies to the trash. Peers simply stop seeing the path in our
 	// index and keep what they already have (they take no action for a
-	// path they hold that we do not advertise — see internal/sync's
+	// path they hold that we do not advertise; see internal/sync's
 	// reconcileOne, "local-only, peer will pull from us").
 	//
 	// Parking sets ignored = 1 rather than deleting the row, which hides

@@ -7,25 +7,25 @@ import (
 	"github.com/nickmarrone/syncat/internal/protocol"
 )
 
-// This file defines the read-only status snapshot Node.Status returns —
+// This file defines the read-only status snapshot Node.Status returns,
 // the contract internal/api's handlers (GET /api/status, /api/peers,
 // /api/shares, /api/remote-shares, /api/subscriptions) marshal to JSON and
 // the web UI renders. Every type here is a plain struct of exported,
 // JSON-friendly fields (strings, numbers, bools, times, slices, maps of
 // string to plain struct), deliberately with no encoding/json or HTTP
-// import anywhere in this package (SPEC.md §12) — internal/api owns
+// import anywhere in this package (SPEC.md §12). internal/api owns
 // marshaling. (ConnState, which PeerStatus.State carries, lives with the
 // connection state machine in peer.go.)
 
 // PeerStatus is one configured peer's connection state, for GET
 // /api/peers and the dashboard's peer cards.
 type PeerStatus struct {
-	// PeerKey is the peer's full Ed25519 public key, hex-encoded — the
+	// PeerKey is the peer's full Ed25519 public key, hex-encoded, the
 	// stable identifier Node's mutation API (RemovePeer, share Access
 	// grants, Subscription.Peer) uses throughout, since a Peer's Name is
 	// just a display label and its Token can in principle be re-pasted.
 	PeerKey string
-	// ShortID is the first 8 bytes of PeerKey, hex-encoded — matches
+	// ShortID is the first 8 bytes of PeerKey, hex-encoded and matches
 	// config.IdentityKey.ShortID and the version-vector node id this peer
 	// appears under in synced files' version vectors.
 	ShortID string
@@ -72,7 +72,7 @@ type ShareStatus struct {
 }
 
 // RemoteShareStatus is one share a peer offers us, for GET
-// /api/remote-shares — built from the ShareList messages peers have sent.
+// /api/remote-shares, built from the ShareList messages peers have sent.
 type RemoteShareStatus struct {
 	PeerKey          string
 	PeerName         string
@@ -86,8 +86,8 @@ type RemoteShareStatus struct {
 }
 
 // WarningStatus is one recorded anomaly for a subscription: a receive-only
-// "locally modified" warning (SPEC.md §1/§5) or — future work, see the
-// package doc comment on Node.Status — a genuine conflict-copy event.
+// "locally modified" warning (SPEC.md §1/§5) or (future work, see the
+// package doc comment on Node.Status) a genuine conflict-copy event.
 // Currently sourced entirely from sync.Session.LocallyModifiedWarnings.
 type WarningStatus struct {
 	ShareID  string
@@ -131,7 +131,7 @@ type RejectedConnection struct {
 // every peer's connection state, our shares and who has access to them,
 // what peers offer us, our subscriptions and their sync state, and recent
 // warnings. Every field is plain, JSON-friendly data (SPEC.md §12: no
-// encoding/json import here) — internal/api marshals this directly for
+// encoding/json import here). internal/api marshals this directly for
 // GET /api/status and friends.
 type Status struct {
 	NodeName  string
@@ -153,7 +153,7 @@ type Status struct {
 
 // Status builds a read-only snapshot of the entire node (see status.go's
 // doc comment for the contract). It's safe to call at any time, including
-// concurrently with the peer manager's own activity — every field is
+// concurrently with the peer manager's own activity. Every field is
 // copied out from under its owning lock before being assembled.
 func (n *Node) Status() Status {
 	n.cfgMu.RLock()
@@ -285,7 +285,7 @@ func (pc *peerConn) remoteShareStatuses() []RemoteShareStatus {
 // offerer, whether the share is actively syncing on the live session, its
 // display name (from the offerer's ShareList, if seen), and any recorded
 // receive-only "locally modified" warnings for it (sourced from
-// syncsvc.Session.LocallyModifiedWarnings — see status.go's WarningStatus
+// syncsvc.Session.LocallyModifiedWarnings. See status.go's WarningStatus
 // doc comment for what isn't covered yet).
 func (pc *peerConn) subscriptionState(shareID string) (access string, connected bool, warnings []WarningStatus, shareName string) {
 	pc.mu.Lock()

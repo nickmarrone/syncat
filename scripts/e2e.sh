@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# scripts/e2e.sh — the canonical end-to-end check (SPEC.md §14): two real
+# scripts/e2e.sh is the canonical end-to-end check (SPEC.md §14): two real
 # syncat daemons, on separate config/data dirs and API ports, talking to each
 # other over real tailcat (DERP-relayed unless direct connectivity is
-# available). Exercises the product the way a user would — init, exchange
-# tokens, peer, share, subscribe — and then verifies bidirectional sync,
-# delete/trash, and conflict resolution actually happen on disk.
+# available). It exercises the product the way a user would: init, exchange
+# tokens, peer, share, subscribe. It then verifies that bidirectional sync,
+# delete/trash, and conflict resolution happen on disk.
 #
 # Usage: scripts/e2e.sh
 #
-# This is the happy path. The networking *failure* scenarios — link loss,
-# hard kills, divergence, fan-out — live in scripts/net/ and run via
+# This is the happy path. The networking *failure* scenarios (link loss,
+# hard kills, divergence, fan-out) live in scripts/net/ and run via
 # scripts/run-net-tests.sh. Both are built on scripts/lib/harness.sh.
 #
 # Runnable from any directory. Cleans and reuses a fixed temp dir on every
@@ -63,7 +63,7 @@ wait_for "$SYNC_TIMEOUT" "conflict.txt to replicate to bob before going offline"
 log "Stopping BOTH daemons to force an offline conflict"
 # Both, not just bob. A conflict only exists if both sides have *indexed*
 # their own edit before they talk again, and a node that is left running
-# indexes through its watcher's 1s debounce — which races the other node
+# indexes through its watcher's 1s debounce, which races the other node
 # restarting and reconnecting, a race it loses often enough to matter. When
 # it loses, the incoming version simply dominates: the local edit is
 # overwritten (into the trash, so it is recoverable, but out of the working
@@ -82,7 +82,7 @@ log "Editing the same file differently on both sides while both are offline"
 echo "alice offline edit" >"$ALICE_SHARE/conflict.txt"
 echo "bob offline edit" >"$BOB_SYNCDIR/conflict.txt"
 # A file only alice has, used below as proof that the index exchange after
-# the restart actually ran — so "no conflict copy" can never be confused
+# the restart actually ran, so "no conflict copy" can never be confused
 # with "the two nodes never talked".
 echo "tracer" >"$ALICE_SHARE/tracer.txt"
 
@@ -99,7 +99,7 @@ log "Waiting for both sides to converge with a .sync-conflict- copy (SPEC.md §5
 # without received traffic, so a reconnect that lands on a connection which
 # looks handshaked but is still draining the old, now-dead session on the
 # other side can legitimately take a bit over 90s to recover before a fresh
-# dial even starts — on top of DERP setup and the sync itself.
+# dial even starts, on top of DERP setup and the sync itself.
 wait_for 240 "a conflict copy to appear on alice" conflict_copy_present "$ALICE_SHARE"
 wait_for 240 "a conflict copy to appear on bob" conflict_copy_present "$BOB_SYNCDIR"
 wait_for 90 "conflict.txt content to converge between alice and bob" \

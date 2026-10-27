@@ -1,5 +1,5 @@
 // keepalive.go: the Ping/Pong idle and dead-connection timer (SPEC.md §4).
-// Pure timing state with no I/O of its own — the session owning the
+// Pure timing state with no I/O of its own, the session owning the
 // connection records sends/receives and drives [Keepalive.Run].
 
 package protocol
@@ -24,7 +24,7 @@ const (
 	// purpose: the poll interval is the granularity of both decisions, so
 	// checking only once per ping interval meant SPEC.md §4's 90s dead rule
 	// actually fired somewhere between 90s and 120s. Ping timing is
-	// unaffected — NeedsPing is a comparison against lastSent, not a
+	// unaffected, NeedsPing is a comparison against lastSent, not a
 	// countdown, so a faster poll finds the same instant, just sooner after
 	// it passes.
 	DefaultKeepaliveCheckInterval = 5 * time.Second
@@ -95,7 +95,7 @@ func NewKeepalive(clock Clock, pingInterval, deadAfter time.Duration) *Keepalive
 	}
 }
 
-// RecordSent notes that a frame (of any type — a Ping counts, and so does
+// RecordSent notes that a frame (of any type, a Ping counts, and so does
 // any other outbound message) was just sent, resetting the ping-idle
 // timer.
 func (k *Keepalive) RecordSent() {
@@ -104,7 +104,7 @@ func (k *Keepalive) RecordSent() {
 	k.mu.Unlock()
 }
 
-// RecordReceived notes that a frame (of any type — a Pong counts, and so
+// RecordReceived notes that a frame (of any type, a Pong counts, and so
 // does any other inbound message) was just received, resetting the
 // dead-connection timer.
 func (k *Keepalive) RecordReceived() {
@@ -132,7 +132,7 @@ func (k *Keepalive) Dead() bool {
 // Run polls NeedsPing and Dead every checkInterval
 // (DefaultKeepaliveCheckInterval if checkInterval <= 0) until ctx is done,
 // calling onPing each time a ping becomes due and onDead (once) the moment
-// the connection is judged dead, at which point Run returns — the caller
+// the connection is judged dead, at which point Run returns, the caller
 // is expected to tear down and reconnect (SPEC.md §4), not keep polling a
 // connection already declared dead. onPing and onDead may be nil.
 //

@@ -104,8 +104,8 @@ func saveIdentityKey(path string, key *IdentityKey) error {
 // The migration belongs here, at the one point where the key enters the
 // program, rather than in LoadOrCreateTailcatKey: `syncat token` reads the
 // key directly and never goes near the create path, so putting it there
-// left `syncat token` printing a legacy address — silently, and looking
-// perfectly normal — on any node whose daemon had not been restarted since
+// left `syncat token` printing a legacy address, silently, and looking
+// perfectly normal, on any node whose daemon had not been restarted since
 // the upgrade. A peer handed that token can never connect.
 func LoadTailcatKey(path string) (*tailcat.PrivateKey, error) {
 	data, err := os.ReadFile(path)
@@ -195,7 +195,7 @@ func saveTailcatKey(path string, key *tailcat.PrivateKey) error {
 //     a separate disco key").
 //
 //   - PresharedKey (tailcat v0.6.0) is *new randomness*, so it cannot be
-//     recovered — only minted. Leaving it zero is not an option: tailcat
+//     recovered, only minted. Leaving it zero is not an option: tailcat
 //     generates a throwaway one at every Server.Start, so the daemon would
 //     advertise a different address on each run and never match what
 //     `syncat token` prints. Minting one here and persisting it pins the

@@ -152,7 +152,7 @@ func peerToken(t *testing.T, n *Node) string {
 // fakeClock is a manually-driven Clock for the backoff test: nothing here
 // ever sleeps on a wall clock. This mirrors internal/protocol's and
 // internal/index's own fakeClock test helpers exactly (each package
-// defines its own rather than sharing one — see protocol.Clock's doc
+// defines its own rather than sharing one. See protocol.Clock's doc
 // comment for why); core needs the same pattern for the same reason.
 //
 // A single Options.Clock drives every timer Node starts (see core.Clock's
@@ -168,7 +168,7 @@ type fakeClock struct {
 	waiters []fakeWaiter
 	notify  chan struct{}
 
-	// delays records every duration passed to After, in call order — the
+	// delays records every duration passed to After, in call order, the
 	// backoff test asserts this sequence grows (SPEC.md §2.2).
 	delays []time.Duration
 }
@@ -180,7 +180,7 @@ type fakeWaiter struct {
 }
 
 // isBackoffDelay reports whether d could plausibly be one of
-// transport.Backoff's own delays (capped at 5 minutes — SPEC.md §2.2),
+// transport.Backoff's own delays (capped at 5 minutes, SPEC.md §2.2),
 // as opposed to some other subsystem's much coarser timer sharing the
 // same fake clock (e.g. the trash janitor's 24h sweep interval).
 func isBackoffDelay(d time.Duration) bool { return d < time.Hour }
@@ -237,7 +237,7 @@ func (c *fakeClock) Advance(d time.Duration) {
 }
 
 // waitForWaiterMatching blocks until at least one goroutine is parked on
-// clock.After with a duration matching pred, or timeout elapses — the
+// clock.After with a duration matching pred, or timeout elapses, the
 // event-driven synchronization primitive that keeps the backoff test
 // deterministic instead of racing a blind sleep against Supervisor.Run's
 // next iteration.
@@ -290,7 +290,7 @@ func (c *fakeClock) snapshotDelays(pred func(time.Duration) bool) []time.Duratio
 // subscribe time (initial full sync), a file added afterward on the
 // offerer (propagated via RescanShare, standing in for the real
 // fsnotify/periodic trigger already covered by internal/index's own
-// tests), and — since the subscription is a mirror — a file added on the
+// tests), and, since the subscription is a mirror, a file added on the
 // subscriber's side all converge, driven entirely through the core layer
 // (Node.AddShare/AddPeer/AddSubscription/RescanShare), never by calling
 // internal/sync.Session directly.
@@ -560,8 +560,8 @@ func TestUnknownPeerQueuedAndApproved(t *testing.T) {
 
 // TestBackoffRetryAndRecover drives a peer that's initially unreachable
 // (its token's transport address has no listener) through several failed
-// dial attempts on a fake clock — asserting the requested delay grows
-// each time, with no real sleeping — then brings the peer online and
+// dial attempts on a fake clock, asserting the requested delay grows
+// each time, with no real sleeping, then brings the peer online and
 // confirms the connection recovers.
 func TestBackoffRetryAndRecover(t *testing.T) {
 	dir := t.TempDir()
@@ -622,7 +622,7 @@ func TestBackoffRetryAndRecover(t *testing.T) {
 	// First attempt happens immediately (no delay before the very first
 	// dial): wait for it to fail and for Supervisor to register its first
 	// backoff wait (isBackoffDelay excludes the trash janitor's own,
-	// much coarser, wait on this same shared clock — see fakeClock's doc
+	// much coarser, wait on this same shared clock. See fakeClock's doc
 	// comment).
 	if !clock.waitForWaiterMatching(isBackoffDelay, 5*time.Second) {
 		t.Fatalf("timed out waiting for the first backoff wait")
@@ -765,7 +765,7 @@ func TestConfigMutationLive(t *testing.T) {
 // TestLifecycleNoGoroutineLeak starts a node with an active share watcher
 // and a peer that's actively (and, in this test, perpetually)
 // dial-retrying, then closes it, and confirms goroutine count settles
-// back to (approximately) where it started — Close leaves nothing
+// back to (approximately) where it started, Close leaves nothing
 // running.
 func TestLifecycleNoGoroutineLeak(t *testing.T) {
 	runtime.GC()
@@ -842,9 +842,9 @@ func TestLifecycleNoGoroutineLeak(t *testing.T) {
 // the peering flow is symmetric ("run `syncat token` on each node, paste
 // each into the other"), so pasting a node's own token back into itself is
 // easy to do and used to be accepted silently. The resulting peer could
-// never connect — the node dialed its own tailcat server, handshook with
+// never connect, the node dialed its own tailcat server, handshook with
 // itself, and then lost dedup forever because KeepConnection compared its
-// key against itself — while reporting only "connecting", with no error.
+// key against itself, while reporting only "connecting", with no error.
 func TestAddPeerRejectsOwnToken(t *testing.T) {
 	n := newTestNode(t, "solo")
 
@@ -863,7 +863,7 @@ func TestAddPeerRejectsOwnToken(t *testing.T) {
 }
 
 // TestOpenDoesNotDialOwnToken covers the same misconfiguration arriving
-// from disk rather than through AddPeer — a config.json written before that
+// from disk rather than through AddPeer, a config.json written before that
 // check existed, or edited by hand. The peer must stay listed (it is still
 // in config.json, and hiding it would make it unremovable through the UI)
 // but must never be dialed, and must say why.
@@ -925,7 +925,7 @@ func TestOpenDoesNotDialOwnToken(t *testing.T) {
 
 // TestRemovePeerDropsSubscriptions confirms that removing a peer also
 // removes every subscription to that peer's shares. A subscription names
-// its offering peer, so one left behind could never sync again — it would
+// its offering peer, so one left behind could never sync again, it would
 // just sit in `syncat status` forever with a watcher still running. The
 // local copy of the files must survive, matching RemoveSubscription:
 // removal unsubscribes, it does not delete the user's data.
@@ -963,7 +963,7 @@ func TestRemovePeerDropsSubscriptions(t *testing.T) {
 	// A second subscription, to a share offered by a *different* peer,
 	// must be left completely alone. The other peer has to be genuinely
 	// configured (rather than a made-up key) because AddSubscription now
-	// rejects a peer it doesn't have — see TestAddSubscriptionRejectsUnknownPeer.
+	// rejects a peer it doesn't have. See TestAddSubscriptionRejectsUnknownPeer.
 	nodeC := newTestNode(t, "nodeC")
 	if _, err := nodeB.AddPeer("nodeC", peerToken(t, nodeC)); err != nil {
 		t.Fatalf("nodeB AddPeer nodeC: %v", err)
@@ -1006,15 +1006,15 @@ func TestRemovePeerDropsSubscriptions(t *testing.T) {
 // TestDedupLossIsReported covers the second silent failure mode from the
 // same investigation: a peer whose dial authenticates but always loses
 // SPEC.md §2.4's dedup rule, with the peer's own (winning) dial never
-// arriving. Losing dedup is deliberately not an error — Supervisor retries
-// with no backoff — so this used to look exactly like a peer that was
+// arriving. Losing dedup is deliberately not an error, Supervisor retries
+// with no backoff, so this used to look exactly like a peer that was
 // simply offline: state "connecting", LastError empty, nothing logged.
 //
 // The setup pins the outcome without depending on timing: `low` (the
 // lower-keyed node, so its own dial always loses) is given `high`'s real
 // address, while `high` is given `low`'s identity paired with a dead
-// address. So `high` accepts and authenticates `low`'s dial — then drops
-// it per dedup — but can never dial back.
+// address. So `high` accepts and authenticates `low`'s dial, then drops
+// it per dedup, but can never dial back.
 func TestDedupLossIsReported(t *testing.T) {
 	dir := t.TempDir()
 	logs := &lockedBuffer{}
@@ -1082,7 +1082,7 @@ func TestDedupLossIsReported(t *testing.T) {
 	}
 
 	// Drive the clock until the losses pile up. Advancing also fires
-	// high's own backoff waits, which is fine — those dials fail and
+	// high's own backoff waits, which is fine, those dials fail and
 	// change nothing here.
 	deadline := time.Now().Add(15 * time.Second)
 	for {
@@ -1140,7 +1140,7 @@ func (b *lockedBuffer) String() string {
 // keyed by raw public key and buildShareList reads it without checking that
 // the key still belongs to a configured peer, so a leftover "granted" would
 // silently restore that peer's access to every share the moment the same
-// key was re-added — no approval, nothing surfaced. Other peers' grants on
+// key was re-added, no approval, nothing surfaced. Other peers' grants on
 // the same share must survive.
 func TestRemovePeerRevokesShareAccess(t *testing.T) {
 	nodeA := newTestNode(t, "nodeA")
@@ -1192,7 +1192,7 @@ func TestRemovePeerRevokesShareAccess(t *testing.T) {
 		t.Errorf("unrelated peer's access = %q (present=%v), want it untouched at %q", got, ok, protocol.AccessGranted)
 	}
 
-	// The grant must not come back if the same key is re-added — the whole
+	// The grant must not come back if the same key is re-added, the whole
 	// point of clearing it.
 	if _, err := nodeA.AddPeer("nodeB-again", peerToken(t, nodeB)); err != nil {
 		t.Fatalf("re-AddPeer: %v", err)
@@ -1205,7 +1205,7 @@ func TestRemovePeerRevokesShareAccess(t *testing.T) {
 // TestAddSubscriptionRejectsUnknownPeer covers the failure that motivated
 // resolve.go's ref resolvers. The subscribe command used to take only a hex
 // peer key while reading as though it took a display name, so "subscribe
-// nishinomiya test ./test/" is the natural thing to type — and it was
+// nishinomiya test ./test/" is the natural thing to type, and it was
 // accepted verbatim. The resulting subscription was inert and silently so:
 // lookupPeer found nothing, so no SubscribeRequest was ever sent, and
 // requestSubscriptions never matched it on any later reconnect either.
@@ -1311,7 +1311,7 @@ func TestAddSubscriptionRejectsAmbiguousName(t *testing.T) {
 
 // TestRemoveSubscriptionOfOrphanedPeer is the constraint that keeps ref
 // resolution from making a mess unfixable. A subscription whose peer is no
-// longer configured cannot resolve — there is nothing to resolve against —
+// longer configured cannot resolve, there is nothing to resolve against,
 // and if that were an error it would be permanently stuck in config with no
 // CLI able to remove it. resolveSubscriptionRef passes unresolvable refs
 // through untouched precisely so these stay removable by their literal
@@ -1357,7 +1357,7 @@ func TestRemoveSubscriptionResolvesNames(t *testing.T) {
 // showed the same share as "no access". The two read different fields:
 // a subscription's access comes from the AccessUpdate the offerer pushed,
 // but a remote share's comes from the offerer's ShareList and nowhere
-// else — and an access decision used to send only the AccessUpdate, so
+// else, and an access decision used to send only the AccessUpdate, so
 // the ShareList the subscriber held stayed at its connect-time "none"
 // until the next reconnect. A grant to a peer that has not subscribed at
 // all is the same gap with no AccessUpdate to mask it: nothing reached
@@ -1399,7 +1399,7 @@ func TestGrantReannouncesShareList(t *testing.T) {
 
 // connectedPairWithShare returns two connected nodes, where nodeA offers a
 // read-only share by the given name and nodeB has already received nodeA's
-// ShareList — the precondition for resolving share names.
+// ShareList, the precondition for resolving share names.
 func connectedPairWithShare(t *testing.T, shareName string) (nodeA, nodeB *Node, shareID string) {
 	t.Helper()
 	nodeA = newTestNode(t, "nodeA")
@@ -1429,7 +1429,7 @@ func connectedPairWithShare(t *testing.T, shareName string) (nodeA, nodeB *Node,
 // TestTrashResolvesShareRef covers the case that exposed how narrowly
 // the ref resolvers had been wired in: `syncat share ls` prints a share's name
 // right next to its id, but `syncat trash ls <name>` answered "share test is
-// not a local share or subscription" — because trash resolution was exact-id
+// not a local share or subscription", because trash resolution was exact-id
 // only. Every ref form the rest of the CLI accepts has to work here too.
 func TestTrashResolvesShareRef(t *testing.T) {
 	node := newTestNode(t, "node")
@@ -1450,7 +1450,7 @@ func TestTrashResolvesShareRef(t *testing.T) {
 
 // TestTrashResolvesSubscriptionRef: the trash holds entries for subscribed
 // shares too (files are trashed on whichever side deleted them), so trash
-// refs resolve against the union of offered and subscribed shares — not just
+// refs resolve against the union of offered and subscribed shares, not just
 // the ones this node offers.
 func TestTrashResolvesSubscriptionRef(t *testing.T) {
 	_, nodeB, shareID := connectedPairWithShare(t, "docs")
@@ -1500,8 +1500,8 @@ func TestShareMutatorsResolveRefs(t *testing.T) {
 	}
 }
 
-// TestRemovePeerResolvesRef: peer removal takes a name too, and — because it
-// resolves best-effort — an exact key still works even when resolution has
+// TestRemovePeerResolvesRef: peer removal takes a name too, and, because it
+// resolves best-effort, an exact key still works even when resolution has
 // nothing to work with.
 func TestRemovePeerResolvesRef(t *testing.T) {
 	nodeA := newTestNode(t, "nodeA")
@@ -1525,9 +1525,9 @@ func TestRemovePeerResolvesRef(t *testing.T) {
 	}
 }
 
-// TestDialFailureIsLogged covers the silence that made a wedged peer so
+// TestDialFailureIsLogged covers the silence that made a stuck peer so
 // hard to diagnose. transport.Supervisor.Run does no logging of its own, so
-// a peer that could not dial out wrote nothing to any log — its error
+// a peer that could not dial out wrote nothing to any log, its error
 // reached `syncat status` as lastErr and nowhere else. In practice that
 // meant the node at fault said nothing at all, while the *other* node
 // filled its log with dedup-loss warnings about a dial that was never
@@ -1614,13 +1614,13 @@ func (t *deadlineProbeTransport) Dial(ctx context.Context, addr string) (net.Con
 // TestDialIsBounded pins that a dial attempt carries a deadline.
 //
 // Supervisor.Run hands dialAttempt the peer's own long-lived context, so
-// before dialTimeout existed a dial had no deadline at all — and a dial into
+// before dialTimeout existed a dial had no deadline at all, and a dial into
 // a half-dead tailcat tunnel does not fail, it hangs: WireGuard retries its
 // handshake indefinitely while netstack retransmits the SYN behind it.
 //
 // That stalls every recovery path, because all of them are driven by a dial
 // *failing*. A hung dial never reaches the backoff schedule, never counts a
-// failure, and never reaches TailcatTransport.discardClient — the thing that
+// failure, and never reaches TailcatTransport.discardClient, the thing that
 // rebuilds the stale per-peer Client after a peer restarts. Observed as a
 // peer that stayed disconnected indefinitely after the *other* node
 // restarted, with its WireGuard handshake retrying forever in the log.
@@ -1710,7 +1710,7 @@ func (t *discardSpyTransport) sawDiscard(addr string) bool {
 //
 // A peer only dials when it holds no session (dialAttempt short-circuits
 // otherwise), so an authenticated inbound connection from a peer we believe
-// we are already connected to means our side is a corpse — and the peer
+// we are already connected to means our side is dead, and the peer
 // just proved it is alive by completing the handshake. The cost of not
 // noticing falls entirely on whichever node the dedup rule made responsible
 // for dialling the pairing, since the other node's dials are rejected here
@@ -1818,7 +1818,7 @@ func TestPeerRedialDropsStaleSession(t *testing.T) {
 
 	// Assert on identity, not on nil: the supervisor redials the moment the
 	// stale session is torn down, so over a pipe the nil window is far too
-	// short to observe. What matters is that the corpse was replaced.
+	// short to observe. What matters is that the dead connection was replaced.
 	waitFor(t, 5*time.Second, func() bool {
 		pc.mu.Lock()
 		defer pc.mu.Unlock()
@@ -1840,7 +1840,7 @@ func TestPeerRedialDropsStaleSession(t *testing.T) {
 // The bug this covers was a race, not a logic error, so it needs the
 // repeats: two nodes that peer at the same instant both dial, and SPEC.md
 // §2.4 keeps only one of the two connections. The winner closes the loser
-// as soon as its own handshake completes — and when that close lands while
+// as soon as its own handshake completes, and when that close lands while
 // the loser is still inside InitiateHandshake (its final SetDeadline is a
 // favourite), the loser saw a hard error rather than a handshake it could
 // then lose dedup on cleanly, and reported it via noteDialFailure. That
@@ -1869,7 +1869,7 @@ func TestConnectedPeerNeverReportsDialFailure(t *testing.T) {
 			t.Fatalf("round %d: nodeB AddPeer: %v", round, err)
 		}
 
-		// Both sides must reach "connected" — with the bug, the side whose
+		// Both sides must reach "connected", with the bug, the side whose
 		// own dial lost the race never leaves "backing_off", so this is
 		// where the failure surfaces first.
 		waitFor(t, 10*time.Second, func() bool { return peerConnected(nodeA) && peerConnected(nodeB) })
@@ -1903,7 +1903,7 @@ func TestConnectedPeerNeverReportsDialFailure(t *testing.T) {
 
 // TestDisabledPeerReportsDisconnected covers a peer that is configured but
 // switched off. Its supervisor is never started, so nothing in the connect
-// path ever runs for it — and nothing else set an initial state, so it
+// path ever runs for it, and nothing else set an initial state, so it
 // reached `syncat peer ls` and the REST API as an empty string rather than
 // as any of the four documented ConnStates.
 func TestDisabledPeerReportsDisconnected(t *testing.T) {
@@ -1949,7 +1949,7 @@ func TestDisabledPeerReportsDisconnected(t *testing.T) {
 }
 
 // TestConnectedSinceClearedOnDisconnect pins PeerStatus.ConnectedSince to
-// its own documented contract — "when the *current* connection was
+// its own documented contract, "when the *current* connection was
 // established; zero otherwise". It used to keep the dead connection's
 // timestamp after teardown, so anything rendering "connected for X" from it
 // showed a duration that kept climbing for a peer that was gone.
@@ -1997,7 +1997,7 @@ func TestConnectedSinceClearedOnDisconnect(t *testing.T) {
 // internal/core propagates a share when a *rescan* finds the working tree
 // and the index disagree, and applying a pulled change updates both, so the
 // scan that follows finds nothing and returns before it would propagate.
-// The periodic rescan finds the same nothing, so it never healed either —
+// The periodic rescan finds the same nothing, so it never healed either,
 // a write on one spoke simply never reached the other, indefinitely.
 func TestFanOutThroughHub(t *testing.T) {
 	ctx := context.Background()
@@ -2011,7 +2011,7 @@ func TestFanOutThroughHub(t *testing.T) {
 		t.Fatalf("AddShare: %v", err)
 	}
 
-	// Both spokes peer with the hub, and only with the hub — peers of the
+	// Both spokes peer with the hub, and only with the hub, peers of the
 	// same share never talk to each other.
 	hubToken := peerToken(t, hub)
 	for _, s := range []struct {
@@ -2040,7 +2040,7 @@ func TestFanOutThroughHub(t *testing.T) {
 		t.Fatalf("spokeB AddSubscription: %v", err)
 	}
 
-	// A change at the hub reaches both spokes — this much always worked,
+	// A change at the hub reaches both spokes, this much always worked,
 	// and is here so a failure below can't be blamed on the topology never
 	// having come up.
 	if err := os.WriteFile(filepath.Join(shareDir, "hub.txt"), []byte("from the hub"), 0o644); err != nil {

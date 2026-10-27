@@ -362,8 +362,8 @@ func TestTailcatKeyCarriesPresharedKey(t *testing.T) {
 // This is a regression test for a real break: `syncat token` reads the key
 // with LoadTailcatKey and never touches LoadOrCreateTailcatKey, so while
 // the migration lived only in the latter, `syncat token` on a node whose
-// daemon had not been restarted since the upgrade printed a legacy address
-// — no disco key, no pre-shared key. It looked like a perfectly normal
+// daemon had not been restarted since the upgrade printed a legacy address,
+// no disco key, no pre-shared key. It looked like a perfectly normal
 // token, and a peer given it could never connect.
 func TestLoadTailcatKeyMigratesLegacyKey(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "tailcat.key")

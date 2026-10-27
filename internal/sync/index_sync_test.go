@@ -169,7 +169,7 @@ func TestCanAnswerWithDeltas(t *testing.T) {
 // change journal safe to prune at all: a peer whose cursor predates every
 // surviving entry must be re-anchored with a full snapshot, not answered
 // with silence. Answering an empty journal as if it meant "you are up to
-// date" leaves that peer permanently behind — its next delta is rejected
+// date" leaves that peer permanently behind, its next delta is rejected
 // for a sequence gap, it asks again, and gets the same silence.
 func TestPrunedJournalFallsBackToSnapshot(t *testing.T) {
 	ctx := context.Background()

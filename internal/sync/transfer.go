@@ -30,16 +30,16 @@ import (
 //
 // SPEC.md §4/§5 promise that a peer which no longer has a requested file,
 // or whose version has moved on, answers with an Error rather than
-// silence — but that is a promise about a *well-behaved* peer, and
+// silence, but that is a promise about a *well-behaved* peer, and
 // pullFile is what pays for it being broken. Without this, a FileRequest
 // answered with neither a chunk nor an Error parks its caller until the
 // whole session is torn down, holding one of the maxConcurrentPulls slots
-// the entire time. Four such requests wedge every transfer with that peer
+// the entire time. Four such requests stall every transfer with that peer
 // while the connection still looks perfectly healthy: pings, index
 // updates and share lists keep flowing, so nothing ever declares it dead.
 //
 // The timer is reset by every chunk received, so it bounds the gap
-// between chunks rather than the transfer as a whole — a legitimately
+// between chunks rather than the transfer as a whole, so a legitimately
 // slow but progressing transfer of any size is unaffected.
 const pullStallTimeout = 60 * time.Second
 
@@ -89,7 +89,7 @@ type pullEntry struct {
 }
 
 // ErrTransferStalled is returned by a pull that went pullStallTimeout with
-// no chunk and no Error from the peer — a peer that answered a
+// no chunk and no Error from the peer, a peer that answered a
 // FileRequest with silence. Wrapped, so callers can check it with
 // errors.Is.
 //
@@ -144,14 +144,14 @@ func newTransferID() (string, error) {
 	return hex.EncodeToString(id[:]), nil
 }
 
-// pullFile fetches wireRelPath's content (as shareID's holder — the peer
-// at the other end of this Session — currently has it under version) and
+// pullFile fetches wireRelPath's content (as shareID's holder, the peer
+// at the other end of this Session, currently has it under version) and
 // streams it into dst as chunks arrive, never buffering more than one
 // chunk (<=1 MiB, protocol.MaxFileChunkData) at a time. It returns the
 // total number of bytes written.
 //
 // Concurrency: pullFile blocks until a slot is free in s.pullSem, which
-// has capacity maxConcurrentPulls — this is the "max 4 concurrent pulls
+// has capacity maxConcurrentPulls, and this is the "max 4 concurrent pulls
 // per peer" enforcement point (SPEC.md §4). Any number of goroutines may
 // call pullFile at once; excess callers simply queue on the semaphore.
 // While waiting for chunks, pullFile is fed by the Session's single read
@@ -275,7 +275,7 @@ func (s *Session) notePullActive() (done func()) {
 }
 
 // resetStallTimer re-arms t to fire d from now, whether or not it has
-// already fired — a fired timer's expiry has to be drained from t.C first
+// already fired. A fired timer's expiry has to be drained from t.C first
 // or the next select would consume it as a stall.
 func resetStallTimer(t *time.Timer, d time.Duration) {
 	if !t.Stop() {
@@ -393,7 +393,7 @@ func (s *Session) handleFileRequest(ctx context.Context, req protocol.FileReques
 
 	if cfg.ignored(req.RelPath, false) {
 		// Backstop. An ignored path has no index row, so the GetFile
-		// below would fail anyway — but a peer can only have learned the
+		// below would fail anyway, but a peer can only have learned the
 		// path from a journal entry we wrote before the rule existed, and
 		// this keeps the answer authoritative rather than incidental. The
 		// error is deliberately the same one a genuinely missing file
@@ -418,7 +418,7 @@ func (s *Session) handleFileRequest(ctx context.Context, req protocol.FileReques
 	if err != nil {
 		// Should be unreachable in practice: an invalid relpath can't have
 		// made it into the index (ValidateRelPath gates every wire path
-		// before it becomes an Action — see reconcile.go/path.go). Treat
+		// before it becomes an Action, see reconcile.go/path.go). Treat
 		// it the same as "not found" rather than ever touching the
 		// filesystem with it.
 		response.fail(protocol.ErrCodeFileNotFound, "invalid path")
@@ -469,8 +469,8 @@ func (s *Session) handleFileRequest(ctx context.Context, req protocol.FileReques
 var errFileChangedDuringTransfer = errors.New("file changed during transfer")
 
 // streamFile sends f's contents as a sequence of FileChunk frames of at
-// most protocol.MaxFileChunkData bytes each — f is never read into memory
-// beyond one chunk at a time — followed by one final zero-length,
+// most protocol.MaxFileChunkData bytes each (f is never read into memory
+// beyond one chunk at a time), followed by one final zero-length,
 // EOF-marked chunk. Sending the EOF marker as its own frame (rather than
 // trying to detect end-of-file on the same read that returned the last
 // data) keeps the read side's contract simple: EOF is only ever true, and

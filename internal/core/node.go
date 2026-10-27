@@ -74,14 +74,14 @@ type Options struct {
 	Logger *log.Logger
 
 	// Clock drives every timer Node starts (dial backoff, handshake
-	// keepalive, share watchers, the trash janitor) — see Clock below.
+	// keepalive, share watchers, the trash janitor). See Clock below.
 	// RealClock if nil.
 	Clock Clock
 
 	// Rand supplies jitter for dial backoff (transport.Backoff.NextDelay).
 	// If nil and DisableJitter is false, a time-seeded Rand is used
 	// (production default). If nil and DisableJitter is true, backoff is
-	// unjittered (deterministic — for tests that assert exact delays).
+	// unjittered (deterministic, for tests that assert exact delays).
 	Rand          *rand.Rand
 	DisableJitter bool
 }
@@ -91,7 +91,7 @@ type Options struct {
 // and the trash janitor. Construct with Open; shut down with Close.
 //
 // Every exported method is safe for concurrent use, including concurrently
-// with the peer manager's own background activity — see mutations.go's
+// with the peer manager's own background activity. See mutations.go's
 // file comment on lock ordering (config mutations always clone-mutate-
 // swap under cfgMu; live effects are applied after cfgMu is released).
 type Node struct {
@@ -113,7 +113,7 @@ type Node struct {
 	closeOnce sync.Once
 
 	// closeMu/closing order every wg.Add strictly before Close's
-	// wg.Wait — see goTracked.
+	// wg.Wait. See goTracked.
 	closeMu sync.RWMutex
 	closing bool
 
@@ -240,7 +240,7 @@ func Open(ctx context.Context, opts Options) (*Node, error) {
 	// this field via localToken. (Such a connection sees an empty token
 	// and is rejected by the peer's Hello validation; the peer's backoff
 	// redials into a fully-initialised node. The token can't be built any
-	// earlier — it embeds Transport.LocalAddress, which is only valid
+	// earlier. It embeds Transport.LocalAddress, which is only valid
 	// once Start has returned.)
 	n.tokenMu.Lock()
 	n.token = tok
@@ -384,8 +384,8 @@ func (n *Node) startConfiguredPeers(cfg *config.Config) {
 		// dialing ourselves fails in a uniquely silent way: the handshake
 		// succeeds against our own server, then loses dedup forever
 		// because KeepConnection compares our key against itself. Register
-		// the peer anyway — so it stays visible in `syncat peer ls` rather
-		// than vanishing while it's still in config.json — but never dial.
+		// the peer anyway, so it stays visible in `syncat peer ls` rather
+		// than vanishing while it's still in config.json, but never dial.
 		if pc.peerKeyHex == n.PeerKey() {
 			n.logger.Printf("core: open: peer %q is configured with this node's own token; not dialing it. Run `syncat peer rm %s`, then add the other node's token.", p.Name, pc.peerKeyHex)
 			pc.disable("configured with this node's own token; remove it and add the other node's token")
@@ -447,7 +447,7 @@ func (n *Node) Close() error {
 // onAccept runs on a transport goroutine, and AddPeer and startShareWatch
 // on API goroutines. (The rest are called from already-tracked goroutines,
 // which keep the counter above zero and so cannot race a Wait.) Without
-// the guard, such an Add can land after Close's wg.Wait has begun — the
+// the guard, such an Add can land after Close's wg.Wait has begun. That is the
 // documented "Add that starts when the counter is zero must happen before
 // Wait" misuse, which the race detector flags, and which really can leak a
 // goroutine past Close and on into a closed store or transport.
@@ -474,8 +474,8 @@ func (n *Node) goTracked(fn func()) bool {
 // onTrashSweep reports the trash janitor's periodic purge (SPEC.md §7).
 //
 // This callback was previously left nil, which made the janitor completely
-// silent: a sweep that failed — a permissions problem on the trash
-// directory, a disk error — was discarded by the janitor's loop with
+// silent: a sweep that failed (a permissions problem on the trash
+// directory, a disk error) was discarded by the janitor's loop with
 // nothing recorded anywhere, and successful purges deleted the user's only
 // remaining copy of a file with no record that it had happened. Retention
 // deletion is irreversible, so it gets a log line whenever it actually
@@ -533,7 +533,7 @@ func (n *Node) localToken() string {
 	return n.token
 }
 
-// PeerKey returns this node's own full Ed25519 public key, hex-encoded —
+// PeerKey returns this node's own full Ed25519 public key, hex-encoded,
 // the same identifier format used for every peer throughout Node's API.
 func (n *Node) PeerKey() string {
 	return hex.EncodeToString(n.identity.Public())
@@ -613,7 +613,7 @@ func (n *Node) handleAccept(conn net.Conn) {
 	if pc == nil {
 		n.rejectedHandshakes.Add(1)
 		// IsKnownPeer said yes but the peer vanished from the map between
-		// then and now (e.g. RemovePeer raced this handshake) — treat as
+		// then and now (e.g. RemovePeer raced this handshake). Treat as
 		// a rejection rather than panicking on a nil peerConn.
 		n.recordRejected(hex.EncodeToString(result.PeerPub), result.PeerName, "peer removed during handshake")
 		conn.Close()
@@ -687,7 +687,7 @@ func (n *Node) recordRejected(peerKeyHex, peerName, reason string) {
 // keepalive (protocol.Keepalive), share watchers (index.Watcher), and the
 // trash janitor (sync.Janitor). Each of those packages defines its own
 // narrow Clock interface (Now/After, or just After for transport.Clock) for
-// leaf-package independence — Clock here has both methods, so a single
+// leaf-package independence. Clock here has both methods, so a single
 // value satisfies all of them structurally, letting a test drive every
 // timer Node starts from one fake clock with no real sleeping.
 //
@@ -713,7 +713,7 @@ type transportClockAdapter struct{ c Clock }
 
 func (a transportClockAdapter) After(d time.Duration) <-chan time.Time { return a.c.After(d) }
 
-// asProtocolClock adapts a Clock to protocol.Clock (Now+After) — Clock
+// asProtocolClock adapts a Clock to protocol.Clock (Now+After). Clock
 // already satisfies this interface structurally, but the helper keeps call
 // sites self-documenting about which package's Clock is being supplied.
 func asProtocolClock(c Clock) protocol.Clock { return c }
