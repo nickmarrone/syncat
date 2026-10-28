@@ -74,7 +74,7 @@ type Options struct {
 	Logger *log.Logger
 
 	// Clock drives every timer Node starts (dial backoff, handshake
-	// keepalive, share watchers, the trash janitor). See Clock below.
+	// keepalive, share watchers, the trash sweeper). See Clock below.
 	// RealClock if nil.
 	Clock Clock
 
@@ -88,7 +88,7 @@ type Options struct {
 
 // Node owns one running syncat instance end to end: config, identity,
 // index store, transport, peer connections, share/subscription watchers,
-// and the trash janitor. Construct with Open; shut down with Close.
+// and the trash sweeper. Construct with Open; shut down with Close.
 //
 // Every exported method is safe for concurrent use, including concurrently
 // with the peer manager's own background activity. See mutations.go's
@@ -155,14 +155,15 @@ const maxInboundHandshakes = 32
 const maxInboundHandshakesPerPeer = 4
 
 // Open loads (or accepts, via Options) config and identity, opens the
-// index store, starts the transport, share watchers, trash janitor, and
+// index store, starts the transport, share watchers, trash sweeper, and
 // peer manager, and returns a fully running Node. The returned Node must
 // be shut down with Close.
 //
 // Startup order matches the SPEC.md §1/§10 lifecycle: config+keys+paths,
 // index store, transport (accepting connections from the moment Start
-// returns), an initial synchronous scan of every configured share and
-// non-paused subscription, the trash janitor, then the peer manager's
+// returns), moving any old data-dir trash into the shares, an initial
+// synchronous scan of every configured share and non-paused subscription,
+// the trash sweeper, then the peer manager's
 // dial supervisors.
 func Open(ctx context.Context, opts Options) (*Node, error) {
 	if opts.Paths == nil {
@@ -410,7 +411,7 @@ func (n *Node) startConfiguredPeers(cfg *config.Config) {
 // Close shuts the node down in order: stop dialing/accepting new work
 // (cancel the root context), wait for every peer connection and
 // background goroutine Node started to finish tearing itself down, stop
-// the share watchers and trash janitor, close the index store, and
+// the share watchers, close the index store, and
 // finally close the transport. Safe to call more than once; only the
 // first call does anything.
 func (n *Node) Close() error {
@@ -672,7 +673,7 @@ func (n *Node) recordRejected(peerKeyHex, peerName, reason string) {
 // Clock abstracts wall-clock time for every timing-dependent piece Node
 // wires together: dial backoff (transport.Backoff/Supervisor), handshake
 // keepalive (protocol.Keepalive), share watchers (index.Watcher), and the
-// trash janitor (sync.Janitor). Each of those packages defines its own
+// trash sweeper. Each of those packages defines its own
 // narrow Clock interface (Now/After, or just After for transport.Clock) for
 // leaf-package independence. Clock here has both methods, so a single
 // value satisfies all of them structurally, letting a test drive every

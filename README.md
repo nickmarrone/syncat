@@ -104,13 +104,15 @@ which side may send changes:
 | Share permission | Subscription mode | Result |
 | --- | --- | --- |
 | `read-write` (`rw`) | `mirror` | Two-way synchronization. |
-| `read-write` (`rw`) | `receive-only` (`receive`) | The subscriber receives changes but never sends them back. |
+| `read-write` (`rw`) | `receive-only` (`receive`) | One-way pull: the subscriber receives changes but never sends them back. |
 | `read-only` (`ro`) | either mode | The share owner is the source of truth; subscriber changes are not sent. |
 
 Use a read-only share whenever the other person should not change your source
-directory. A receive-only subscription is useful for a backup or a local copy
-that must not publish edits. Local edits in a receive-only copy are reported
-as warnings and can be replaced by a later source update.
+directory. A receive-only subscription is useful for a local copy that must
+not publish edits. It is not a backup: it receives deletes just like a mirror
+does (see [syncat is not a backup](#syncat-is-not-a-backup)). Local edits in a
+receive-only copy are reported as warnings and are replaced, into the trash,
+by a later source update.
 
 Subscription and share paths must not overlap: a directory received from a
 peer cannot be offered back as a new local share. Removing a share or a
@@ -144,19 +146,103 @@ You can later grant, deny, or revoke a peer's access from the web UI. Revoking
 access stops future synchronization; it does not remove the peer's existing
 local copy.
 
-### Deletes, conflicts, and trash
+### Holds: when a change looks like a disaster
 
-When syncat applies a remote delete or overwrites an existing local file, it
-first moves the replaced content to its per-share trash. Local deletions made
-by you are not put in that trash. List and restore remote changes with:
+syncat refuses to record or send a change that looks like a disaster, and
+puts the share **on hold** instead:
+
+- the share's folder is missing or unreadable (an unmounted drive, a
+  permissions change);
+- every file in it has gone;
+- or one change would delete at least 50% of its files and at least 20 of
+  them (a **bulk delete**).
+
+The same check runs on changes arriving from each peer, so a peer can't push a
+mass delete onto your copy either. While a share is on hold nothing about it
+is synchronized. `syncat status` and every page of the web UI say why. Either
+fix the folder (put the files back, remount the drive), and the hold clears by
+itself at the next scan, or, if the deletes were intended, let them through:
 
 ```bash
-syncat trash ls docs
-syncat trash restore docs path/inside/the/share.txt
+syncat share confirm-deletes docs              # this node's own change
+syncat share confirm-deletes docs --peer bob   # a change from bob
 ```
 
-Restoring creates a new local change, so it can synchronize to peers. Trash
-entries are retained for 30 days by default.
+A file syncat can't read is never treated as deleted. The thresholds are set
+per share or subscription, on each node:
+
+```bash
+syncat share safety docs                                # show the settings
+syncat share safety docs --hold-percent 30 --hold-min 5
+```
+
+### The trash: undo for changes peers make
+
+When syncat applies a peer's delete, or overwrites a file with a peer's
+version, it first moves your copy into the trash inside the folder itself, at
+`.syncat/trash/`. Each change is one folder, named for when it happened and
+which peer made it, and laid out like the share:
+
+```text
+docs/.syncat/trash/2026-10-27 10.32.05 from laptop/notes/ideas.md
+```
+
+You can browse it and move files back with a file manager, or use the web UI
+or the CLI:
+
+```bash
+syncat trash ls docs              # numbered changes, newest first
+syncat trash ls docs --files      # ...with the files in each
+syncat trash undo docs 1          # undo the newest change
+syncat trash undo docs 1 notes/ideas.md
+```
+
+Undoing puts the files back and sends them to peers as a new change. A file in
+the way is moved into the trash first, so an undo can be undone. Deletes you
+make yourself never go to the trash.
+
+A change is kept for 30 days, or until the trash is bigger than 25% of the
+share, whichever comes first; the oldest changes go first, and the newest is
+always kept. Change either per share:
+
+```bash
+syncat share safety docs --trash-days 14 --trash-max 2GiB
+```
+
+`.syncat/` is never synchronized. syncat won't share a folder that already has
+a `.syncat/` it didn't create.
+
+### syncat is not a backup
+
+Holds stop a disaster from spreading, and the trash undoes what peers change.
+Neither recovers a file *you* deleted or overwrote, an older version of a
+file, or anything from before the trash's retention window. A receive-only
+copy doesn't either: it receives deletes like any other copy. Back up the
+folders you care about with a tool built for it. For example, with
+[restic](https://restic.net) and a systemd timer:
+
+```ini
+# ~/.config/systemd/user/restic-docs.service
+[Service]
+Type=oneshot
+Environment=RESTIC_REPOSITORY=/mnt/backup/restic RESTIC_PASSWORD_FILE=%h/.config/restic/password
+ExecStart=/usr/bin/restic backup %h/Documents
+ExecStart=/usr/bin/restic forget --keep-hourly 24 --keep-daily 14 --keep-weekly 8 --prune
+
+# ~/.config/systemd/user/restic-docs.timer
+[Timer]
+OnCalendar=hourly
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+Run `restic init` once, then `systemctl --user enable --now restic-docs.timer`.
+Filesystem snapshots (btrfs, ZFS) work just as well. The trash, in
+`.syncat/trash/`, is included in such a backup like any other folder.
+
+### Conflicts
 
 If peers edit the same file while disconnected, syncat keeps both versions.
 One becomes the ordinary filename and the other is stored alongside it as a
@@ -198,8 +284,13 @@ has two views.
   details.
 - **Shares** lets you add, rename, change the permission or approval setting,
   and remove local shares. It also provides per-peer Grant/Deny/Revoke
-  controls, pause/remove controls for subscriptions, and a trash browser with
-  Restore actions.
+  controls and pause/remove controls for subscriptions. Every share and
+  subscription has a **Trash and safety** panel listing its trash by change,
+  with Undo for a whole change or Restore for one file, a filter to find a
+  file, and its hold and trash settings.
+
+A share on hold shows a banner on every page, with a button to let the
+deletes through when that is possible.
 
 Use the CLI for configuration settings and detailed status output; the web UI
 does not have a Settings page in this release.
@@ -231,6 +322,8 @@ one of those nodes.
 | `share ls [--json]` | List local shares and peer access. |
 | `share set ID [--name NAME] [--perm ro\|rw] [--approval\|--no-approval]` | Change share metadata or its approval requirement. |
 | `share rm ID` | Stop offering a directory without deleting its files. |
+| `share safety SHARE [--hold-percent N] [--hold-min N] [--trash-days N] [--trash-max SIZE]` | Show or change a share's or subscription's hold and trash settings. |
+| `share confirm-deletes SHARE [--peer PEER]` | Let a held change through. |
 | `remote ls [--json]` | List shares offered by configured peers and their access status. |
 | `subscription add PEER SHARE LOCALPATH [--mode mirror\|receive]` | Receive a peer's share into a local directory. |
 | `subscription ls [--json]` | List subscriptions, connection state, access, and warnings. |
@@ -238,8 +331,8 @@ one of those nodes.
 | `subscription rm PEER SHARE` | Stop a subscription; local files remain. |
 | `approvals` | List pending peer and share-access requests. |
 | `approvals grant ID` / `deny ID` | Decide a pending peer or share-access request. |
-| `trash ls SHARE [--json]` | List files syncat placed in a share's trash. |
-| `trash restore SHARE PATH` | Restore a share-relative trashed path. |
+| `trash ls SHARE [--files] [--json]` | List the changes in a share's trash, newest first. |
+| `trash undo SHARE N [PATH...]` | Undo change N from `trash ls` (1 is the newest), or just the given files. |
 | `config set FIELD VALUE` | Change a supported scalar configuration value. |
 | `version` | Print the syncat version. |
 
@@ -260,7 +353,9 @@ $XDG_DATA_HOME/syncat/ or ~/.local/share/syncat/
   keys/identity.key
   keys/tailcat.key
   db/index.db
-  trash/
+
+each share or subscription folder/
+  .syncat/trash/              # the trash (see above); never synchronized
 ```
 
 The generated configuration and key files contain secrets. syncat creates its
@@ -272,7 +367,7 @@ so the new setting is loaded:
 ```bash
 syncat config set node_name work-laptop
 syncat config set api_addr 127.0.0.1:9347
-syncat config set trash_retention_days 14
+syncat config set trash_retention_days 14   # default for shares that don't set their own
 syncat config set rescan_interval_seconds 120
 syncat config set debug true
 ```
@@ -286,10 +381,10 @@ only one directory.
 
 `syncat init` is idempotent. Use `syncat init --reset` only when you intend to
 make a completely new node. Stop the daemon first. Reset deletes `config.json`,
-the local API credential, keys, index, and trash, but leaves share directories
-and subscription copies in place. It changes the node identity and token, so
-remove the old peer and pair the new one again on every other node. Restore any
-needed trash files before resetting. For a system-wide service, stop it and
+the local API credential, keys, and index, but leaves share directories and
+subscription copies in place, including the trash inside them. It changes the
+node identity and token, so remove the old peer and pair the new one again on
+every other node. For a system-wide service, stop it and
 run reset as its dedicated service account; see the next section.
 
 For a user-level systemd service, install and initialize the binary, then

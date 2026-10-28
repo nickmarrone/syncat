@@ -7,7 +7,7 @@
 // bytes (pulling files from the peer and serving them), apply.go writes
 // the results to disk, path.go validates every peer-supplied relpath
 // before it ever becomes a filesystem path, and trash.go implements the
-// trash can and its janitor.
+// trash inside each synced folder.
 package sync
 
 import (
