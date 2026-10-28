@@ -201,7 +201,8 @@ machine — verify these across two real machines.
       ends up in a new "replaced by restore" event, nothing is lost.
 - [ ] Delete 25 of 30 files in a share at once. The share goes **on hold**:
       `syncat status` and a banner on every web UI page say so, and the peer
-      keeps all 30. Put the files back: the hold clears by itself. Delete them
+      keeps all 30. Put 20 back: still on hold, now 5 of 30. Put the rest
+      back: the hold clears by itself. Delete them
       again and run `syncat share confirm-deletes <share>`: the deletes now
       reach the peer.
 - [ ] Unmount (or `mv` away) a share's folder while the daemon runs. The

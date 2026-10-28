@@ -300,9 +300,12 @@ every peer's changes into it.
   delete; only one that is truly absent is.
 - While held, the scan result or the peer's changes are not applied, and nothing is
   sent. The peer's rows stay recorded, so a confirm applies exactly what was held.
-- A hold clears itself when the next scan or pass no longer trips a trigger, or the
-  user confirms it (`syncat share confirm-deletes SHARE [--peer P]`), which lets the
-  next held pass through. A missing root or a foreign `.syncat/` cannot be confirmed.
+- A hold clears itself when the next scan or pass would delete nothing (the folder
+  is back as it was), or the user confirms it (`syncat share confirm-deletes SHARE
+  [--peer P]`), which lets the next held pass through. Falling back under the
+  thresholds is not enough: putting back part of what vanished leaves the rest held,
+  not deleted. A missing root or a foreign `.syncat/` cannot be confirmed; a root
+  that returns with files still missing stays held as everything-vanished, which can.
 - Holds are stored in the index, so a restart doesn't forget them. They show in
   `syncat status`, `GET /api/holds`, and as a banner on every page of the web UI.
 

@@ -71,7 +71,17 @@ func TestLocalBulkDeleteIsHeldUntilFolderIsFixed(t *testing.T) {
 		t.Errorf("index has %d live files while held, want all 30 kept", got)
 	}
 
-	// Putting the files back clears the hold by itself.
+	// Putting some back leaves 5 deletes, under the thresholds, but still
+	// held.
+	writeNumberedFiles(t, dir, 15)
+	if err := node.RescanShare(ctx, shareID); err != nil {
+		t.Fatal(err)
+	}
+	if h := onlyHold(t, node); h.Reason != HoldBulkDelete || h.Deletes != 5 {
+		t.Errorf("hold after a partial fix = %+v, want bulk-delete of 5", h)
+	}
+
+	// Putting them all back clears the hold by itself.
 	writeNumberedFiles(t, dir, 30)
 	if err := node.RescanShare(ctx, shareID); err != nil {
 		t.Fatal(err)
@@ -144,6 +154,85 @@ func TestEverythingVanishingIsHeldInASmallShare(t *testing.T) {
 	}
 	if h := onlyHold(t, node); h.Reason != HoldEverythingVanished {
 		t.Errorf("reason = %q, want %q", h.Reason, HoldEverythingVanished)
+	}
+}
+
+// Restoring part of what vanished is not fixing the folder: the remaining
+// deletes are under the thresholds, but they are the same disaster, so the
+// hold stays until nothing would be deleted.
+func TestPartialRestoreKeepsHold(t *testing.T) {
+	ctx := context.Background()
+	node := newTestNode(t, "node")
+	dir := t.TempDir()
+	writeNumberedFiles(t, dir, 3)
+	shareID, err := node.AddShare(dir, "docs", config.PermissionReadWrite, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	removeNumberedFiles(t, dir, 3)
+	if err := node.RescanShare(ctx, shareID); err != nil {
+		t.Fatal(err)
+	}
+	onlyHold(t, node)
+
+	writeNumberedFiles(t, dir, 1)
+	if err := node.RescanShare(ctx, shareID); err != nil {
+		t.Fatal(err)
+	}
+	h := onlyHold(t, node)
+	if h.Reason != HoldEverythingVanished || h.Deletes != 2 || h.Live != 3 {
+		t.Errorf("hold after restoring one file = %+v, want everything-vanished with 2 of 3 still missing", h)
+	}
+	if got := liveIndexed(t, node, shareID); got != 3 {
+		t.Errorf("index has %d live files, want all 3 kept", got)
+	}
+
+	writeNumberedFiles(t, dir, 3)
+	if err := node.RescanShare(ctx, shareID); err != nil {
+		t.Fatal(err)
+	}
+	if holds := node.Holds(); len(holds) != 0 {
+		t.Errorf("Holds() after restoring everything = %+v, want none", holds)
+	}
+}
+
+// A missing root that comes back with files still missing stays held, now
+// as a hold the user can confirm.
+func TestRootReturningPartlyKeepsHold(t *testing.T) {
+	ctx := context.Background()
+	node := newTestNode(t, "node")
+	dir := filepath.Join(t.TempDir(), "share")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeNumberedFiles(t, dir, 5)
+	shareID, err := node.AddShare(dir, "docs", config.PermissionReadWrite, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := node.RescanShare(ctx, shareID); err == nil {
+		t.Fatal("RescanShare of a missing root succeeded, want an error")
+	}
+
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeNumberedFiles(t, dir, 4)
+	if err := node.RescanShare(ctx, shareID); err != nil {
+		t.Fatal(err)
+	}
+	h := onlyHold(t, node)
+	if h.Reason != HoldEverythingVanished || !h.Confirmable || h.Deletes != 1 {
+		t.Errorf("hold = %+v, want a confirmable everything-vanished hold with 1 missing", h)
+	}
+	if _, err := node.ConfirmHold(ctx, "docs", ""); err != nil {
+		t.Fatalf("ConfirmHold: %v", err)
+	}
+	if got := liveIndexed(t, node, shareID); got != 4 {
+		t.Errorf("index has %d live files after confirming, want 4", got)
 	}
 }
 

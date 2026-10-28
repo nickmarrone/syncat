@@ -29,7 +29,7 @@ _Avoid_: Mount, replica
 ### Safety
 
 **Hold**:
-The state of a share or subscription in which syncat records and exchanges no changes because a change looked like a disaster; the user clears it by fixing the folder or confirms the change to let it through.
+The state of a share or subscription in which syncat records and exchanges no changes because a change looked like a disaster; it clears once the folder is back as it was (nothing would be deleted), or the user confirms the change to let it through.
 _Avoid_: Pause (a pause is user-chosen; a hold is imposed), freeze, lock
 
 **Bulk delete**:

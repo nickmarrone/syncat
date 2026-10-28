@@ -21,7 +21,8 @@ nodes on this release still talk to 0.4 nodes.
 everything in it disappears, or one change would delete at least half of it
 (and at least 20 files), syncat puts the share on hold instead of telling your
 peers to delete their copies. The same check guards your copy against a peer's
-mass delete. Fix the folder and the hold clears by itself, or let the deletes
+mass delete. Put everything back and the hold clears by itself (putting back
+only some of it doesn't let the rest be deleted), or let the deletes
 through with `syncat share confirm-deletes SHARE`. The thresholds are set per
 share with `syncat share safety`. Holds show in `syncat status` and as a
 banner in the web UI.
