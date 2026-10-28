@@ -161,7 +161,8 @@ The same check runs on changes arriving from each peer, so a peer can't push a
 mass delete onto your copy either. While a share is on hold nothing about it
 is synchronized. `syncat status` and every page of the web UI say why. Either
 fix the folder (put the files back, remount the drive), and the hold clears by
-itself at the next scan, or, if the deletes were intended, let them through:
+itself at the next scan once nothing would be deleted, or, if the deletes were
+intended, let them through:
 
 ```bash
 syncat share confirm-deletes docs              # this node's own change

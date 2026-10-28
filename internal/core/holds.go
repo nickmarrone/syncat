@@ -25,9 +25,11 @@ import (
 // would spread the other way.
 //
 // A hold ends one of two ways. The folder is fixed, so the next scan or
-// pass no longer trips a trigger and the hold clears itself. Or the user
+// pass would delete nothing and the hold clears itself. Or the user
 // confirms it (ConfirmHold), and the next pass that would have been held
-// applies instead.
+// applies instead. Getting back under the thresholds is not enough: after
+// a share's files all vanish, restoring one would otherwise clear the hold
+// and let the rest go through as ordinary deletes.
 
 // Hold reasons, stored in index.Hold.Reason and shown to the user.
 const (
@@ -88,6 +90,27 @@ func holdReason(s config.Safety, deletes, live int) string {
 		return HoldBulkDelete
 	}
 	return ""
+}
+
+// stillHeld returns why a link already on hold with reason held stays on
+// hold for a change that would delete deletes files and trips fresh (""
+// for no trigger), or "" if the hold clears. Only a change that deletes
+// nothing clears a hold over deletes; one that merely deletes fewer is the
+// same disaster partly undone. A hold whose cause was never deletes ends
+// once that cause is gone.
+func stillHeld(held, fresh string, deletes int) string {
+	if fresh != "" || deletes == 0 {
+		return fresh
+	}
+	switch held {
+	case HoldReservedDirTaken:
+		return ""
+	case HoldRootUnavailable:
+		// The folder is back, but not all of it: what is still missing
+		// vanished with the rest.
+		return HoldEverythingVanished
+	}
+	return held
 }
 
 func (n *Node) safetyFor(shareID string) config.Safety {
@@ -192,11 +215,15 @@ func (n *Node) holdForScan(shareID string, result *index.ScanResult, existing ma
 	}
 	live := liveFileCount(existing)
 	reason := holdReason(n.safetyFor(shareID), deletes, live)
+	h, held := n.getHold(shareID, "")
+	if held {
+		reason = stillHeld(h.Reason, reason, deletes)
+	}
 	if reason == "" {
-		n.clearLocalHold(shareID, "the folder looks normal again")
+		n.clearLocalHold(shareID, "the folder is back")
 		return false
 	}
-	if h, ok := n.getHold(shareID, ""); ok && h.Confirmed {
+	if held && h.Confirmed {
 		n.clearLocalHold(shareID, "deletes confirmed")
 		return false
 	}
@@ -252,11 +279,15 @@ func (n *Node) shareGuardFunc(shareID, peerKey string) func(deletes, live int) b
 			return false
 		}
 		reason := holdReason(n.safetyFor(shareID), deletes, live)
+		h, held := n.getHold(shareID, peerKey)
+		if held {
+			reason = stillHeld(h.Reason, reason, deletes)
+		}
 		if reason == "" {
-			n.clearHold(shareID, peerKey, "the peer's changes look normal again")
+			n.clearHold(shareID, peerKey, "the peer's changes delete nothing any more")
 			return true
 		}
-		if h, ok := n.getHold(shareID, peerKey); ok && h.Confirmed {
+		if held && h.Confirmed {
 			n.clearHold(shareID, peerKey, "deletes confirmed")
 			return true
 		}
