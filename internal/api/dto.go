@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/nickmarrone/syncat/internal/config"
 	"github.com/nickmarrone/syncat/internal/core"
 	syncsvc "github.com/nickmarrone/syncat/internal/sync"
 	"github.com/nickmarrone/syncat/internal/version"
@@ -49,6 +50,7 @@ type statusResponse struct {
 	Shares        []shareDTO        `json:"shares"`
 	RemoteShares  []remoteShareDTO  `json:"remote_shares"`
 	Subscriptions []subscriptionDTO `json:"subscriptions"`
+	Holds         []holdDTO         `json:"holds"`
 	Rejected      []rejectedConnDTO `json:"rejected_connections"`
 	Network       map[string]any    `json:"network"`
 }
@@ -102,6 +104,40 @@ type shareDTO struct {
 	Permission       string           `json:"permission"`
 	ApprovalRequired bool             `json:"approval_required"`
 	Access           []shareAccessDTO `json:"access"`
+	Safety           safetyDTO        `json:"safety"`
+}
+
+// safetyDTO is a share's or subscription's hold and trash settings, with
+// defaults filled in.
+type safetyDTO struct {
+	HoldDeletePercent  int    `json:"hold_delete_percent"`
+	HoldDeleteMin      int    `json:"hold_delete_min"`
+	TrashRetentionDays int    `json:"trash_retention_days"`
+	TrashMaxSize       string `json:"trash_max_size"`
+}
+
+func toSafetyDTO(s config.Safety) safetyDTO { return safetyDTO(s) }
+
+// holdDTO is one share, or one peer's link to it, on hold.
+type holdDTO struct {
+	ShareID     string    `json:"share_id"`
+	ShareName   string    `json:"share_name,omitempty"`
+	PeerKey     string    `json:"peer_key,omitempty"` // empty for this node's own copy
+	PeerName    string    `json:"peer_name,omitempty"`
+	Reason      string    `json:"reason"`
+	Deletes     int       `json:"deletes"`
+	Live        int       `json:"live"`
+	Since       time.Time `json:"since"`
+	Confirmed   bool      `json:"confirmed"`
+	Confirmable bool      `json:"confirmable"`
+}
+
+func toHoldDTO(h core.HoldStatus) holdDTO {
+	return holdDTO{
+		ShareID: h.ShareID, ShareName: h.ShareName, PeerKey: h.PeerKey, PeerName: h.PeerName,
+		Reason: h.Reason, Deletes: h.Deletes, Live: h.Live, Since: h.Since,
+		Confirmed: h.Confirmed, Confirmable: h.Confirmable,
+	}
 }
 
 type remoteShareDTO struct {
@@ -134,6 +170,7 @@ type subscriptionDTO struct {
 	Access    string       `json:"access"`
 	Connected bool         `json:"connected"`
 	Warnings  []warningDTO `json:"warnings,omitempty"`
+	Safety    safetyDTO    `json:"safety"`
 }
 
 type rejectedConnDTO struct {
@@ -214,7 +251,7 @@ func toShareDTO(s core.ShareStatus) shareDTO {
 	}
 	return shareDTO{
 		ID: s.ShareID, Name: s.Name, Path: s.Path, Permission: s.Permission,
-		ApprovalRequired: s.ApprovalRequired, Access: access,
+		ApprovalRequired: s.ApprovalRequired, Access: access, Safety: toSafetyDTO(s.Safety),
 	}
 }
 
@@ -237,7 +274,7 @@ func toSubscriptionDTO(s core.SubscriptionStatus) subscriptionDTO {
 	return subscriptionDTO{
 		ID: subscriptionID(s.PeerKey, s.ShareID), PeerKey: s.PeerKey, PeerName: s.PeerName,
 		ShareID: s.ShareID, ShareName: s.ShareName, LocalPath: s.LocalPath, Mode: s.Mode, Paused: s.Paused,
-		Access: s.Access, Connected: s.Connected, Warnings: warnings,
+		Access: s.Access, Connected: s.Connected, Warnings: warnings, Safety: toSafetyDTO(s.Safety),
 	}
 }
 
@@ -266,6 +303,10 @@ func toStatusResponse(st core.Status) statusResponse {
 	for _, s := range st.Subscriptions {
 		subs = append(subs, toSubscriptionDTO(s))
 	}
+	holds := make([]holdDTO, 0, len(st.Holds))
+	for _, h := range st.Holds {
+		holds = append(holds, toHoldDTO(h))
+	}
 	rejected := make([]rejectedConnDTO, 0, len(st.RejectedConnections))
 	for _, r := range st.RejectedConnections {
 		rejected = append(rejected, toRejectedConnDTO(r))
@@ -275,7 +316,7 @@ func toStatusResponse(st core.Status) statusResponse {
 		NodeName: st.NodeName, NodeToken: st.NodeToken, ShortID: st.ShortID, PeerKey: st.PeerKey,
 		StartedAt: st.StartedAt, UptimeSeconds: st.UptimeSeconds,
 		Peers: peers, Shares: shares, RemoteShares: remoteShares, Subscriptions: subs,
-		Rejected: rejected, Network: toNetworkDTO(st.Network),
+		Holds: holds, Rejected: rejected, Network: toNetworkDTO(st.Network),
 	}
 }
 

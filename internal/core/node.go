@@ -129,6 +129,12 @@ type Node struct {
 	sharesMu     sync.Mutex
 	shareWatches map[string]*shareWatch // key: share id
 
+	// holdsMu/holds mirror the store's holds table (see holds.go), so the
+	// guard every reconcile pass consults never has to query the database.
+	// Writes go to the store first and to the map only once that succeeded.
+	holdsMu sync.Mutex
+	holds   map[holdKey]index.Hold
+
 	rejectedMu sync.Mutex
 	rejected   []RejectedConnection
 
@@ -178,6 +184,11 @@ func Open(ctx context.Context, opts Options) (*Node, error) {
 	if err != nil {
 		return nil, fmt.Errorf("core: open: %w", err)
 	}
+	holds, err := loadHolds(ctx, store)
+	if err != nil {
+		store.Close()
+		return nil, fmt.Errorf("core: open: %w", err)
+	}
 
 	nodeCtx, cancel := context.WithCancel(context.Background())
 
@@ -192,6 +203,7 @@ func Open(ctx context.Context, opts Options) (*Node, error) {
 		cfg:               in.cfg,
 		peers:             map[string]*peerConn{},
 		shareWatches:      map[string]*shareWatch{},
+		holds:             holds,
 		ctx:               nodeCtx,
 		cancel:            cancel,
 		startTime:         in.clock.Now(),

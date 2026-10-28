@@ -58,7 +58,7 @@ type Store struct {
 // file header) rather than a table we'd have to query separately. It's
 // exactly what PRAGMA user_version exists for, and it's readable/writable
 // in the same connection setup step as the other pragmas below.
-const currentSchemaVersion = 3
+const currentSchemaVersion = 4
 
 // migrations[i] upgrades a database from schema version i to i+1.
 // Migrations run inside a single transaction per step (see migrate) so a
@@ -67,6 +67,7 @@ var migrations = []func(ctx context.Context, tx *sql.Tx) error{
 	migrateV1,
 	migrateV2,
 	migrateV3,
+	migrateV4,
 }
 
 func migrateV2(ctx context.Context, tx *sql.Tx) error {

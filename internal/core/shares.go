@@ -237,7 +237,14 @@ func (n *Node) rescanShare(ctx context.Context, shareID string) error {
 	}
 	result, err := sw.currentScanner().Scan(ctx, shareID, existing)
 	if err != nil {
+		n.holdForScanError(shareID, sw.root, existing)
 		return fmt.Errorf("core: rescan %s: scan: %w", shareID, err)
+	}
+	if n.holdForScan(shareID, result, existing) {
+		// Dropped, not applied: the index keeps describing the share as it
+		// was, so nothing reaches peers until the hold clears or is
+		// confirmed. See holds.go.
+		return nil
 	}
 
 	nodeID := n.identity.ShortID()

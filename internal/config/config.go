@@ -32,6 +32,14 @@ const (
 	DefaultRescanIntervalSeconds = 300
 )
 
+// Defaults for a share's or subscription's Safety settings, applied by
+// Config.SafetyFor when the setting is left at zero.
+const (
+	DefaultHoldDeletePercent = 50
+	DefaultHoldDeleteMin     = 20
+	DefaultTrashMaxSize      = "25%"
+)
+
 // Permission values for Share.Permission.
 const (
 	PermissionReadOnly  = "read-only"
@@ -87,6 +95,26 @@ type Share struct {
 	// Access maps a peer's Ed25519 public key (hex) to its pending, granted,
 	// denied, or revoked access state.
 	Access map[string]string
+	Safety Safety
+}
+
+// Safety is one share's or subscription's settings for holds and the trash
+// (see GLOSSARY.md). Each node sets its own; nothing here is negotiated
+// with peers, because the point is to protect this node from theirs. A zero
+// field means "use the default"; Config.SafetyFor resolves them.
+type Safety struct {
+	// A single change that would delete at least HoldDeletePercent percent
+	// of the share's live files, and at least HoldDeleteMin of them, is a
+	// bulk delete and puts the share on hold.
+	HoldDeletePercent int
+	HoldDeleteMin     int
+
+	// The trash keeps an event until it is TrashRetentionDays old or the
+	// trash outgrows TrashMaxSize, whichever comes first. TrashMaxSize is a
+	// percentage of the share's live size ("25%") or an absolute size
+	// ("2GiB"); see ParseTrashMaxSize.
+	TrashRetentionDays int
+	TrashMaxSize       string
 }
 
 // NewShareID returns a random 8-byte hex-encoded (16 character) share id,
@@ -107,6 +135,7 @@ type Subscription struct {
 	LocalPath string
 	Mode      string
 	Paused    bool
+	Safety    Safety
 }
 
 // Default returns a Config populated with the documented defaults and an
@@ -159,6 +188,9 @@ func (c *Config) Validate() error {
 		if s.Path != "" && !filepath.IsAbs(s.Path) {
 			errs = append(errs, fmt.Errorf("share[%d] (%s): path %q must be absolute", i, s.Name, s.Path))
 		}
+		if err := s.Safety.Validate(); err != nil {
+			errs = append(errs, fmt.Errorf("share[%d] (%s): %w", i, s.Name, err))
+		}
 	}
 
 	for i, sub := range c.Subscriptions {
@@ -169,6 +201,9 @@ func (c *Config) Validate() error {
 		if sub.LocalPath != "" && !filepath.IsAbs(sub.LocalPath) {
 			errs = append(errs, fmt.Errorf("subscription[%d] (peer %s, share %s): local path %q must be absolute",
 				i, sub.Peer, sub.ShareID, sub.LocalPath))
+		}
+		if err := sub.Safety.Validate(); err != nil {
+			errs = append(errs, fmt.Errorf("subscription[%d] (peer %s, share %s): %w", i, sub.Peer, sub.ShareID, err))
 		}
 	}
 
@@ -238,16 +273,28 @@ type shareDoc struct {
 	Permission       string            `json:"permission"`
 	ApprovalRequired bool              `json:"approval_required"`
 	Access           map[string]string `json:"access,omitempty"`
+	safetyDoc
 }
 
-// subscriptionDoc mirrors Subscription 1:1 (no fields need
-// pointer-defaulting), so the two convert with a plain type conversion.
+// subscriptionDoc mirrors Subscription, with Safety flattened into it the
+// same way shareDoc does.
 type subscriptionDoc struct {
 	Peer      string `json:"peer"`
 	ShareID   string `json:"share_id"`
 	LocalPath string `json:"local_path"`
 	Mode      string `json:"mode"`
 	Paused    bool   `json:"paused"`
+	safetyDoc
+}
+
+// safetyDoc mirrors Safety 1:1. It is embedded, so its keys sit directly on
+// the share or subscription object, and every one is omitted while it holds
+// the "use the default" zero value.
+type safetyDoc struct {
+	HoldDeletePercent  int    `json:"hold_delete_percent,omitempty"`
+	HoldDeleteMin      int    `json:"hold_delete_min,omitempty"`
+	TrashRetentionDays int    `json:"trash_retention_days,omitempty"`
+	TrashMaxSize       string `json:"trash_max_size,omitempty"`
 }
 
 // Marshal encodes cfg as indented JSON (config.json stays hand-editable).
@@ -296,10 +343,14 @@ func configToDoc(cfg *Config) *configDoc {
 			Permission:       s.Permission,
 			ApprovalRequired: s.ApprovalRequired,
 			Access:           s.Access,
+			safetyDoc:        safetyDoc(s.Safety),
 		})
 	}
 	for _, sub := range cfg.Subscriptions {
-		doc.Subscriptions = append(doc.Subscriptions, subscriptionDoc(sub))
+		doc.Subscriptions = append(doc.Subscriptions, subscriptionDoc{
+			Peer: sub.Peer, ShareID: sub.ShareID, LocalPath: sub.LocalPath,
+			Mode: sub.Mode, Paused: sub.Paused, safetyDoc: safetyDoc(sub.Safety),
+		})
 	}
 	return doc
 }
@@ -331,10 +382,14 @@ func docToConfig(doc *configDoc) *Config {
 			Permission:       s.Permission,
 			ApprovalRequired: s.ApprovalRequired,
 			Access:           s.Access,
+			Safety:           Safety(s.safetyDoc),
 		})
 	}
 	for _, sub := range doc.Subscriptions {
-		cfg.Subscriptions = append(cfg.Subscriptions, Subscription(sub))
+		cfg.Subscriptions = append(cfg.Subscriptions, Subscription{
+			Peer: sub.Peer, ShareID: sub.ShareID, LocalPath: sub.LocalPath,
+			Mode: sub.Mode, Paused: sub.Paused, Safety: Safety(sub.safetyDoc),
+		})
 	}
 	return cfg
 }

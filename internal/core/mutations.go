@@ -597,6 +597,61 @@ func (n *Node) PauseSubscription(peerRef, shareRef string, paused bool) error {
 	return nil
 }
 
+// SetSafety replaces the hold and trash settings of a share this node
+// offers or subscribes to (see config.Safety; zero fields mean "use the
+// default"). It returns the settings now in force, defaults filled in.
+// They are read fresh by every scan, reconcile pass, and trash sweep, so
+// nothing else needs restarting.
+func (n *Node) SetSafety(shareRef string, s config.Safety) (config.Safety, error) {
+	shareID, err := n.resolveShareOrSubscriptionRef(shareRef)
+	if err != nil {
+		return config.Safety{}, fmt.Errorf("core: set safety: %w", err)
+	}
+	if err := s.Validate(); err != nil {
+		return config.Safety{}, mutationError(MutationInvalid, fmt.Errorf("core: set safety: %w", err))
+	}
+	cfg, err := n.mutateConfig(func(cfg *config.Config) error {
+		found := false
+		if i := findShareIndex(cfg, shareID); i >= 0 {
+			cfg.Shares[i].Safety, found = s, true
+		}
+		for i := range cfg.Subscriptions {
+			if cfg.Subscriptions[i].ShareID == shareID {
+				cfg.Subscriptions[i].Safety, found = s, true
+			}
+		}
+		if !found {
+			return mutationErrorf(MutationNotFound, "share %s is not a local share or subscription", shareID)
+		}
+		return nil
+	})
+	if err != nil {
+		return config.Safety{}, fmt.Errorf("core: set safety: %w", err)
+	}
+	n.debugf("core: share %s safety set to %+v", shareID, s)
+	return cfg.SafetyFor(shareID), nil
+}
+
+// Safety returns the raw (unfilled) settings for a share or subscription,
+// for a caller that wants to change one field and keep the rest.
+func (n *Node) Safety(shareRef string) (config.Safety, error) {
+	shareID, err := n.resolveShareOrSubscriptionRef(shareRef)
+	if err != nil {
+		return config.Safety{}, fmt.Errorf("core: safety: %w", err)
+	}
+	n.cfgMu.RLock()
+	defer n.cfgMu.RUnlock()
+	if i := findShareIndex(n.cfg, shareID); i >= 0 {
+		return n.cfg.Shares[i].Safety, nil
+	}
+	for _, sub := range n.cfg.Subscriptions {
+		if sub.ShareID == shareID {
+			return sub.Safety, nil
+		}
+	}
+	return config.Safety{}, mutationErrorf(MutationNotFound, "share %s is not a local share or subscription", shareID)
+}
+
 // --- node mutation -----------------------------------------------------------
 
 // RenameNode changes this node's display name, persisting it and
