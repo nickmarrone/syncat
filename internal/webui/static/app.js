@@ -63,7 +63,9 @@ const state = {
   pollTimer: null,
 };
 
-const trashState = { shareId: null, entries: [], error: null };
+// Each share's trash, fetched only while its panel is open (see
+// renderTrashPanel) and refreshed on every poll, keyed by share id.
+const trashState = { data: {}, errors: {}, filters: {} };
 
 // Purely presentational state: which disclosures are open. It lives
 // outside `state` because nothing here comes from (or goes back to) the
@@ -72,6 +74,10 @@ const trashState = { shareId: null, entries: [], error: null };
 const ui = {
   tokenExpanded: false,
   expandedPeers: new Set(),
+  // Share ids whose trash panel is open, and trash events whose file list
+  // is open (keyed "<share id>/<event id>").
+  expandedTrash: new Set(),
+  expandedEvents: new Set(),
 };
 
 // --- API client ------------------------------------------------------------
@@ -137,6 +143,7 @@ async function pollStatus() {
   } catch (err) {
     state.statusError = err.message || String(err);
   }
+  await Promise.all(Array.from(ui.expandedTrash).map(fetchTrash));
   render();
 }
 
@@ -747,6 +754,7 @@ function renderShareItem(share) {
 
   card.append(el('h3', {}, 'Peer access'));
   card.append(renderShareAccessList(share));
+  card.append(renderTrashPanel(share.id, share.safety));
   return card;
 }
 
@@ -786,83 +794,192 @@ function renderSubscriptionItem(sub) {
     });
   });
 
-  return el('li', { class: 'list-item' }, [
-    left,
-    el('div', { class: 'row' }, [el('label', { class: 'checkbox-row' }, [pauseCheckbox, 'Paused']), removeBtn]),
+  return el('li', { class: 'list-item subscription-item' }, [
+    el('div', { class: 'row between' }, [
+      left,
+      el('div', { class: 'row' }, [el('label', { class: 'checkbox-row' }, [pauseCheckbox, 'Paused']), removeBtn]),
+    ]),
+    renderTrashPanel(sub.share_id, sub.safety),
   ]);
 }
 
-async function loadTrash(shareId) {
-  trashState.shareId = shareId || null;
-  trashState.error = null;
-  if (!shareId) {
-    trashState.entries = [];
-    render();
-    return;
-  }
+// --- trash and safety settings (see GLOSSARY.md) --------------------------
+
+async function fetchTrash(shareId) {
   try {
-    const data = await apiGet('/api/shares/' + encodeURIComponent(shareId) + '/trash');
-    trashState.entries = data.entries || [];
+    trashState.data[shareId] = await apiGet('/api/shares/' + encodeURIComponent(shareId) + '/trash');
+    delete trashState.errors[shareId];
   } catch (err) {
-    trashState.error = err.message;
-    trashState.entries = [];
+    trashState.errors[shareId] = err.message;
   }
-  render();
 }
 
-function renderTrashSection(status) {
-  const card = el('div', { class: 'card' });
-  card.append(el('h2', {}, 'Trash'));
-  const shares = status.shares || [];
-  if (shares.length === 0) {
-    card.append(el('p', { class: 'faint' }, 'Add a share to browse its trash.'));
-    return card;
-  }
-  const select = el('select', {}, [el('option', { value: '' }, 'Select a share…')].concat(
-    shares.map((s) => {
-      const opt = el('option', { value: s.id }, s.name);
-      if (trashState.shareId === s.id) opt.selected = true;
-      return opt;
-    })
-  ));
-  select.addEventListener('change', () => loadTrash(select.value));
-  card.append(select);
+const trashVerbs = { deleted: 'deleted', overwritten: 'overwrote', migrated: 'moved over', '': 'kept' };
 
-  if (trashState.shareId) {
-    if (trashState.error) {
-      card.append(el('div', { class: 'error-banner' }, [el('span', {}, trashState.error)]));
-    } else if (trashState.entries.length === 0) {
-      card.append(el('p', { class: 'empty-state' }, 'Trash is empty.'));
-    } else {
-      const tbody = el('tbody');
-      for (const entry of trashState.entries) {
-        const restoreBtn = el('button', {}, 'Restore');
+function countWord(n, word) {
+  return n + ' ' + word + (n === 1 ? '' : 's');
+}
+
+/** "laptop deleted 14 files, overwrote 1 file" and the like. */
+function describeTrashEvent(ev) {
+  const counts = {};
+  for (const it of ev.items) counts[it.kind || ''] = (counts[it.kind || ''] || 0) + 1;
+  if (ev.source === 'restore') return 'A restore replaced ' + countWord(ev.items.length, 'file');
+  if (ev.source === 'migrated') return countWord(ev.items.length, 'file') + ' from the old trash';
+  const parts = [];
+  for (const kind of ['deleted', 'overwritten', 'migrated', '']) {
+    if (counts[kind]) parts.push(trashVerbs[kind] + ' ' + countWord(counts[kind], 'file'));
+  }
+  const who = (ev.label || '').replace(/^from /, '') || 'A peer';
+  return who + ' ' + parts.join(', ');
+}
+
+async function undoTrash(shareId, ev, paths) {
+  try {
+    const res = await apiPost('/api/shares/' + encodeURIComponent(shareId) + '/trash/undo', { event: ev.id, paths: paths || [] });
+    showToast('Restored ' + countWord((res && res.restored || []).length, 'file'));
+  } catch (err) {
+    showToast('Failed to restore: ' + err.message, true);
+  }
+  await fetchTrash(shareId);
+  await pollStatus();
+}
+
+/** The event list, filtered. Rebuilt in place when the filter changes,
+ * since render() skips its rebuild while the filter box has focus. */
+function renderTrashEvents(shareId, list) {
+  const data = trashState.data[shareId];
+  const filter = (trashState.filters[shareId] || '').toLowerCase();
+  list.replaceChildren();
+  let shown = 0;
+  for (const ev of data.events || []) {
+    const items = filter ? ev.items.filter((it) => it.rel_path.toLowerCase().includes(filter)) : ev.items;
+    if (items.length === 0) continue;
+    shown++;
+    const key = shareId + '/' + ev.id;
+    const open = ui.expandedEvents.has(key) || !!filter;
+
+    const toggle = el('button', { class: 'link', 'aria-expanded': open ? 'true' : 'false' }, (open ? '▾ ' : '▸ ') + describeTrashEvent(ev));
+    toggle.addEventListener('click', () => {
+      if (ui.expandedEvents.has(key)) ui.expandedEvents.delete(key);
+      else ui.expandedEvents.add(key);
+      renderTrashEvents(shareId, list);
+    });
+    const undoBtn = el('button', {}, items.length === ev.items.length ? 'Undo' : 'Restore ' + countWord(items.length, 'match'));
+    undoBtn.addEventListener('click', async () => {
+      undoBtn.disabled = true;
+      await undoTrash(shareId, ev, items.length === ev.items.length ? [] : items.map((it) => it.rel_path));
+    });
+
+    const row = el('li', { class: 'trash-event' }, [
+      el('div', { class: 'row between' }, [
+        el('div', { class: 'stack' }, [toggle, el('span', { class: 'faint' }, formatTime(ev.at) + ' · ' + formatBytes(ev.size))]),
+        undoBtn,
+      ]),
+    ]);
+    if (open) {
+      const files = el('ul', { class: 'plain trash-files' });
+      for (const it of items) {
+        const restoreBtn = el('button', { class: 'small' }, 'Restore');
         restoreBtn.addEventListener('click', async () => {
           restoreBtn.disabled = true;
-          try {
-            await apiPost('/api/shares/' + encodeURIComponent(trashState.shareId) + '/trash/restore', { rel_path: entry.rel_path });
-            showToast('Restored ' + entry.rel_path);
-            await loadTrash(trashState.shareId);
-          } catch (err) {
-            showToast('Failed to restore: ' + err.message, true);
-            restoreBtn.disabled = false;
-          }
+          await undoTrash(shareId, ev, [it.rel_path]);
         });
-        tbody.append(el('tr', {}, [
-          el('td', { class: 'mono' }, entry.rel_path),
-          el('td', {}, formatTime(entry.trashed_at)),
-          el('td', {}, formatBytes(entry.size)),
-          el('td', {}, restoreBtn),
+        files.append(el('li', { class: 'row between' }, [
+          el('span', {}, [el('span', { class: 'mono' }, it.rel_path), el('span', { class: 'faint' }, ' · ' + (trashVerbs[it.kind || ''] || it.kind) + ' · ' + formatBytes(it.size))]),
+          restoreBtn,
         ]));
       }
-      const table = el('table', { class: 'trash-table' }, [
-        el('thead', {}, el('tr', {}, [el('th', {}, 'Path'), el('th', {}, 'Trashed at'), el('th', {}, 'Size'), el('th', {}, '')])),
-        tbody,
-      ]);
-      card.append(el('div', { class: 'table-wrap' }, table));
+      row.append(files);
+    }
+    list.append(row);
+  }
+  if (shown === 0) {
+    list.append(el('li', { class: 'empty-state' }, filter ? 'Nothing in the trash matches.' : 'The trash is empty.'));
+  }
+}
+
+function renderSafetyForm(shareId, safety) {
+  const num = (value) => {
+    const input = el('input', { type: 'number', min: '1', class: 'narrow' });
+    input.value = value;
+    return input;
+  };
+  const percent = num(safety.hold_delete_percent);
+  percent.max = '100';
+  const min = num(safety.hold_delete_min);
+  const days = num(safety.trash_retention_days);
+  const maxSize = el('input', { type: 'text', class: 'narrow', placeholder: '25% or 2GiB' });
+  maxSize.value = safety.trash_max_size;
+  const saveBtn = el('button', {}, 'Save');
+  saveBtn.addEventListener('click', async () => {
+    saveBtn.disabled = true;
+    try {
+      await apiPatch('/api/shares/' + encodeURIComponent(shareId) + '/safety', {
+        hold_delete_percent: Number(percent.value),
+        hold_delete_min: Number(min.value),
+        trash_retention_days: Number(days.value),
+        trash_max_size: maxSize.value.trim(),
+      });
+      showToast('Settings saved');
+      await fetchTrash(shareId);
+      await pollStatus();
+    } catch (err) {
+      showToast('Failed to save settings: ' + err.message, true);
+    } finally {
+      saveBtn.disabled = false;
+    }
+  });
+  return el('div', { class: 'safety-form' }, [
+    el('div', { class: 'row' }, ['Hold a change that deletes at least', percent, '% and at least', min, 'files.']),
+    el('div', { class: 'row' }, ['Keep trash for up to', days, 'days, and at most', maxSize, '.', saveBtn]),
+  ]);
+}
+
+/** A share's (or subscription's) trash and safety settings, behind a
+ * disclosure so the trash is only fetched when someone looks at it. */
+function renderTrashPanel(shareId, safety) {
+  const open = ui.expandedTrash.has(shareId);
+  const toggle = el('button', { class: 'link', 'aria-expanded': open ? 'true' : 'false' }, (open ? '▾ ' : '▸ ') + 'Trash and safety');
+  toggle.addEventListener('click', async () => {
+    if (ui.expandedTrash.has(shareId)) {
+      ui.expandedTrash.delete(shareId);
+    } else {
+      ui.expandedTrash.add(shareId);
+      await fetchTrash(shareId);
+    }
+    render();
+  });
+  const panel = el('div', { class: 'trash-panel' }, toggle);
+  if (!open) return panel;
+
+  if (trashState.errors[shareId]) {
+    panel.append(el('div', { class: 'error-banner' }, [el('span', {}, trashState.errors[shareId])]));
+  }
+  const data = trashState.data[shareId];
+  if (data) {
+    panel.append(el('p', { class: 'faint' },
+      'Files a peer deleted or overwrote here. They are also in the folder itself, under .syncat/trash/. The trash is an undo, not a backup.'));
+    const filter = el('input', { type: 'search', placeholder: 'Find a file…', class: 'trash-filter' });
+    filter.value = trashState.filters[shareId] || '';
+    const list = el('ul', { class: 'plain' });
+    filter.addEventListener('input', () => {
+      trashState.filters[shareId] = filter.value;
+      renderTrashEvents(shareId, list);
+    });
+    if ((data.events || []).length > 0) panel.append(filter);
+    renderTrashEvents(shareId, list);
+    panel.append(list);
+
+    const usage = 'Using ' + formatBytes(data.size) + ' of ' + formatBytes(data.limit) + '; changes are kept up to ' + countWord(data.retention_days, 'day') + '.';
+    if (data.size > data.limit) {
+      panel.append(el('div', { class: 'warn-banner' }, usage + ' Over the limit: the oldest changes go at the next hourly sweep, the newest is always kept.'));
+    } else {
+      panel.append(el('p', { class: 'faint' }, usage));
     }
   }
-  return card;
+  if (safety) panel.append(renderSafetyForm(shareId, safety));
+  return panel;
 }
 
 function renderShares(status) {
@@ -890,8 +1007,6 @@ function renderShares(status) {
     subsSection.append(el('div', { class: 'card' }, list));
   }
   wrap.append(subsSection);
-
-  wrap.append(renderTrashSection(status));
   return wrap;
 }
 
@@ -940,10 +1055,14 @@ function updateConnIndicator() {
 function describeHold(h) {
   const share = h.share_name || h.share_id;
   const from = h.peer_key ? 'Changes from ' + peerLabel(h.peer_key, h.peer_name) + ' to ' : '';
+  const subject = from ? from + '"' + share + '" are' : '"' + share + '" is';
   if (h.reason === 'root-unavailable') {
-    return from + '"' + share + '" are on hold: the folder is missing or unreadable. Restore it, or remove the share.';
+    return subject + ' on hold: the folder is missing or unreadable. Restore it, or remove the share.';
   }
-  return from + '"' + share + '" ' + (h.peer_key ? 'are' : 'is') + ' on hold: ' + h.deletes + ' of ' + h.live +
+  if (h.reason === 'reserved-dir-taken') {
+    return subject + ' on hold: the folder has a .syncat directory that syncat did not create. Move it away.';
+  }
+  return subject + ' on hold: ' + h.deletes + ' of ' + h.live +
     ' files would be deleted. Nothing is synced until you fix the folder or let the deletes through.';
 }
 
