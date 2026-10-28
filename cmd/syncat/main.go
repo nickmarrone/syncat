@@ -26,7 +26,7 @@ var commands = []command{
 	{name: "token", usage: "syncat token", summary: "print this node's connection token", run: cmdToken},
 	{name: "peer", usage: "syncat peer add TOKEN [--name N] | ls | rm ID | approve ID", summary: "manage peers (ID: name, key, or key prefix)", run: cmdPeer},
 	{name: "status", usage: "syncat status [--watch] [--json]", summary: "show node, peer and share status", run: cmdStatus},
-	{name: "share", usage: "syncat share add PATH --name N [--perm ro|rw] [--approval] | ls | rm ID | set ID [...]", summary: "manage local shares (ID: name, id, or id prefix)", run: cmdShare},
+	{name: "share", usage: "syncat share add PATH --name N [--perm ro|rw] [--approval] | ls | rm ID | set ID [...] | safety SHARE [...] | confirm-deletes SHARE [--peer P]", summary: "manage local shares, holds and safety settings (ID: name, id, or id prefix)", run: cmdShare},
 	{name: "remote", usage: "syncat remote ls", summary: "list peers' offered shares", run: cmdRemote},
 	{name: "subscription", usage: "syncat subscription add PEER SHARE LOCALPATH [--mode mirror|receive] | ls | rm PEER SHARE | pause PEER SHARE | resume PEER SHARE", summary: "manage subscriptions to peers' shares (PEER/SHARE: name, id, or id prefix)", run: cmdSubscription},
 	{name: "approvals", usage: "syncat approvals [grant|deny ID]", summary: "manage pending peer and share approvals", run: cmdApprovals},

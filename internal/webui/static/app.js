@@ -935,6 +935,47 @@ function updateConnIndicator() {
   }
 }
 
+// --- holds (see GLOSSARY.md) ----------------------------------------------
+
+function describeHold(h) {
+  const share = h.share_name || h.share_id;
+  const from = h.peer_key ? 'Changes from ' + peerLabel(h.peer_key, h.peer_name) + ' to ' : '';
+  if (h.reason === 'root-unavailable') {
+    return from + '"' + share + '" are on hold: the folder is missing or unreadable. Restore it, or remove the share.';
+  }
+  return from + '"' + share + '" ' + (h.peer_key ? 'are' : 'is') + ' on hold: ' + h.deletes + ' of ' + h.live +
+    ' files would be deleted. Nothing is synced until you fix the folder or let the deletes through.';
+}
+
+/** One banner per hold, on every page: a held share syncs nothing at
+ * all, which is not something to discover by visiting the right tab. */
+function renderHoldBanners(status) {
+  const holds = status.holds || [];
+  if (holds.length === 0) return null;
+  const wrap = el('div', { class: 'stack' });
+  for (const h of holds) {
+    const row = el('div', { class: 'hold-banner' }, [el('span', {}, describeHold(h))]);
+    if (h.confirmable) {
+      const btn = el('button', { class: 'danger' }, 'Let the deletes through');
+      btn.addEventListener('click', () => {
+        confirmThen('Delete ' + h.deletes + ' file(s) from "' + (h.share_name || h.share_id) + '"' +
+          (h.peer_key ? ' on this node' : ' on every peer') + '? They go to the trash first.', async () => {
+          try {
+            await apiPost('/api/shares/' + encodeURIComponent(h.share_id) + '/holds/confirm', { peer: h.peer_key || '' });
+            showToast('Deletes confirmed');
+            await pollStatus();
+          } catch (err) {
+            showToast('Failed to confirm: ' + err.message, true);
+          }
+        });
+      });
+      row.append(btn);
+    }
+    wrap.append(row);
+  }
+  return wrap;
+}
+
 function renderFatal(message) {
   const app = document.getElementById('app');
   app.replaceChildren(el('div', { class: 'error-banner' }, [el('span', {}, message)]));
@@ -967,6 +1008,8 @@ function render() {
   if (state.statusError) {
     frag.append(el('div', { class: 'error-banner' }, [el('span', {}, 'Lost connection to the daemon: ' + state.statusError)]));
   }
+  const holds = renderHoldBanners(state.status);
+  if (holds) frag.append(holds);
   if (route === '/shares') frag.append(renderShares(state.status));
   else frag.append(renderDashboard(state.status));
 

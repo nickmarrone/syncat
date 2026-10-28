@@ -633,6 +633,14 @@ func printStatus(c *apiClient, asJSON bool) error {
 	fmt.Printf("uptime:   %s\n", time.Duration(st.UptimeSeconds*float64(time.Second)).Round(time.Second))
 	fmt.Println()
 
+	if len(st.Holds) > 0 {
+		fmt.Printf("ON HOLD (%d):\n", len(st.Holds))
+		for _, h := range st.Holds {
+			fmt.Printf("  %s\n", describeHold(h))
+		}
+		fmt.Println()
+	}
+
 	fmt.Printf("peers (%d):\n", len(st.Peers))
 	for _, p := range st.Peers {
 		fmt.Printf("  %-20s %s\tstate=%s\n", p.Name, p.ID, p.State)

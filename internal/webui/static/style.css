@@ -486,6 +486,20 @@ button.link:hover {
   margin-bottom: 0.5rem;
 }
 
+.hold-banner {
+  background: var(--warn-bg);
+  color: var(--warn);
+  border: 1px solid var(--warn);
+  border-radius: var(--radius);
+  padding: 0.75em 1em;
+  margin-bottom: 1rem;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 0.75rem 1rem;
+  align-items: center;
+}
+
 .toast-stack {
   position: fixed;
   bottom: 1rem;

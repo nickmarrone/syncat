@@ -62,6 +62,19 @@ type ShareConfig struct {
 	// internal/core resolves the closure against the share's current matcher
 	// on every call.
 	Ignore func(relpath string, isDir bool) bool
+
+	// Guard is asked before a reconcile pass applies anything. deletes is how
+	// many files the pass would delete and live how many live files the share
+	// holds locally. Returning false skips the whole pass: nothing is applied
+	// and nothing is reported back. internal/core uses it to put a peer's
+	// bulk delete on hold, and to stop every peer's changes while this
+	// node's own copy of the share is on hold (see GLOSSARY.md). nil allows
+	// every pass.
+	//
+	// The peer's rows are already recorded in peer_files when Guard says no,
+	// so a later ReconcileShare (after the user confirms) applies exactly
+	// what was held, without waiting for the peer to resend it.
+	Guard func(deletes, live int) bool
 }
 
 // ignored calls Ignore after checking it for nil.
@@ -1310,6 +1323,13 @@ func (s *Session) reconcileLocked(ctx context.Context, cfg ShareConfig, why stri
 	}
 
 	actions := Reconcile(rowsToInfos(localRows), rowsToInfos(remoteRows), s.nodeID, cfg.Direction, s.clock, cfg.Ignore)
+	if cfg.Guard != nil {
+		deletes, live := countLiveFileDeletes(actions, localRows)
+		if !cfg.Guard(deletes, live) {
+			s.debugf("reconcile %s (%s) skipped: share is on hold (%d of %d file(s) would be deleted)", shareID, why, deletes, live)
+			return
+		}
+	}
 
 	var mu sync.Mutex
 	var changed []index.FileRow
@@ -1356,6 +1376,27 @@ func (s *Session) reconcileLocked(ctx context.Context, cfg ShareConfig, why stri
 	if len(counts) > 0 {
 		s.debugf("reconciled %s (%s): %s", shareID, why, formatActionCounts(counts))
 	}
+}
+
+// countLiveFileDeletes returns how many of the share's live local files
+// (live) the actions would delete (deletes). Directories are left out of
+// both counts: a directory only goes once it is empty, so its files have
+// already been counted. So are deletes of paths that are not live here (a
+// tombstone for a file this node never had, or two tombstones merging),
+// because they remove nothing.
+func countLiveFileDeletes(actions []Action, localRows []index.FileRow) (deletes, live int) {
+	liveFiles := make(map[string]bool, len(localRows))
+	for _, r := range localRows {
+		if !r.Deleted && r.Type != protocol.FileTypeDir {
+			liveFiles[r.RelPath] = true
+		}
+	}
+	for _, a := range actions {
+		if a.Kind == ActionDelete && liveFiles[a.RelPath] {
+			deletes++
+		}
+	}
+	return deletes, len(liveFiles)
 }
 
 // runActionWorkers applies an arbitrarily large reconciliation plan with a

@@ -209,6 +209,26 @@ type subscriptionView struct {
 	Warnings  []warningView `json:"warnings"`
 }
 
+type safetyView struct {
+	HoldDeletePercent  int    `json:"hold_delete_percent"`
+	HoldDeleteMin      int    `json:"hold_delete_min"`
+	TrashRetentionDays int    `json:"trash_retention_days"`
+	TrashMaxSize       string `json:"trash_max_size"`
+}
+
+type holdView struct {
+	ShareID     string    `json:"share_id"`
+	ShareName   string    `json:"share_name"`
+	PeerKey     string    `json:"peer_key"`
+	PeerName    string    `json:"peer_name"`
+	Reason      string    `json:"reason"`
+	Deletes     int       `json:"deletes"`
+	Live        int       `json:"live"`
+	Since       time.Time `json:"since"`
+	Confirmed   bool      `json:"confirmed"`
+	Confirmable bool      `json:"confirmable"`
+}
+
 type rejectedView struct {
 	PeerKey  string    `json:"peer_key"`
 	PeerName string    `json:"peer_name"`
@@ -236,6 +256,7 @@ type statusView struct {
 	Shares        []shareView        `json:"shares"`
 	RemoteShares  []remoteShareView  `json:"remote_shares"`
 	Subscriptions []subscriptionView `json:"subscriptions"`
+	Holds         []holdView         `json:"holds"`
 	Rejected      []rejectedView     `json:"rejected_connections"`
 	Network       map[string]any     `json:"network"`
 }

@@ -14,7 +14,7 @@ import (
 // cmdShare implements `syncat share add|ls|rm|set` (SPEC.md §8).
 func cmdShare(paths *config.Paths, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: syncat share add PATH --name N [--perm ro|rw] [--approval] | ls | rm ID | set ID [...]")
+		return fmt.Errorf("usage: syncat share add PATH --name N [--perm ro|rw] [--approval] | ls | rm ID | set ID [...] | safety SHARE [...] | confirm-deletes SHARE [--peer P]")
 	}
 	sub, rest := args[0], args[1:]
 	switch sub {
@@ -26,8 +26,12 @@ func cmdShare(paths *config.Paths, args []string) error {
 		return cmdShareRm(paths, rest)
 	case "set":
 		return cmdShareSet(paths, rest)
+	case "safety":
+		return cmdShareSafety(paths, rest)
+	case "confirm-deletes":
+		return cmdShareConfirmDeletes(paths, rest)
 	default:
-		return fmt.Errorf("unknown share subcommand %q (want add, ls, rm, or set)", sub)
+		return fmt.Errorf("unknown share subcommand %q (want add, ls, rm, set, safety, or confirm-deletes)", sub)
 	}
 }
 
