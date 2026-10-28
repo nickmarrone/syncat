@@ -98,13 +98,16 @@ func (p *Paths) DBDir() string { return filepath.Join(p.DataDir, "db") }
 // DBFile returns the path to the SQLite index database.
 func (p *Paths) DBFile() string { return filepath.Join(p.DBDir(), "index.db") }
 
-// TrashDir returns the root of the trash can (subdirectories per share).
-func (p *Paths) TrashDir() string { return filepath.Join(p.DataDir, "trash") }
+// LegacyTrashDir is where versions before the trash moved into each share
+// kept it (one subdirectory per share). Nothing writes it any more; it is
+// read once at startup to move what it holds into the shares, and removed
+// once empty.
+func (p *Paths) LegacyTrashDir() string { return filepath.Join(p.DataDir, "trash") }
 
 // EnsureDirs creates the config dir, data dir, and all data subdirectories,
 // each with mode 0700, if they don't already exist.
 func (p *Paths) EnsureDirs() error {
-	dirs := []string{p.ConfigDir, p.DataDir, p.KeysDir(), p.DBDir(), p.TrashDir()}
+	dirs := []string{p.ConfigDir, p.DataDir, p.KeysDir(), p.DBDir()}
 	for _, dir := range dirs {
 		if err := os.MkdirAll(dir, 0700); err != nil {
 			return fmt.Errorf("config: create directory %s: %w", dir, err)

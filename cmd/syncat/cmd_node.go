@@ -38,7 +38,7 @@ import (
 func cmdInit(paths *config.Paths, args []string) error {
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
 	name := fs.String("name", "", "display name for this node (default: hostname)")
-	reset := fs.Bool("reset", false, "delete this node's config, keys, index and trash, then re-initialize from scratch")
+	reset := fs.Bool("reset", false, "delete this node's config, keys and index, then re-initialize from scratch (shared folders, and the trash inside them, are kept)")
 	yes := fs.Bool("yes", false, "skip the --reset confirmation prompt (for scripts)")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -242,8 +242,9 @@ func userLabel(uid int) string {
 // worse operation than deleting the files we wrote into it.
 //
 // The three directories go whole: that is what takes index.db's -wal and
-// -shm sidecars and the per-share trash subtrees without enumerating
-// them. The .tmp-* glob covers writeFileAtomic's leftovers from a crashed
+// -shm sidecars and the old data-dir trash (see LegacyTrashDir) without
+// enumerating them. Each share's own trash, in its .syncat/, is left with
+// the share's files. The .tmp-* glob covers writeFileAtomic's leftovers from a crashed
 // write, since the config dir is the one we don't remove outright.
 func resetTargets(p *config.Paths) []string {
 	targets := []string{
@@ -251,7 +252,7 @@ func resetTargets(p *config.Paths) []string {
 		p.APITokenFile(),
 		p.KeysDir(),
 		p.DBDir(),
-		p.TrashDir(),
+		p.LegacyTrashDir(),
 	}
 	// Glob errors only on a malformed pattern, and this one is a literal.
 	tmps, _ := filepath.Glob(filepath.Join(p.ConfigDir, ".tmp-*"))
@@ -441,7 +442,7 @@ const shutdownGrace = 15 * time.Second
 // listener, and runs until SIGINT/SIGTERM, at which point it shuts both
 // down in order: stop accepting new API requests, then close the node
 // (which itself waits for every background goroutine, including the
-// trash janitor and peer sessions, before returning).
+// trash sweeper and peer sessions, before returning).
 func cmdDaemon(paths *config.Paths, args []string) error {
 	fs := flag.NewFlagSet("daemon", flag.ContinueOnError)
 	apiAddr := fs.String("api", "", "API listen address, host:port (default: api_addr from config.json, normally 127.0.0.1:8347)")

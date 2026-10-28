@@ -236,11 +236,27 @@ type rejectedView struct {
 	Reason   string    `json:"reason"`
 }
 
-type trashEntryView struct {
-	ShareID   string    `json:"share_id"`
-	RelPath   string    `json:"rel_path"`
-	TrashedAt time.Time `json:"trashed_at"`
-	Size      int64     `json:"size"`
+type trashView struct {
+	ShareID       string           `json:"share_id"`
+	Events        []trashEventView `json:"events"`
+	Size          int64            `json:"size"`
+	Limit         int64            `json:"limit"`
+	RetentionDays int              `json:"retention_days"`
+}
+
+type trashEventView struct {
+	ID     string          `json:"id"`
+	At     time.Time       `json:"at"`
+	Label  string          `json:"label"`
+	Source string          `json:"source"`
+	Size   int64           `json:"size"`
+	Items  []trashItemView `json:"items"`
+}
+
+type trashItemView struct {
+	RelPath string `json:"rel_path"`
+	Kind    string `json:"kind"`
+	Size    int64  `json:"size"`
 }
 
 type statusView struct {

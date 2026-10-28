@@ -66,6 +66,9 @@ var windowsReservedNames = map[string]bool{
 //   - any element that is (ignoring its own extension) a Windows reserved
 //     device name: CON, PRN, AUX, NUL, COM1-9, LPT1-9
 //   - any element starting with our own temp-file prefix ".syncat.tmp."
+//   - anything inside, or naming, our own ReservedDirName at the root
+//     (".syncat"), where the trash lives: a peer must never be able to
+//     read from it, write into it, or delete it
 //   - paths longer than maxRelPathLen bytes
 //
 // A relpath that passes ValidateRelPath, joined element-by-element onto any
@@ -93,6 +96,9 @@ func ValidateRelPath(relpath string) error {
 		if r == 0 || r < 0x20 || r == 0x7f {
 			return fmt.Errorf("sync: relpath %q contains a control character", relpath)
 		}
+	}
+	if relpath == ReservedDirName || strings.HasPrefix(relpath, ReservedDirName+"/") {
+		return fmt.Errorf("sync: relpath %q is inside syncat's reserved %s directory", relpath, ReservedDirName)
 	}
 
 	for _, elem := range strings.Split(relpath, "/") {

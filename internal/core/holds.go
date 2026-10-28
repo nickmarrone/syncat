@@ -12,6 +12,7 @@ import (
 	"github.com/nickmarrone/syncat/internal/config"
 	"github.com/nickmarrone/syncat/internal/index"
 	"github.com/nickmarrone/syncat/internal/protocol"
+	syncsvc "github.com/nickmarrone/syncat/internal/sync"
 )
 
 // This file is the hold (see GLOSSARY.md): the guard that stops a change
@@ -43,7 +44,18 @@ const (
 	// HoldBulkDelete: the change would delete at least the share's
 	// configured percentage and number of live files.
 	HoldBulkDelete = "bulk-delete"
+
+	// HoldReservedDirTaken: the folder has a .syncat/ that syncat did not
+	// create, so it has nowhere safe to keep the trash. It cannot be
+	// confirmed; it clears once that directory is moved away.
+	HoldReservedDirTaken = "reserved-dir-taken"
 )
+
+// holdConfirmable reports whether a hold with reason has a change the user
+// can let through.
+func holdConfirmable(reason string) bool {
+	return reason != HoldRootUnavailable && reason != HoldReservedDirTaken
+}
 
 // holdKey identifies one held link: a share, and either a peer's hex key
 // or "" for this node's own scans.
@@ -292,7 +304,7 @@ func (n *Node) Holds() []HoldStatus {
 		hs := HoldStatus{
 			ShareID: h.ShareID, ShareName: n.shareDisplayName(h.ShareID),
 			PeerKey: h.PeerKey, Reason: h.Reason, Deletes: h.Deletes, Live: h.Live,
-			Since: h.Since, Confirmed: h.Confirmed, Confirmable: h.Reason != HoldRootUnavailable,
+			Since: h.Since, Confirmed: h.Confirmed, Confirmable: holdConfirmable(h.Reason),
 		}
 		if pc := n.lookupPeer(h.PeerKey); pc != nil {
 			hs.PeerName = pc.name
@@ -365,8 +377,11 @@ func (n *Node) ConfirmHold(ctx context.Context, shareRef, peerRef string) (HoldS
 	default:
 		return HoldStatus{}, mutationErrorf(MutationInvalid, "share %s has %d holds; name the peer whose changes to confirm", shareID, len(candidates))
 	}
-	if h.Reason == HoldRootUnavailable {
+	switch h.Reason {
+	case HoldRootUnavailable:
 		return HoldStatus{}, mutationErrorf(MutationInvalid, "share %s is on hold because its folder is missing or unreadable; there is nothing to confirm. Restore the folder, or remove the share", shareID)
+	case HoldReservedDirTaken:
+		return HoldStatus{}, mutationErrorf(MutationInvalid, "share %s is on hold because its folder already has a %s directory that syncat did not create; there is nothing to confirm. Move that directory away", shareID, syncsvc.ReservedDirName)
 	}
 
 	h.Confirmed = true

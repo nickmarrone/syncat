@@ -70,7 +70,7 @@ func TestPathsDerivedFiles(t *testing.T) {
 		{"TailcatKeyFile", p.TailcatKeyFile(), filepath.Join("/data", "keys", "tailcat.key")},
 		{"DBDir", p.DBDir(), filepath.Join("/data", "db")},
 		{"DBFile", p.DBFile(), filepath.Join("/data", "db", "index.db")},
-		{"TrashDir", p.TrashDir(), filepath.Join("/data", "trash")},
+		{"LegacyTrashDir", p.LegacyTrashDir(), filepath.Join("/data", "trash")},
 	}
 	for _, c := range cases {
 		if c.got != c.want {
@@ -89,7 +89,7 @@ func TestEnsureDirsCreatesPrivateDirectories(t *testing.T) {
 		t.Fatalf("EnsureDirs: %v", err)
 	}
 
-	for _, dir := range []string{p.ConfigDir, p.DataDir, p.KeysDir(), p.DBDir(), p.TrashDir()} {
+	for _, dir := range []string{p.ConfigDir, p.DataDir, p.KeysDir(), p.DBDir()} {
 		info, err := os.Stat(dir)
 		if err != nil {
 			t.Fatalf("stat %s: %v", dir, err)

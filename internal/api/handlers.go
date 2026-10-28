@@ -340,43 +340,40 @@ func (s *Server) handleSubscriptionsDelete(w http.ResponseWriter, r *http.Reques
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// --- trash (SPEC.md §7) -----------------------------------------------------
+// --- trash ---------------------------------------------------------------
 
 func (s *Server) handleTrashList(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	entries, err := s.node.ListTrash(id)
+	st, err := s.node.ListTrash(r.Context(), r.PathValue("id"))
 	if err != nil {
 		writeMutationError(w, err)
 		return
 	}
-	out := make([]trashEntryDTO, 0, len(entries))
-	for _, e := range entries {
-		out = append(out, toTrashEntryDTO(e))
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"entries": out})
+	writeJSON(w, http.StatusOK, toTrashDTO(st))
 }
 
-type restoreTrashRequest struct {
-	RelPath string `json:"rel_path"`
+type undoTrashRequest struct {
+	Event string `json:"event"`
+	// Paths limits the undo to these files of the event; empty undoes all
+	// of it.
+	Paths []string `json:"paths"`
 }
 
-func (s *Server) handleTrashRestore(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	var req restoreTrashRequest
+func (s *Server) handleTrashUndo(w http.ResponseWriter, r *http.Request) {
+	var req undoTrashRequest
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	if !requireField(w, "rel_path", req.RelPath) {
+	if !requireField(w, "event", req.Event) {
 		return
 	}
-	row, err := s.node.RestoreTrash(r.Context(), id, req.RelPath)
+	rows, err := s.node.UndoTrash(r.Context(), r.PathValue("id"), req.Event, req.Paths)
 	if err != nil {
 		writeMutationError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"share_id": id,
-		"rel_path": req.RelPath,
-		"version":  row.Version,
-	})
+	restored := make([]string, 0, len(rows))
+	for _, row := range rows {
+		restored = append(restored, row.RelPath)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"restored": restored})
 }

@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -224,6 +225,17 @@ func (n *Node) rescanShare(ctx context.Context, shareID string) error {
 	n.sharesMu.Unlock()
 	if !ok {
 		return fmt.Errorf("core: rescan: %s has no active watch", shareID)
+	}
+
+	// syncat's own .syncat/ must be ours before anything is synced into
+	// the folder: the trash lives there, and a peer's changes would go
+	// into a trash we don't control. Someone else's .syncat/ holds the
+	// share until it is moved out of the way.
+	if err := syncsvc.EnsureReservedDir(sw.root); errors.Is(err, syncsvc.ErrReservedDirTaken) {
+		if err := n.placeHold(index.Hold{ShareID: shareID, Reason: HoldReservedDirTaken, Since: n.clock.Now()}); err != nil {
+			n.logger.Printf("core: hold share %s: %v", shareID, err)
+		}
+		return fmt.Errorf("core: rescan %s: %w", shareID, err)
 	}
 
 	// Pick up any edit to .syncatignore before this scan reads the tree,

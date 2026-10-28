@@ -19,7 +19,7 @@ import (
 
 // safeBuffer is a bytes.Buffer usable as a log sink from the many
 // goroutines a Node runs (peer supervisors, session read loops, the trash
-// janitor) without tripping the race detector.
+// sweeper) without tripping the race detector.
 type safeBuffer struct {
 	mu  sync.Mutex
 	buf bytes.Buffer
@@ -144,58 +144,101 @@ func TestConnectionLifecycleIsLogged(t *testing.T) {
 	})
 }
 
-// --- trash janitor --------------------------------------------------------
+// --- trash sweeps --------------------------------------------------------
 
-// TestTrashSweepIsLogged covers a callback that was previously wired to
-// nil, which made the janitor completely silent: a sweep that failed was
-// discarded with nothing recorded anywhere, and a successful purge deleted
-// the user's last remaining copy of a file with no record it had happened.
+// trashEventAt puts one file into root's trash as an event at at.
+func trashEventAt(t *testing.T, root string, at time.Time, name string) {
+	t.Helper()
+	src := filepath.Join(root, name)
+	if err := os.WriteFile(src, []byte("bye"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ev := syncsvc.NewTrash(func() time.Time { return at }).BeginPeerEvent(root, "peer")
+	if err := ev.Put(context.Background(), name, src, syncsvc.TrashDeleted); err != nil {
+		t.Fatalf("trash put: %v", err)
+	}
+	ev.Close()
+}
+
+// Expiry deletes the user's last copy of a file, so every removal is
+// logged; the common pass that removes nothing stays quiet.
 func TestTrashSweepIsLogged(t *testing.T) {
-	clock := newFakeClock(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+	now := time.Date(2026, 1, 10, 0, 0, 0, 0, time.UTC)
+	clock := newFakeClock(now)
 	n, logs := newLoggingTestNode(t, "nodeA", clock, func(cfg *config.Config) {
 		cfg.TrashRetentionDays = 1
 	})
-
-	// Trash a file, then move the clock past both the retention window and
-	// the janitor's sweep interval so the background loop purges it.
-	src := filepath.Join(t.TempDir(), "doomed.txt")
-	if err := os.WriteFile(src, []byte("bye"), 0o644); err != nil {
-		t.Fatalf("write source: %v", err)
-	}
-	if err := n.trash.Put(context.Background(), "share1", "doomed.txt", src); err != nil {
-		t.Fatalf("trash put: %v", err)
+	root := t.TempDir()
+	if _, err := n.AddShare(root, "docs", config.PermissionReadWrite, false); err != nil {
+		t.Fatal(err)
 	}
 
-	// Wait until the janitor is actually parked on its interval before
-	// advancing, so the tick is never missed.
-	if !clock.waitForWaiterMatching(func(d time.Duration) bool { return d == syncsvc.DefaultJanitorInterval }, 5*time.Second) {
-		t.Fatal("janitor never parked on its sweep interval")
+	trashEventAt(t, root, now.Add(-time.Hour), "fresh.txt")
+	n.sweepTrash()
+	if out := logs.String(); strings.Contains(out, "trash sweep") {
+		t.Errorf("a sweep that removed nothing logged %q", out)
 	}
-	clock.Advance(48 * time.Hour)
 
-	waitFor(t, 5*time.Second, func() bool {
-		return strings.Contains(logs.String(), "trash sweep purged")
-	})
-	if out := logs.String(); !strings.Contains(out, "purged 1 expired entry ") {
-		t.Errorf("sweep line = %q, want it to report exactly 1 entry purged (singular)", out)
+	trashEventAt(t, root, now.Add(-48*time.Hour), "doomed.txt")
+	n.sweepTrash()
+	if out := logs.String(); !strings.Contains(out, "trash sweep removed 1 event from") {
+		t.Errorf("sweep logged %q, want it to report exactly 1 event removed", out)
 	}
 }
 
-// TestTrashSweepQuietWhenNothingPurged: retention deletion is worth a line,
-// but the overwhelmingly common sweep purges nothing, and a daily "purged
-// 0" is exactly the kind of line that trains people to ignore the log.
-func TestTrashSweepQuietWhenNothingPurged(t *testing.T) {
-	n, logs := newLoggingTestNode(t, "nodeA", nil, nil)
-
-	n.onTrashSweep(0, nil)
-	if out := logs.String(); out != "" {
-		t.Errorf("empty sweep logged %q, want nothing", out)
+// The background loop runs the sweep on its interval.
+func TestTrashSweeperRunsOnInterval(t *testing.T) {
+	now := time.Date(2026, 1, 10, 0, 0, 0, 0, time.UTC)
+	clock := newFakeClock(now)
+	n, logs := newLoggingTestNode(t, "nodeA", clock, func(cfg *config.Config) {
+		cfg.TrashRetentionDays = 1
+	})
+	root := t.TempDir()
+	if _, err := n.AddShare(root, "docs", config.PermissionReadWrite, false); err != nil {
+		t.Fatal(err)
 	}
+	trashEventAt(t, root, now.Add(-48*time.Hour), "doomed.txt")
 
-	// A failure is never silent, even with nothing purged.
-	n.onTrashSweep(0, os.ErrPermission)
-	if out := logs.String(); !strings.Contains(out, "trash sweep failed") {
-		t.Errorf("failed sweep logged %q, want a failure line", out)
+	if !clock.waitForWaiterMatching(func(d time.Duration) bool { return d == trashSweepInterval }, 5*time.Second) {
+		t.Fatal("trash sweeper never parked on its interval")
+	}
+	clock.Advance(trashSweepInterval)
+	waitFor(t, 5*time.Second, func() bool { return strings.Contains(logs.String(), "trash sweep removed 1 event") })
+}
+
+// Old data-dir trash is moved into the share's own trash at startup.
+func TestOpenMigratesLegacyTrash(t *testing.T) {
+	root := t.TempDir()
+	var legacy string
+	n, logs := newLoggingTestNode(t, "nodeA", nil, func(cfg *config.Config) {
+		cfg.Shares = []config.Share{{ID: "0123456789abcdef", Name: "docs", Path: root, Permission: config.PermissionReadWrite}}
+	})
+	// The node is already open; seed the old trash and run the migration
+	// the way Open does.
+	legacy = filepath.Join(n.paths.LegacyTrashDir(), "0123456789abcdef")
+	if err := os.MkdirAll(filepath.Join(legacy, "sub"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacy, "sub", "old.txt.1700000000"), []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	n.cfgMu.RLock()
+	cfg := n.cfg
+	n.cfgMu.RUnlock()
+	n.migrateLegacyTrash(cfg)
+
+	st, err := n.ListTrash(context.Background(), "docs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.Events) != 1 || st.Events[0].Items[0].RelPath != "sub/old.txt" {
+		t.Fatalf("trash after migration = %+v, want sub/old.txt", st.Events)
+	}
+	if _, err := os.Stat(n.paths.LegacyTrashDir()); !os.IsNotExist(err) {
+		t.Errorf("old trash dir left behind after everything moved (stat err = %v)", err)
+	}
+	if !strings.Contains(logs.String(), "moved 1 file(s) of old trash") {
+		t.Errorf("migration not logged: %q", logs.String())
 	}
 }
 

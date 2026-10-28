@@ -452,7 +452,7 @@ share_id_of() {
 # peer_id_of NAME PEER is the peer's full hex identity key as NAME knows it,
 # which is what `subscription add` wants.
 peer_id_of() {
-	nx "$1" peer ls --json 2>/dev/null | jq -r --arg p "$2" '.[]? | select(.name==$p) | .id'
+	nx "$1" peer ls --json 2>/dev/null | jq -r --arg p "$2" '.peers[]? | select(.name==$p) | .id'
 }
 
 remote_share_seen() {
@@ -470,7 +470,7 @@ rejected_has() {
 }
 
 trash_has() {
-	[ -n "$(nx "$1" trash ls --json "$2" 2>/dev/null | jq -r --arg r "$3" '.[]? | select(.rel_path==$r) | .rel_path')" ]
+	[ -n "$(nx "$1" trash ls --json "$2" 2>/dev/null | jq -r --arg r "$3" '.events[]?.items[]? | select(.rel_path==$r) | .rel_path')" ]
 }
 
 file_content_is() {

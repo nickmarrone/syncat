@@ -208,6 +208,11 @@ func (sc *Scanner) visit(result *ScanResult, existing map[string]FileRow, seen m
 		return nil
 	}
 
+	if relpath == ReservedDirName && d.IsDir() {
+		// syncat's own directory: never descend, whatever the ignore
+		// rules say about pruning.
+		return fs.SkipDir
+	}
 	if sc.ignore.MatchPath(relpath, d.IsDir()) {
 		sc.noteIgnored(result, existing, seen, relpath)
 		if d.IsDir() && sc.ignore.PruneDirs() {
@@ -520,6 +525,11 @@ func (m *Matcher) Match(relpath string) bool {
 // isDir says whether relpath names a directory, which directory-only
 // patterns ("build/") need in order to match.
 func (m *Matcher) MatchPath(relpath string, isDir bool) bool {
+	// syncat's own directory at the share root, before anything else, and
+	// even for a nil Matcher: it is excluded by what it is, not by a rule.
+	if relpath == ReservedDirName || strings.HasPrefix(relpath, ReservedDirName+"/") {
+		return true
+	}
 	if m == nil {
 		return false
 	}

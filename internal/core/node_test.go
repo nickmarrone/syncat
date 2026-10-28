@@ -157,8 +157,8 @@ func peerToken(t *testing.T, n *Node) string {
 //
 // A single Options.Clock drives every timer Node starts (see core.Clock's
 // doc comment), so the test's own peer-dial backoff waits share this
-// clock with, at minimum, the trash janitor's 24h sweep interval
-// (Node.Open starts the janitor before anything else). isBackoffDelay
+// clock with, at minimum, the hourly trash and journal sweeps (Node.Open
+// starts them before any peer supervisor). isBackoffDelay
 // filters that (and any other coarse, non-backoff interval) out wherever
 // the test inspects recorded/pending delays, so it only ever reasons
 // about the peer supervisor's own schedule.
@@ -182,7 +182,7 @@ type fakeWaiter struct {
 // isBackoffDelay reports whether d could plausibly be one of
 // transport.Backoff's own delays (capped at 5 minutes, SPEC.md §2.2),
 // as opposed to some other subsystem's much coarser timer sharing the
-// same fake clock (e.g. the trash janitor's 24h sweep interval).
+// same fake clock (e.g. the trash sweeper's hourly interval).
 func isBackoffDelay(d time.Duration) bool { return d < time.Hour }
 
 func newFakeClock(start time.Time) *fakeClock {
@@ -621,7 +621,7 @@ func TestBackoffRetryAndRecover(t *testing.T) {
 
 	// First attempt happens immediately (no delay before the very first
 	// dial): wait for it to fail and for Supervisor to register its first
-	// backoff wait (isBackoffDelay excludes the trash janitor's own,
+	// backoff wait (isBackoffDelay excludes the trash sweeper's own,
 	// much coarser, wait on this same shared clock. See fakeClock's doc
 	// comment).
 	if !clock.waitForWaiterMatching(isBackoffDelay, 5*time.Second) {
@@ -1439,11 +1439,11 @@ func TestTrashResolvesShareRef(t *testing.T) {
 	}
 
 	for _, ref := range []string{"test", shareID, shareID[:6]} {
-		if _, err := node.ListTrash(ref); err != nil {
+		if _, err := node.ListTrash(context.Background(), ref); err != nil {
 			t.Errorf("ListTrash(%q): %v", ref, err)
 		}
 	}
-	if _, err := node.ListTrash("nosuchshare"); err == nil {
+	if _, err := node.ListTrash(context.Background(), "nosuchshare"); err == nil {
 		t.Error("ListTrash with an unknown ref succeeded; want an error")
 	}
 }
@@ -1461,7 +1461,7 @@ func TestTrashResolvesSubscriptionRef(t *testing.T) {
 	// nodeB offers nothing; "docs" is only reachable as a subscription, and
 	// its name is only known because nodeA sent a ShareList.
 	for _, ref := range []string{"docs", shareID, shareID[:6]} {
-		if _, err := nodeB.ListTrash(ref); err != nil {
+		if _, err := nodeB.ListTrash(context.Background(), ref); err != nil {
 			t.Errorf("ListTrash(%q) on a subscribed share: %v", ref, err)
 		}
 	}
