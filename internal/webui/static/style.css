@@ -582,20 +582,73 @@ dialog.confirm-dialog::backdrop {
   margin-top: 1.1rem;
 }
 
-table.trash-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 0.9rem;
+.list-item.subscription-item {
+  flex-direction: column;
+  align-items: stretch;
 }
 
-table.trash-table th, table.trash-table td {
-  text-align: left;
-  padding: 0.4em 0.6em;
+.trash-panel {
+  margin-top: 0.75rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid var(--border);
+}
+
+.trash-panel > p {
+  margin: 0.4em 0;
+}
+
+.trash-filter {
+  width: 100%;
+  max-width: 24rem;
+  margin: 0.25rem 0 0.5rem;
+}
+
+.trash-event {
+  padding: 0.5em 0;
   border-bottom: 1px solid var(--border);
 }
 
-.table-wrap {
-  overflow-x: auto;
+.trash-event:last-child {
+  border-bottom: none;
+}
+
+.trash-event button.link {
+  text-align: left;
+  padding-left: 0;
+}
+
+.trash-files {
+  margin: 0.4rem 0 0 1rem;
+}
+
+.trash-files li {
+  padding: 0.2em 0;
+  font-size: 0.9rem;
+}
+
+.trash-files .mono {
+  overflow-wrap: anywhere;
+}
+
+button.small {
+  padding: 0.25em 0.6em;
+  font-size: 0.8rem;
+}
+
+.safety-form {
+  margin-top: 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  font-size: 0.9rem;
+}
+
+.safety-form .row {
+  gap: 0.4rem;
+}
+
+input.narrow {
+  width: 6rem;
 }
 
 footer.hint {

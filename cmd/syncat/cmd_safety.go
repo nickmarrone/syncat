@@ -96,21 +96,22 @@ func shareLabel(h holdView) string {
 // describeHold renders one hold as a line of `syncat status`, with what
 // to do about it.
 func describeHold(h holdView) string {
-	from := "this node's folder"
+	held := "on hold"
+	confirm := fmt.Sprintf("syncat share confirm-deletes %s", shareLabel(h))
 	if h.PeerKey != "" {
 		name := h.PeerName
 		if name == "" {
 			name = h.PeerKey
 		}
-		from = "changes from " + name
+		held = "changes from " + name + " on hold"
+		confirm += " --peer " + name
 	}
-	what := fmt.Sprintf("%d of %d files would be deleted", h.Deletes, h.Live)
-	if h.Reason == "root-unavailable" {
-		what = "the folder is missing or unreadable"
+	since := h.Since.Local().Format(time.DateTime)
+	switch h.Reason {
+	case "root-unavailable":
+		return fmt.Sprintf("%s: %s since %s: the folder is missing or unreadable (restore it, or remove the share)", shareLabel(h), held, since)
+	case "reserved-dir-taken":
+		return fmt.Sprintf("%s: %s since %s: the folder has a .syncat directory syncat didn't create (move it away)", shareLabel(h), held, since)
 	}
-	line := fmt.Sprintf("%s: %s held since %s: %s", shareLabel(h), from, h.Since.Local().Format(time.DateTime), what)
-	if !h.Confirmable {
-		return line + " (restore the folder, or remove the share)"
-	}
-	return line + fmt.Sprintf(" (fix the folder, or run `syncat share confirm-deletes %s`)", shareLabel(h))
+	return fmt.Sprintf("%s: %s since %s: %d of %d files would be deleted (fix the folder, or run `%s`)", shareLabel(h), held, since, h.Deletes, h.Live, confirm)
 }
