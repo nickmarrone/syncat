@@ -47,7 +47,8 @@ way to exercise the DERP relay path rather than a direct LAN hop.
 - [ ] `syncat token` prints an `sc1…` token, and prints the same token on
       every subsequent run.
 - [ ] Files land where documented: `~/.config/syncat/{config.json,api.token}`
-      and `~/.local/share/syncat/{keys,db,trash}`.
+      and `~/.local/share/syncat/{keys,db}`. No `trash/` there any more:
+      the trash is in each share's `.syncat/`.
 - [ ] Directories and key files are mode `0700`/`0600` — nothing
       world-readable.
 - [ ] `syncat --config /tmp/x --data /tmp/y init` honours the overrides.
@@ -65,12 +66,14 @@ id first so you can tell the identity actually rotated.
 - [ ] `init --reset` with the daemon **running** refuses, and the message
       names the address it found something on.
 - [ ] With the daemon stopped, the prompt lists all five paths it will
-      delete *and* names the share and subscription directories it will not.
+      delete (one is the old data-dir `trash/`) *and* names the share and
+      subscription directories it will not.
 - [ ] Typing `reset`, `yes`, or just Enter aborts. Confirm afterwards that
       `config.json` and the keys are still there — nothing partial.
-- [ ] Typing `RESET` goes through. `config.json`, `api.token`, `keys/`,
-      `db/`, and `trash/` are gone and immediately rebuilt; the three
-      directories are back at mode `0700` and empty of old state.
+- [ ] Typing `RESET` goes through. `config.json`, `api.token`, `keys/`, and
+      `db/` are gone and immediately rebuilt; the directories are back at
+      mode `0700` and empty of old state. Each share's `.syncat/trash/` is
+      untouched.
 - [ ] `syncat token` prints a **different** short id than the one you noted.
 - [ ] The share directory still has its files, byte for byte.
 - [ ] `--name` takes effect on a reset (it is ignored on a plain re-`init`),
@@ -173,8 +176,8 @@ the command succeeds.
 - [ ] **rw + receive** → one-way pull. Subscriber's local edits never reach
       the offerer.
 - [ ] On a **read-only** share, edit the subscriber's copy, then change the
-      offerer's copy. The local edit is warned about in `syncat status`, a
-      trash copy is taken, and it is overwritten.
+      offerer's copy. The local edit is warned about in `syncat status`, it
+      goes into the subscriber's trash as "overwritten", and it is replaced.
 - [automated] `syncat share set <id> --perm ro` on a live rw share takes
       effect on the subscriber without a restart, stops its writes, and
       leaves its existing files alone
@@ -182,15 +185,36 @@ the command succeeds.
 - [ ] Changing a subscription's *mode* is refused with a message saying to
       remove and re-add. (Known limitation, but the message should say so.)
 
-## 6. Deletes, trash, and conflicts
+## 6. Deletes, trash, holds, and conflicts
 
-`e2e.sh` covers the happy path for all three on one machine — verify these
-across two real machines.
+`e2e.sh` covers the happy path for deletes, trash, and conflicts on one
+machine — verify these across two real machines.
 
-- [ ] Delete on one side propagates; a trash copy appears on the receiving
-      side under `~/.local/share/syncat/trash/<share-id>/`.
-- [ ] `syncat trash ls <share>` lists it; `syncat trash restore <share>
-      <path>` brings it back and re-syncs.
+- [ ] Delete on one side propagates; on the receiving side it lands in
+      `<folder>/.syncat/trash/<date time> from <peer>/<path>`, browsable in a
+      file manager.
+- [ ] `syncat trash ls <share>` lists that change, numbered;
+      `syncat trash undo <share> 1` brings it back and it re-syncs to the
+      other side. The web UI's **Trash and safety** panel shows the same
+      change and its Undo works too.
+- [ ] Undo a change whose file has since been recreated: the current file
+      ends up in a new "replaced by restore" event, nothing is lost.
+- [ ] Delete 25 of 30 files in a share at once. The share goes **on hold**:
+      `syncat status` and a banner on every web UI page say so, and the peer
+      keeps all 30. Put the files back: the hold clears by itself. Delete them
+      again and run `syncat share confirm-deletes <share>`: the deletes now
+      reach the peer.
+- [ ] Unmount (or `mv` away) a share's folder while the daemon runs. The
+      share is held as missing; nothing is deleted on the peer. Put it back:
+      the hold clears.
+- [ ] `chmod 000` a subdirectory of a share. Nothing is deleted on the peer;
+      a warning is logged. `chmod 755` it again.
+- [ ] Loosen one side's guard (`syncat share safety <share> --hold-percent
+      100`), bulk-delete there: the *other* side holds the incoming change,
+      and `confirm-deletes <share> --peer <name>` lets it through.
+- [ ] Upgrading from 0.4 with entries in the old `~/.local/share/syncat/trash/`
+      moves them into each share's trash as "migrated from old trash" events,
+      and removes the old directory once it is empty.
 - [ ] Rename a file. Both sides converge (expect delete + create, not a
       true rename — confirm nothing is lost).
 - [ ] Take one side offline, edit the same file differently on both, bring

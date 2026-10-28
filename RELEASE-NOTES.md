@@ -1,3 +1,53 @@
+# Unreleased
+
+A safety release. syncat now refuses to spread a disaster, and its trash
+moves into your folders where you can see it.
+
+## Upgrading
+
+**The trash moves.** On first start, everything in the old trash
+(`~/.local/share/syncat/trash/`) moves into the trash inside each share or
+subscription, at `.syncat/trash/`. Anything that can't be moved, such as the
+trash of a share you have since removed, stays where it was and is logged;
+delete it by hand once you're sure you don't need it. `syncat trash restore`
+is replaced by `syncat trash undo` (below).
+
+The index database gains a table for holds. Nothing else on disk changes, and
+nodes on this release still talk to 0.4 nodes.
+
+## What's new
+
+**Holds stop a disaster from spreading.** If a share's folder goes missing,
+everything in it disappears, or one change would delete at least half of it
+(and at least 20 files), syncat puts the share on hold instead of telling your
+peers to delete their copies. The same check guards your copy against a peer's
+mass delete. Fix the folder and the hold clears by itself, or let the deletes
+through with `syncat share confirm-deletes SHARE`. The thresholds are set per
+share with `syncat share safety`. Holds show in `syncat status` and as a
+banner in the web UI.
+
+**Unreadable files are no longer deletes.** A permissions change that made a
+folder unreadable used to look like the folder's files had been deleted, and
+that delete spread to every peer. Now the files are left alone and a warning
+is logged.
+
+**The trash lives in your folders, one folder per change.** What a peer
+deletes or overwrites goes into `.syncat/trash/` inside the share, in a folder
+like `2026-10-27 10.32.05 from laptop`, laid out like the share. Browse it in
+a file manager, or use `syncat trash ls SHARE` and `syncat trash undo SHARE N`
+to put a whole change (or chosen files) back. Undoing never loses anything:
+whatever is in the way goes into the trash first. The web UI lists each
+share's trash by change, with Undo and Restore buttons and a filter.
+
+**The trash has a size limit.** A change is kept for 30 days or until the
+trash outgrows 25% of the share, whichever comes first, oldest first; the
+newest change is always kept. Both are set per share.
+
+**syncat is not a backup.** The trash undoes what peers change; it doesn't
+recover what you delete yourself. A receive-only subscription is no longer
+described as a backup, because it receives deletes too. The README now has a
+section on backing up your folders with restic or filesystem snapshots.
+
 # syncat 0.4.0
 
 A hardening release. Most of the work is in how two nodes talk to each other:
