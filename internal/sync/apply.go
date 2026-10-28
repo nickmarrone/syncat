@@ -60,6 +60,10 @@ func SweepTempFiles(root string) (int, error) {
 	var firstErr error
 	for _, e := range entries {
 		name := e.Name()
+		if e.IsDir() && name == ReservedDirName {
+			// syncat's own directory (the trash) never holds a staging file.
+			continue
+		}
 		if e.IsDir() {
 			// Staging files are written beside their destination, so a
 			// nested share needs the subdirectories swept too.
@@ -218,13 +222,13 @@ func (s *Session) applyDelete(ctx context.Context, cfg ShareConfig, relpath stri
 		return true, nil
 	}
 
-	// --- trash hook (SPEC.md §7) ---
+	// --- trash hook ---
 	// The one place a file/symlink is discarded on a peer's behalf via a
-	// delete: moved into <datadir>/trash/<share-id>/<relpath>.<unix-ts>
-	// (Trash.Put) before the remove below ever runs. A trash failure
-	// aborts here, before anything is removed, rather than risking data
-	// loss because the safety net itself failed.
-	if err := s.trashHook(ctx, cfg.ShareID, relpath, absPath); err != nil {
+	// delete: moved into this pass's trash event (see trash.go) before the
+	// remove below ever runs. A trash failure aborts here, before anything
+	// is removed, rather than risking data loss because the safety net
+	// itself failed.
+	if err := s.trashHook(ctx, relpath, absPath, TrashDeleted); err != nil {
 		return false, fmt.Errorf("sync: delete %s: trash: %w", relpath, err)
 	}
 
@@ -455,7 +459,7 @@ func (s *Session) finalizeFile(ctx context.Context, shareID, destRelPath, destAb
 		return fmt.Errorf("sync: install %s: chtimes: %w", destRelPath, err)
 	}
 
-	// --- trash hook (SPEC.md §7) ---
+	// --- trash hook ---
 	// destAbs may already exist here (we're overwriting a file the peer's
 	// version dominates, resolving a conflict's winner, or reverting a
 	// receive-only subscriber's local edit). This is the other place,
@@ -463,7 +467,7 @@ func (s *Session) finalizeFile(ctx context.Context, shareID, destRelPath, destAb
 	// behalf, and it runs strictly before the rename below: a trash
 	// failure returns here and the rename never happens, so the original
 	// content is never destroyed just because the safety net failed.
-	if err := s.trashHook(ctx, shareID, destRelPath, destAbs); err != nil {
+	if err := s.trashHook(ctx, destRelPath, destAbs, TrashOverwritten); err != nil {
 		return fmt.Errorf("sync: install %s: trash: %w", destRelPath, err)
 	}
 
@@ -478,7 +482,7 @@ func (s *Session) finalizeFile(ctx context.Context, shareID, destRelPath, destAb
 // unlike os.Rename cannot itself overwrite an existing path.
 func (s *Session) replaceWithTrashHook(ctx context.Context, shareID, relpath, destAbs string) error {
 	if _, err := os.Lstat(destAbs); err == nil {
-		if err := s.trashHook(ctx, shareID, relpath, destAbs); err != nil {
+		if err := s.trashHook(ctx, relpath, destAbs, TrashOverwritten); err != nil {
 			return fmt.Errorf("sync: install symlink %s: trash: %w", relpath, err)
 		}
 		if err := os.Remove(destAbs); err != nil && !os.IsNotExist(err) {
@@ -490,24 +494,45 @@ func (s *Session) replaceWithTrashHook(ctx context.Context, shareID, relpath, de
 	return nil
 }
 
-// trashHook is the single, obvious slot "move old content to trash before
-// overwrite/delete" (SPEC.md §7) plugs into. It's called immediately
-// before every destructive operation that discards existing destination
-// content on a peer's behalf: applyDelete's os.Remove, and
-// pullAndInstall's overwrite (both the rename-into-place path and the
-// symlink-replace path via replaceWithTrashHook). destAbs may or may not
-// currently exist. Trash.Put no-ops when it doesn't.
+// trashHook is the single, obvious slot "move old content to the trash
+// before overwrite/delete" plugs into. It's called immediately before every
+// destructive operation that discards existing destination content on a
+// peer's behalf: applyDelete's os.Remove, and pullAndInstall's overwrite
+// (both the rename-into-place path and the symlink-replace path via
+// replaceWithTrashHook). destAbs may or may not currently exist;
+// TrashEvent.Put no-ops when it doesn't. kind is TrashDeleted or
+// TrashOverwritten.
 //
-// If s.trash is nil (no Trash configured, e.g. a test exercising apply
-// logic that doesn't care about trash, or trash deliberately disabled),
-// this is a no-op, matching this hook's pre-Phase-6 behavior. Once a Trash
-// is set via SessionOptions.Trash, every call site above gets real trash-can behavior
-// with no further change to this file: the hook always runs strictly
-// before its caller's destructive step, and an error here aborts that
-// step rather than proceeding to destroy data.
-func (s *Session) trashHook(ctx context.Context, shareID, relpath, destAbs string) error {
+// The file goes into the trash event reconcileLocked started for this pass
+// (withTrashEvent), so everything one pass with one peer discards is one
+// event the user can undo at once. If s.trash is nil (no Trash configured,
+// e.g. a test exercising apply logic that doesn't care about trash), this
+// is a no-op. With a Trash but no event in ctx it fails, aborting the
+// destructive step, rather than discarding the file untrashed: every apply
+// runs inside a reconcile pass, so that would be a bug, and failing closed
+// is the safe way for it to show.
+func (s *Session) trashHook(ctx context.Context, relpath, destAbs, kind string) error {
 	if s.trash == nil {
 		return nil
 	}
-	return s.trash.Put(ctx, shareID, relpath, destAbs)
+	ev := trashEventFrom(ctx)
+	if ev == nil {
+		return fmt.Errorf("sync: trash: no trash event for this pass")
+	}
+	return ev.Put(ctx, relpath, destAbs, kind)
+}
+
+type trashEventKey struct{}
+
+// withTrashEvent returns ctx carrying ev, the trash event every trashHook
+// call under it records into. It travels in the context because the apply
+// path is several calls deep (applyAction, pullAndInstall, finalizeFile)
+// and none of the others has any use for it.
+func withTrashEvent(ctx context.Context, ev *TrashEvent) context.Context {
+	return context.WithValue(ctx, trashEventKey{}, ev)
+}
+
+func trashEventFrom(ctx context.Context) *TrashEvent {
+	ev, _ := ctx.Value(trashEventKey{}).(*TrashEvent)
+	return ev
 }

@@ -21,6 +21,12 @@ import (
 // reaches the wire.
 const IgnoreFileName = ".syncatignore"
 
+// ReservedDirName is the directory syncat keeps at the root of every
+// synced folder for its own use (the trash; see internal/sync's trash.go).
+// It is never scanned, never synced, and no ignore rule can re-include it:
+// Matcher.MatchPath excludes it before consulting any rule.
+const ReservedDirName = ".syncat"
+
 // ignorePattern is one compiled, non-comment line of a .syncatignore.
 //
 // re matches against a whole share-relative path (forward slashes, no

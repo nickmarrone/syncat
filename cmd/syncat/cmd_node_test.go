@@ -38,7 +38,7 @@ func populate(t *testing.T, p *config.Paths) {
 		p.DBFile(),
 		p.DBFile() + "-wal",
 		p.DBFile() + "-shm",
-		filepath.Join(p.TrashDir(), "shareid", "notes.txt.1757260000"),
+		filepath.Join(p.LegacyTrashDir(), "shareid", "notes.txt.1757260000"),
 	}
 	for _, f := range files {
 		if err := os.MkdirAll(filepath.Dir(f), 0700); err != nil {
@@ -79,7 +79,7 @@ func TestRemoveStateClearsEveryTargetAndNothingElse(t *testing.T) {
 	}
 
 	for _, gone := range []string{
-		p.ConfigFile(), p.APITokenFile(), p.KeysDir(), p.DBDir(), p.TrashDir(), tmpLeftover,
+		p.ConfigFile(), p.APITokenFile(), p.KeysDir(), p.DBDir(), p.LegacyTrashDir(), tmpLeftover,
 	} {
 		if _, err := os.Lstat(gone); !os.IsNotExist(err) {
 			t.Errorf("%s survived the reset (err=%v)", gone, err)
@@ -93,7 +93,7 @@ func TestRemoveStateClearsEveryTargetAndNothingElse(t *testing.T) {
 	if err := p.EnsureDirs(); err != nil {
 		t.Fatalf("EnsureDirs after reset: %v", err)
 	}
-	for _, dir := range []string{p.KeysDir(), p.DBDir(), p.TrashDir()} {
+	for _, dir := range []string{p.KeysDir(), p.DBDir()} {
 		entries, err := os.ReadDir(dir)
 		if err != nil {
 			t.Fatalf("read %s: %v", dir, err)

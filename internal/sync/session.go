@@ -110,9 +110,10 @@ type Session struct {
 	peerID string // the peer's ShortID
 	clock  Clock
 
-	// trash is this Session's trash can (SPEC.md §7), from
-	// SessionOptions.Trash. If it is nil, trashHook does nothing (see
-	// apply.go), so tests that ignore trash can use a Session without one.
+	// trash is where this Session keeps what it deletes or overwrites (see
+	// trash.go), from SessionOptions.Trash. If it is nil, trashHook does
+	// nothing (see apply.go), so tests that ignore trash can use a Session
+	// without one.
 	trash *Trash
 
 	// warningsMu/warnings record every LocallyModifiedWarning this Session
@@ -334,8 +335,9 @@ type SessionOptions struct {
 	// noisy for an idle daemon.
 	Debug bool
 
-	// Trash is where this session moves files it deletes or overwrites
-	// (SPEC.md §7). nil makes trashHook do nothing.
+	// Trash is where this session moves files it deletes or overwrites: the
+	// trash inside each share, one event per reconcile pass (see trash.go).
+	// nil makes trashHook do nothing.
 	Trash *Trash
 
 	// OnControl is called, synchronously from the read loop, for every frame
@@ -1329,6 +1331,12 @@ func (s *Session) reconcileLocked(ctx context.Context, cfg ShareConfig, why stri
 			s.debugf("reconcile %s (%s) skipped: share is on hold (%d of %d file(s) would be deleted)", shareID, why, deletes, live)
 			return
 		}
+	}
+
+	if s.trash != nil {
+		ev := s.trash.BeginPeerEvent(cfg.Root, s.peerLabel)
+		defer ev.Close()
+		ctx = withTrashEvent(ctx, ev)
 	}
 
 	var mu sync.Mutex

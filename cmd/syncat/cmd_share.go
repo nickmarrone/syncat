@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"strconv"
+	"strings"
 
 	"github.com/nickmarrone/syncat/internal/config"
 )
@@ -309,76 +311,141 @@ func subscriptionPath(peer, shareID string) string {
 	return url.PathEscape(peer + ":" + shareID)
 }
 
-// cmdTrash implements `syncat trash ls SHARE` and `syncat trash restore
-// SHARE PATH` (SPEC.md §7/§8) as a thin API client, so like the other
-// daemon-backed subcommands (`peer`, `share`, `status`, ...) it requires a
-// running daemon.
+// cmdTrash implements `syncat trash ls SHARE` and `syncat trash undo SHARE
+// EVENT [PATH...]` as a thin API client, so like the other daemon-backed
+// subcommands it requires a running daemon. EVENT is the number `trash ls`
+// prints beside it (1 is the newest) or the event's folder name.
 func cmdTrash(paths *config.Paths, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: syncat trash ls SHARE | syncat trash restore SHARE PATH")
+		return fmt.Errorf("usage: syncat trash ls SHARE | syncat trash undo SHARE EVENT [PATH...]")
 	}
 	sub, rest := args[0], args[1:]
 	switch sub {
 	case "ls":
 		return cmdTrashLs(paths, rest)
-	case "restore":
-		return cmdTrashRestore(paths, rest)
+	case "undo":
+		return cmdTrashUndo(paths, rest)
 	default:
-		return fmt.Errorf("unknown trash subcommand %q (want ls or restore)", sub)
+		return fmt.Errorf("unknown trash subcommand %q (want ls or undo)", sub)
 	}
+}
+
+func fetchTrash(c *apiClient, shareRef string) (trashView, error) {
+	var tv trashView
+	err := c.do(context.Background(), http.MethodGet, "/api/shares/"+url.PathEscape(shareRef)+"/trash", nil, &tv)
+	return tv, err
 }
 
 func cmdTrashLs(paths *config.Paths, args []string) error {
+	positional, rest := splitLeadingPositional(args, 1)
 	fs := flag.NewFlagSet("trash ls", flag.ContinueOnError)
 	asJSON := fs.Bool("json", false, "output raw JSON")
-	if err := fs.Parse(args); err != nil {
+	files := fs.Bool("files", false, "list every file in each event")
+	if err := fs.Parse(rest); err != nil {
 		return err
 	}
-	if fs.NArg() != 1 {
-		return fmt.Errorf("usage: syncat trash ls SHARE\n\nSHARE accepts a name, an id, or a unique id prefix, for a share you offer or subscribe to")
+	// SHARE may come before or after the flags.
+	positional = append(positional, fs.Args()...)
+	if len(positional) != 1 {
+		return fmt.Errorf("usage: syncat trash ls SHARE [--files]\n\nSHARE accepts a name, an id, or a unique id prefix, for a share you offer or subscribe to")
 	}
-	shareID := fs.Arg(0)
-
 	c, err := newAPIClient(paths)
 	if err != nil {
 		return err
 	}
-	var resp struct {
-		Entries []trashEntryView `json:"entries"`
-	}
-	if err := c.do(context.Background(), http.MethodGet, "/api/shares/"+url.PathEscape(shareID)+"/trash", nil, &resp); err != nil {
+	tv, err := fetchTrash(c, positional[0])
+	if err != nil {
 		return err
 	}
 	if *asJSON {
-		return printJSON(resp.Entries)
+		return printJSON(tv)
 	}
-	if len(resp.Entries) == 0 {
-		fmt.Printf("no trashed files for share %s\n", shareID)
+	if len(tv.Events) == 0 {
+		fmt.Printf("the trash for %s is empty\n", positional[0])
 		return nil
 	}
-	for _, e := range resp.Entries {
-		fmt.Printf("%s\t%s\t%d bytes\n", e.TrashedAt.Local().Format("2006-01-02 15:04:05"), e.RelPath, e.Size)
+	for i, ev := range tv.Events {
+		fmt.Printf("%3d  %s  %s (%s)\n", i+1, ev.ID, summarizeTrashEvent(ev), formatSize(ev.Size))
+		if *files {
+			for _, it := range ev.Items {
+				kind := it.Kind
+				if kind == "" {
+					kind = "?"
+				}
+				fmt.Printf("       %-11s %s\n", kind, it.RelPath)
+			}
+		}
 	}
+	over := ""
+	if tv.Size > tv.Limit {
+		over = " (over the limit: older events go first at the next sweep, the newest is kept)"
+	}
+	fmt.Printf("\n%s of %s used; events are kept up to %d days%s\n", formatSize(tv.Size), formatSize(tv.Limit), tv.RetentionDays, over)
+	fmt.Printf("undo one with: syncat trash undo %s NUMBER [PATH...]\n", positional[0])
 	return nil
 }
 
-func cmdTrashRestore(paths *config.Paths, args []string) error {
-	fs := flag.NewFlagSet("trash restore", flag.ContinueOnError)
+// summarizeTrashEvent says what an event did in a few words, e.g.
+// "deleted 14 files, overwrote 1".
+func summarizeTrashEvent(ev trashEventView) string {
+	counts := map[string]int{}
+	for _, it := range ev.Items {
+		counts[it.Kind]++
+	}
+	var parts []string
+	for _, k := range []struct{ kind, verb string }{{"deleted", "deleted"}, {"overwritten", "overwrote"}, {"migrated", "migrated"}, {"", "kept"}} {
+		if n := counts[k.kind]; n > 0 {
+			parts = append(parts, fmt.Sprintf("%s %d file%s", k.verb, n, map[bool]string{true: "", false: "s"}[n == 1]))
+		}
+	}
+	return strings.Join(parts, ", ")
+}
+
+func formatSize(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for m := n / unit; m >= unit; m /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
+}
+
+func cmdTrashUndo(paths *config.Paths, args []string) error {
+	fs := flag.NewFlagSet("trash undo", flag.ContinueOnError)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if fs.NArg() != 2 {
-		return fmt.Errorf("usage: syncat trash restore SHARE PATH\n\nSHARE accepts a name, an id, or a unique id prefix, for a share you offer or subscribe to")
+	if fs.NArg() < 2 {
+		return fmt.Errorf("usage: syncat trash undo SHARE EVENT [PATH...]\n\nEVENT is the number `syncat trash ls SHARE` shows (1 is the newest) or the event's folder name. With no PATH, the whole event is undone")
 	}
-	shareID, relPath := fs.Arg(0), fs.Arg(1)
+	shareRef, eventRef, relPaths := fs.Arg(0), fs.Arg(1), fs.Args()[2:]
 
 	c, err := newAPIClient(paths)
 	if err != nil {
 		return err
 	}
-	if err := c.do(context.Background(), http.MethodPost, "/api/shares/"+url.PathEscape(shareID)+"/trash/restore", map[string]string{"rel_path": relPath}, nil); err != nil {
+	eventID := eventRef
+	if n, err := strconv.Atoi(eventRef); err == nil {
+		tv, err := fetchTrash(c, shareRef)
+		if err != nil {
+			return err
+		}
+		if n < 1 || n > len(tv.Events) {
+			return fmt.Errorf("no event %d in the trash for %s (it has %d)", n, shareRef, len(tv.Events))
+		}
+		eventID = tv.Events[n-1].ID
+	}
+	var resp struct {
+		Restored []string `json:"restored"`
+	}
+	body := map[string]any{"event": eventID, "paths": relPaths}
+	if err := c.do(context.Background(), http.MethodPost, "/api/shares/"+url.PathEscape(shareRef)+"/trash/undo", body, &resp); err != nil {
 		return err
 	}
-	fmt.Printf("restored %s\n", relPath)
+	fmt.Printf("restored %d file(s) from %q\n", len(resp.Restored), eventID)
 	return nil
 }

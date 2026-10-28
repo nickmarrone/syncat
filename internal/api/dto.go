@@ -10,7 +10,6 @@ import (
 
 	"github.com/nickmarrone/syncat/internal/config"
 	"github.com/nickmarrone/syncat/internal/core"
-	syncsvc "github.com/nickmarrone/syncat/internal/sync"
 	"github.com/nickmarrone/syncat/internal/version"
 )
 
@@ -180,11 +179,29 @@ type rejectedConnDTO struct {
 	Reason   string    `json:"reason"`
 }
 
-type trashEntryDTO struct {
-	ShareID   string    `json:"share_id"`
-	RelPath   string    `json:"rel_path"`
-	TrashedAt time.Time `json:"trashed_at"`
-	Size      int64     `json:"size"`
+// trashDTO is one share's trash: its events, newest first, and its size
+// against its limit.
+type trashDTO struct {
+	ShareID       string          `json:"share_id"`
+	Events        []trashEventDTO `json:"events"`
+	Size          int64           `json:"size"`
+	Limit         int64           `json:"limit"`
+	RetentionDays int             `json:"retention_days"`
+}
+
+type trashEventDTO struct {
+	ID     string         `json:"id"`
+	At     time.Time      `json:"at"`
+	Label  string         `json:"label"`
+	Source string         `json:"source,omitempty"`
+	Size   int64          `json:"size"`
+	Items  []trashItemDTO `json:"items"`
+}
+
+type trashItemDTO struct {
+	RelPath string `json:"rel_path"`
+	Kind    string `json:"kind,omitempty"`
+	Size    int64  `json:"size"`
 }
 
 func toPeerDTO(p core.PeerStatus) peerDTO {
@@ -282,8 +299,16 @@ func toRejectedConnDTO(r core.RejectedConnection) rejectedConnDTO {
 	return rejectedConnDTO{PeerKey: r.PeerKey, PeerName: r.PeerName, At: r.At, Reason: r.Reason}
 }
 
-func toTrashEntryDTO(e syncsvc.TrashEntry) trashEntryDTO {
-	return trashEntryDTO{ShareID: e.ShareID, RelPath: e.RelPath, TrashedAt: e.TrashedAt, Size: e.Size}
+func toTrashDTO(st core.TrashStatus) trashDTO {
+	out := trashDTO{ShareID: st.ShareID, Size: st.Size, Limit: st.Limit, RetentionDays: st.RetentionDays, Events: make([]trashEventDTO, 0, len(st.Events))}
+	for _, ev := range st.Events {
+		items := make([]trashItemDTO, 0, len(ev.Items))
+		for _, it := range ev.Items {
+			items = append(items, trashItemDTO{RelPath: it.RelPath, Kind: it.Kind, Size: it.Size})
+		}
+		out.Events = append(out.Events, trashEventDTO{ID: ev.ID, At: ev.At, Label: ev.Label, Source: ev.Source, Size: ev.Size, Items: items})
+	}
+	return out
 }
 
 func toStatusResponse(st core.Status) statusResponse {
