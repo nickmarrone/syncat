@@ -721,82 +721,66 @@ func TestTrashListEmpty(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
 	}
-	var resp struct {
-		Entries []trashEntryDTO `json:"entries"`
-	}
+	var resp trashDTO
 	decodeJSONBody(t, w, &resp)
-	if len(resp.Entries) != 0 {
-		t.Fatalf("entries = %+v, want none", resp.Entries)
+	if len(resp.Events) != 0 || resp.RetentionDays != config.DefaultTrashRetentionDays {
+		t.Fatalf("trash = %+v, want no events and the default retention", resp)
 	}
 }
 
-func TestTrashRestoreMissingRelPath(t *testing.T) {
+func TestTrashUndoMissingEvent(t *testing.T) {
 	srv, n, _ := newTestServer(t)
 	id, err := n.AddShare(t.TempDir(), "share", "read-write", false)
 	if err != nil {
 		t.Fatalf("add share: %v", err)
 	}
-	w := doRequest(t, srv, http.MethodPost, "/api/shares/"+id+"/trash/restore", testToken, map[string]any{})
+	w := doRequest(t, srv, http.MethodPost, "/api/shares/"+id+"/trash/undo", testToken, map[string]any{})
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400; body: %s", w.Code, w.Body.String())
 	}
-}
-
-func TestTrashRestoreUnknownEntry(t *testing.T) {
-	srv, n, _ := newTestServer(t)
-	id, err := n.AddShare(t.TempDir(), "share", "read-write", false)
-	if err != nil {
-		t.Fatalf("add share: %v", err)
-	}
-	w := doRequest(t, srv, http.MethodPost, "/api/shares/"+id+"/trash/restore", testToken, map[string]any{"rel_path": "nope.txt"})
+	w = doRequest(t, srv, http.MethodPost, "/api/shares/"+id+"/trash/undo", testToken, map[string]any{"event": "nope"})
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404; body: %s", w.Code, w.Body.String())
 	}
 }
 
-func TestTrashListAndRestoreRoundTrip(t *testing.T) {
-	srv, n, paths := newTestServer(t)
+func TestTrashListAndUndoRoundTrip(t *testing.T) {
+	srv, n, _ := newTestServer(t)
 	shareDir := t.TempDir()
 	id, err := n.AddShare(shareDir, "share", "read-write", false)
 	if err != nil {
 		t.Fatalf("add share: %v", err)
 	}
 
-	// Put something in the trash the way applyDelete/pullAndInstall would
-	// (see internal/sync/trash.go's doc comment), a second Trash instance
-	// over the same on-disk root as the node's own.
-	tr := syncsvc.NewTrash(paths.TrashDir(), nil)
-	src := filepath.Join(t.TempDir(), "foo.txt")
+	// Trash something the way a reconcile pass would.
+	src := filepath.Join(shareDir, "foo.txt")
 	if err := os.WriteFile(src, []byte("hello"), 0o644); err != nil {
 		t.Fatalf("write src: %v", err)
 	}
-	if err := tr.Put(context.Background(), id, "foo.txt", src); err != nil {
+	ev := syncsvc.NewTrash(nil).BeginPeerEvent(shareDir, "laptop")
+	if err := ev.Put(context.Background(), "foo.txt", src, syncsvc.TrashDeleted); err != nil {
 		t.Fatalf("trash put: %v", err)
 	}
+	ev.Close()
 
 	w := doRequest(t, srv, http.MethodGet, "/api/shares/"+id+"/trash", testToken, nil)
 	if w.Code != http.StatusOK {
 		t.Fatalf("list: status = %d, want 200; body: %s", w.Code, w.Body.String())
 	}
-	var resp struct {
-		Entries []trashEntryDTO `json:"entries"`
-	}
+	var resp trashDTO
 	decodeJSONBody(t, w, &resp)
-	if len(resp.Entries) != 1 || resp.Entries[0].RelPath != "foo.txt" {
-		t.Fatalf("entries = %+v, want one foo.txt entry", resp.Entries)
+	if len(resp.Events) != 1 || resp.Events[0].Label != "from laptop" || len(resp.Events[0].Items) != 1 ||
+		resp.Events[0].Items[0].RelPath != "foo.txt" || resp.Events[0].Items[0].Kind != "deleted" || resp.Size != 5 {
+		t.Fatalf("trash = %+v, want one event deleting foo.txt", resp)
 	}
 
-	w = doRequest(t, srv, http.MethodPost, "/api/shares/"+id+"/trash/restore", testToken, map[string]any{"rel_path": "foo.txt"})
+	w = doRequest(t, srv, http.MethodPost, "/api/shares/"+id+"/trash/undo", testToken, map[string]any{"event": resp.Events[0].ID})
 	if w.Code != http.StatusOK {
-		t.Fatalf("restore: status = %d, want 200; body: %s", w.Code, w.Body.String())
+		t.Fatalf("undo: status = %d, want 200; body: %s", w.Code, w.Body.String())
 	}
-
-	data, err := os.ReadFile(filepath.Join(shareDir, "foo.txt"))
-	if err != nil {
-		t.Fatalf("read restored file: %v", err)
-	}
-	if string(data) != "hello" {
-		t.Fatalf("restored content = %q, want %q", data, "hello")
+	data, err := os.ReadFile(src)
+	if err != nil || string(data) != "hello" {
+		t.Fatalf("restored file = %q, %v", data, err)
 	}
 }
 

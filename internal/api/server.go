@@ -168,8 +168,12 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("PATCH /api/subscriptions/{id}", s.auth(s.handleSubscriptionsPatch))
 	s.mux.HandleFunc("DELETE /api/subscriptions/{id}", s.auth(s.handleSubscriptionsDelete))
 
+	s.mux.HandleFunc("GET /api/holds", s.auth(s.handleHoldsList))
+	s.mux.HandleFunc("POST /api/shares/{id}/holds/confirm", s.auth(s.handleHoldConfirm))
+	s.mux.HandleFunc("PATCH /api/shares/{id}/safety", s.auth(s.handleSafetyPatch))
+
 	s.mux.HandleFunc("GET /api/shares/{id}/trash", s.auth(s.handleTrashList))
-	s.mux.HandleFunc("POST /api/shares/{id}/trash/restore", s.auth(s.handleTrashRestore))
+	s.mux.HandleFunc("POST /api/shares/{id}/trash/undo", s.auth(s.handleTrashUndo))
 
 	// GET /api/events (SSE) is deliberately not implemented; the UI polls
 	// /api/status instead. Not registered at all, so it 404s like any

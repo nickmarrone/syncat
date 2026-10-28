@@ -21,11 +21,11 @@ iOS/Android come later, so the sync core must be a reusable, cgo-free Go package
 (gomobile-friendly).
 
 Fixed decisions:
-- **Sync modes (v1):** bidirectional mirror, one-way push (send-only), one-way pull (backup). No on-demand browse/fetch.
+- **Sync modes (v1):** bidirectional mirror, one-way push (send-only), one-way pull (receive-only). No on-demand browse/fetch.
 - **Conflicts:** keep both — newest wins the filename, loser saved as a conflict copy.
 - **"Requires approval"** gates *peer access to a share* (not individual changes).
 - **Interface:** headless CLI daemon serving a web UI on localhost; CLI subcommands drive the same REST API.
-- **Safety:** simple trash can for remote deletes/overwrites, auto-cleaned after N days.
+- **Safety:** a *hold* stops any change that looks like a disaster (missing or emptied share root, bulk delete) from being recorded or spread, on both the sending and receiving side (§7a); a *trash* inside each synced folder undoes what peers delete or overwrite (§7). syncat is **not a backup** and does not provide point-in-time recovery; users are pointed to restic or filesystem snapshots. See docs/adr/0001-trash-lives-in-the-share-hold-guards-disasters.md.
 - **Transfers:** whole-file in v1 (with resume); block-level delta specified in §11 as v2.
 - **UI stack:** vanilla HTML/CSS/JS embedded via `go:embed` — single binary, no build step.
 
@@ -55,11 +55,11 @@ Mode is not a single enum; it falls out of *offerer permission × subscriber mod
 |---|---|---|
 | read-write | mirror | **Bidirectional mirror** (both sides propagate changes) |
 | read-only | receive-only (forced) | **One-way push** — offerer is source of truth |
-| read-write | receive-only | **One-way pull / backup** — subscriber takes changes, never sends |
+| read-write | receive-only | **One-way pull** — subscriber takes changes, never sends. Not a backup: deletes arrive too. |
 
 On a read-only share, subscribers are forced to receive-only; local modifications in
 the subscriber's copy are detected, logged as warnings in the UI, and overwritten on
-the next change from the offerer (after a trash copy is taken).
+the next change from the offerer (the local version goes to the trash first).
 
 ## 2. Identity, tokens, and peering
 
@@ -123,14 +123,20 @@ node, then re-exchange tokens.
   keys/tailcat.key                  # 0600
   keys/identity.key                 # 0600
   db/index.db                       # SQLite (modernc.org/sqlite, pure Go — cgo-free for gomobile)
-  trash/<share-id>/<relpath>.<unix-ts>   # trash can (§7)
+<each share or subscription folder>/.syncat/
+  README                            # marks the directory as syncat's own
+  trash/<event>/<relpath>           # the trash (§7)
+  trash-events/<event>.jsonl        # what each trash event holds
 ```
 
 `config.toml` holds: node name, listen address for the API (default `127.0.0.1:8347`),
-trash retention days (default 30), rescan interval (default 300s), peers
+default trash retention days (default 30), rescan interval (default 300s), peers
 (`[[peer]] name/token/enabled`), shares (`[[share]] id/name/path/permission/approval_required`,
 plus `[share.access] peer-key = "granted"|"denied"`), and subscriptions
-(`[[subscription]] peer/share-id/local-path/mode/paused`).
+(`[[subscription]] peer/share-id/local-path/mode/paused`). Every share and
+subscription may also set `hold_delete_percent` (default 50), `hold_delete_min`
+(default 20), `trash_retention_days` (default: the node's), and `trash_max_size`
+(`"25%"` of the share's live size, or an absolute size like `"2GiB"`; default `"25%"`).
 
 Share IDs are random 8-byte hex, generated at share creation, stable for the share's life.
 
@@ -223,7 +229,8 @@ sha256, version_json, deleted, updated_at)` plus `peer_files(...)` mirroring the
 ### Applying remote changes
 1. Download to `.syncat.tmp.<rand>` in the destination directory; verify sha256;
    fsync; set mtime/mode.
-2. If a file is being replaced or deleted, move the old content to trash first (§7).
+2. If a file is being replaced or deleted, move the old content to the trash first (§7).
+   A pass that would delete a bulk of the share's files is held instead (§7a).
 3. `rename(2)` into place (atomic on same filesystem).
 4. Directory deletes apply only when empty after children sync; non-empty remote-deleted
    dirs containing local-only files are kept and the delete is logged.
@@ -232,8 +239,8 @@ sha256, version_json, deleted, updated_at)` plus `peer_files(...)` mirroring the
 - Offerer with `read-only` share: sends `IndexUpdate`/`FileChunk`, **ignores** incoming
   `IndexUpdate` for that share.
 - Subscriber in `receive-only` mode: applies remote changes, never sends `IndexUpdate`
-  for that share; local edits are flagged "locally modified" in UI and reverted (via
-  trash) when the offerer's copy next changes.
+  for that share; local edits are flagged "locally modified" in UI and reverted (the
+  local version going to the trash) when the offerer's copy next changes.
 - Fan-out: a share offered to multiple peers propagates through the offerer (hub).
   Peers of the same share do not talk to each other in v1.
 
@@ -248,16 +255,56 @@ sha256, version_json, deleted, updated_at)` plus `peer_files(...)` mirroring the
   `AccessUpdate`. Access can later be revoked in the UI (peer keeps its local copy;
   sync just stops).
 
-## 7. Trash can
+## 7. Trash
 
-- Any remote-initiated delete or overwrite moves the old file to
-  `<datadir>/trash/<share-id>/<relpath>.<unix-ts>` (rename when same filesystem,
-  copy+delete otherwise).
-- Retention: `trash_retention_days` (default 30); a daily janitor purges older entries.
-- UI: per-share trash browser with restore (restore = copy back + local version bump,
-  so it propagates as a new change). CLI: `syncat trash ls|restore`.
-- Local deletions by the user are **not** trashed (the OS/user owns those); only
-  changes syncat itself applies on behalf of a peer are.
+The trash is an undo for changes peers make. It is not a backup.
+
+- It lives inside each synced folder, at `.syncat/trash/`, so it can be browsed and
+  restored from with a file manager, every move into it is a same-filesystem rename,
+  and the user's own backup of the folder covers it. `.syncat/` is reserved: the
+  scanner never indexes it, a peer-supplied relpath into it is rejected like `..`,
+  and a folder whose `.syncat/` syncat didn't create (no `README` marker) can't be
+  added and is held if one appears (§7a).
+- Any remote-initiated delete or overwrite moves the old file into the current
+  **event**: one folder per reconcile pass with one peer, named
+  `YYYY-MM-DD HH.MM.SS from <peer>`, laid out like the share. A failure to trash
+  aborts the destructive step. Each event's log (`trash-events/<event>.jsonl`)
+  records which files were deleted and which overwritten.
+- Undo restores a whole event or chosen files: each is moved back and indexed with
+  a local version bump, so it propagates as a new change. A file in the way is moved
+  into a new "replaced by restore" event first, so an undo can itself be undone.
+- Expiry: an event goes once it is older than `trash_retention_days`, or, oldest
+  first, while the trash is bigger than `trash_max_size`. Events are only removed
+  whole, and the newest is never removed for size. Checked hourly.
+- UI: per-share panel listing events ("laptop deleted 14 files, overwrote 1") with
+  Undo per event, Restore per file, and a filter. CLI: `syncat trash ls|undo`.
+- Local deletions by the user are **not** trashed (the OS/user owns those, and a
+  backup tool is what recovers them); only changes syncat itself applies on behalf
+  of a peer are.
+- On upgrade, the old `<datadir>/trash/<share-id>/<relpath>.<unix-ts>` entries move
+  into each share's trash, one event per second they were trashed in.
+
+## 7a. Holds
+
+A **hold** stops a change that looks like a disaster from being recorded or spread.
+It is per (share, peer) link; a hold on this node's own copy of a share also stops
+every peer's changes into it.
+
+- Triggers, checked on a local scan before it is applied and on every reconcile pass
+  over a peer's changes before anything is applied:
+  - the share root is missing or unreadable while the index has live files;
+  - every live file (at least two) would be deleted;
+  - a single change would delete at least `hold_delete_percent` of the share's live
+    files and at least `hold_delete_min` of them.
+- A path that exists but can't be read (after a permissions change, say) is never a
+  delete; only one that is truly absent is.
+- While held, the scan result or the peer's changes are not applied, and nothing is
+  sent. The peer's rows stay recorded, so a confirm applies exactly what was held.
+- A hold clears itself when the next scan or pass no longer trips a trigger, or the
+  user confirms it (`syncat share confirm-deletes SHARE [--peer P]`), which lets the
+  next held pass through. A missing root or a foreign `.syncat/` cannot be confirmed.
+- Holds are stored in the index, so a restart doesn't forget them. They show in
+  `syncat status`, `GET /api/holds`, and as a banner on every page of the web UI.
 
 ## 8. REST API & CLI
 
@@ -279,7 +326,9 @@ POST /api/subscriptions          # {peer, share_id, local_path, mode}
 PATCH/DELETE /api/subscriptions/{id}     # pause/resume/mode/remove
 GET  /api/approvals              # pending peer + share-access approvals
 POST /api/approvals/{id}         # {decision: grant|deny}
-GET  /api/shares/{id}/trash      # list; POST /restore
+GET  /api/shares/{id}/trash      # events + size/limit; POST /trash/undo {event, paths?}
+PATCH /api/shares/{id}/safety    # hold + trash settings (share or subscription)
+GET  /api/holds                  # every hold; POST /api/shares/{id}/holds/confirm {peer?}
 GET  /api/events                 # SSE stream: conn changes, transfers, conflicts, approvals
 ```
 
@@ -287,12 +336,12 @@ CLI (each maps 1:1 onto the API):
 
 ```
 syncat init [--name NAME]           syncat share add PATH --name N [--perm ro|rw] [--approval]
-syncat daemon [--api ADDR]          syncat share ls|rm|set
+syncat daemon [--api ADDR]          syncat share ls|rm|set|safety|confirm-deletes
 syncat token                        syncat remote ls            # peers' offered shares
 syncat peer add TOKEN [--name N]    syncat subscription add PEER SHARE LOCALPATH [--mode mirror|receive]
 syncat peer ls|rm|approve           syncat subscription ls|rm|pause|resume
 syncat status [--watch]             syncat approvals [grant|deny ID]
-                                    syncat trash ls|restore SHARE [PATH]
+                                    syncat trash ls SHARE | undo SHARE N [PATH...]
 ```
 
 ## 9. Web UI
@@ -313,8 +362,9 @@ stream for live updates. Three views:
    here there was nothing left for a dashboard to summarize.
 2. **Shares** — add/edit local shares (dir path, name, permission dropdown, approval
    toggle), per-share peer access list with revoke, subscriptions with mode + pause,
-   trash browser, conflict list.
-3. **Settings** — rescan interval, trash retention, global ignores, API address.
+   and per share/subscription a trash panel (events with undo) and its hold/trash
+   settings, conflict list. Holds show as a banner on every page.
+3. **Settings** — rescan interval, default trash retention, global ignores, API address.
 
 Style: minimal, clean, dark-mode-aware via `prefers-color-scheme`. A cat 🐱 favicon.
 
@@ -462,7 +512,7 @@ function they mean.)
 3. **Protocol** — framing, handshake with mutual Ed25519 auth, ping/pong. Two in-process nodes shake hands in a test.
 4. **Index** — SQLite schema, scanner, hashing, fsnotify, ignore rules.
 5. **Sync core** — version vectors, reconciler, whole-file transfer with resume, atomic apply, conflict copies. Integration test: two nodes, bidirectional sync incl. a conflict, over `net.Pipe`.
-6. **Modes & safety** — permissions, approval flow, receive-only/read-only direction rules, trash + janitor.
+6. **Modes & safety** — permissions, approval flow, receive-only/read-only direction rules, trash, holds.
 7. **API + CLI** — REST endpoints, SSE, all subcommands.
 8. **Web UI** — the views against the live API.
 9. **Hardening** — path traversal rejection (no `..`/absolute relpaths — verify on every incoming path), frame size limits, fuzz the frame decoder, README.
@@ -471,7 +521,8 @@ function they mean.)
 
 - `go test ./...` — unit tests: version-vector algebra, ignore matching, frame
   codec (incl. `FuzzDecode`), handshake and keepalive, scanner/watcher on temp dirs,
-  trash and its janitor, config schema and overlap rules, REST handlers.
+  the trash (events, undo, expiry, migration), holds, config schema and overlap rules,
+  REST handlers.
 - Integration tests over the loopback test transport (`internal/sync/integration_test.go`):
   bidirectional sync over a nested tree, one-way read-only shares, receive-only revert
   via trash, conflict copy creation, delete-vs-modify resurrect, hostile relpath

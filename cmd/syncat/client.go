@@ -209,6 +209,26 @@ type subscriptionView struct {
 	Warnings  []warningView `json:"warnings"`
 }
 
+type safetyView struct {
+	HoldDeletePercent  int    `json:"hold_delete_percent"`
+	HoldDeleteMin      int    `json:"hold_delete_min"`
+	TrashRetentionDays int    `json:"trash_retention_days"`
+	TrashMaxSize       string `json:"trash_max_size"`
+}
+
+type holdView struct {
+	ShareID     string    `json:"share_id"`
+	ShareName   string    `json:"share_name"`
+	PeerKey     string    `json:"peer_key"`
+	PeerName    string    `json:"peer_name"`
+	Reason      string    `json:"reason"`
+	Deletes     int       `json:"deletes"`
+	Live        int       `json:"live"`
+	Since       time.Time `json:"since"`
+	Confirmed   bool      `json:"confirmed"`
+	Confirmable bool      `json:"confirmable"`
+}
+
 type rejectedView struct {
 	PeerKey  string    `json:"peer_key"`
 	PeerName string    `json:"peer_name"`
@@ -216,11 +236,27 @@ type rejectedView struct {
 	Reason   string    `json:"reason"`
 }
 
-type trashEntryView struct {
-	ShareID   string    `json:"share_id"`
-	RelPath   string    `json:"rel_path"`
-	TrashedAt time.Time `json:"trashed_at"`
-	Size      int64     `json:"size"`
+type trashView struct {
+	ShareID       string           `json:"share_id"`
+	Events        []trashEventView `json:"events"`
+	Size          int64            `json:"size"`
+	Limit         int64            `json:"limit"`
+	RetentionDays int              `json:"retention_days"`
+}
+
+type trashEventView struct {
+	ID     string          `json:"id"`
+	At     time.Time       `json:"at"`
+	Label  string          `json:"label"`
+	Source string          `json:"source"`
+	Size   int64           `json:"size"`
+	Items  []trashItemView `json:"items"`
+}
+
+type trashItemView struct {
+	RelPath string `json:"rel_path"`
+	Kind    string `json:"kind"`
+	Size    int64  `json:"size"`
 }
 
 type statusView struct {
@@ -236,6 +272,7 @@ type statusView struct {
 	Shares        []shareView        `json:"shares"`
 	RemoteShares  []remoteShareView  `json:"remote_shares"`
 	Subscriptions []subscriptionView `json:"subscriptions"`
+	Holds         []holdView         `json:"holds"`
 	Rejected      []rejectedView     `json:"rejected_connections"`
 	Network       map[string]any     `json:"network"`
 }

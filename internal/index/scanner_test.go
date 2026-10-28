@@ -201,6 +201,47 @@ func TestScanDeletionProducesTombstone(t *testing.T) {
 	}
 }
 
+// An unreadable directory is not a deleted one. A permissions change (a
+// container chowning the tree, a mistyped chmod) must not tombstone the
+// directory's contents, because tombstones propagate and delete every
+// peer's copy.
+func TestScanUnreadableDirIsNotDeleted(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	root := t.TempDir()
+	writeFile(t, root, "public.txt", []byte("p"), time.Now())
+	writeFile(t, root, "private/notes.md", []byte("n"), time.Now())
+	writeFile(t, root, "private/sub/deep.md", []byte("d"), time.Now())
+
+	sc := NewScanner(os.DirFS(root), nil)
+	first, err := sc.Scan(context.Background(), "share1", nil)
+	if err != nil {
+		t.Fatalf("first Scan: %v", err)
+	}
+	existing := make(map[string]FileRow, len(first.Added))
+	for _, r := range first.Added {
+		existing[r.RelPath] = r
+	}
+
+	private := filepath.Join(root, "private")
+	if err := os.Chmod(private, 0); err != nil {
+		t.Fatalf("Chmod: %v", err)
+	}
+	t.Cleanup(func() { os.Chmod(private, 0755) })
+
+	second, err := sc.Scan(context.Background(), "share1", existing)
+	if err != nil {
+		t.Fatalf("second Scan: %v", err)
+	}
+	if len(second.Deleted) != 0 {
+		t.Errorf("unreadable directory produced tombstones: %v", rowsPaths(second.Deleted))
+	}
+	if len(second.Warnings) == 0 {
+		t.Error("expected a warning about the unreadable directory")
+	}
+}
+
 func TestScanNestedAndEmptyDirectories(t *testing.T) {
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, "empty"), 0755); err != nil {

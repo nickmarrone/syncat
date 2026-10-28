@@ -69,6 +69,8 @@ type ShareStatus struct {
 	// Access lists every peer with a recorded access decision for this
 	// share (config.Share.Access), in no particular order.
 	Access []ShareAccessEntry
+	// Safety is the hold and trash settings in force, defaults filled in.
+	Safety config.Safety
 }
 
 // RemoteShareStatus is one share a peer offers us, for GET
@@ -115,6 +117,8 @@ type SubscriptionStatus struct {
 	// connection is up).
 	Connected bool
 	Warnings  []WarningStatus
+	// Safety is the hold and trash settings in force, defaults filled in.
+	Safety config.Safety
 }
 
 // RejectedConnection records one inbound connection whose handshake did not
@@ -147,6 +151,9 @@ type Status struct {
 	RemoteShares  []RemoteShareStatus
 	Subscriptions []SubscriptionStatus
 
+	// Holds lists every share or peer link on hold (see holds.go).
+	Holds []HoldStatus
+
 	RejectedConnections []RejectedConnection
 	Network             NetworkStatus
 }
@@ -169,6 +176,7 @@ func (n *Node) Status() Status {
 		shares = append(shares, ShareStatus{
 			ShareID: s.ID, Name: s.Name, Path: s.Path, Permission: s.Permission,
 			ApprovalRequired: s.ApprovalRequired, Access: access,
+			Safety: cfg.SafetyFor(s.ID),
 		})
 	}
 
@@ -177,6 +185,7 @@ func (n *Node) Status() Status {
 		subs = append(subs, SubscriptionStatus{
 			PeerKey: sub.Peer, PeerName: peerNameLocked(cfg, sub.Peer),
 			ShareID: sub.ShareID, LocalPath: sub.LocalPath, Mode: sub.Mode, Paused: sub.Paused,
+			Safety: cfg.SafetyFor(sub.ShareID),
 		})
 	}
 	n.cfgMu.RUnlock()
@@ -229,6 +238,8 @@ func (n *Node) Status() Status {
 		Shares:        shares,
 		RemoteShares:  remoteShares,
 		Subscriptions: subs,
+
+		Holds: n.Holds(),
 
 		RejectedConnections: rejected,
 		Network:             network,

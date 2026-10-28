@@ -74,7 +74,7 @@ type Options struct {
 	Logger *log.Logger
 
 	// Clock drives every timer Node starts (dial backoff, handshake
-	// keepalive, share watchers, the trash janitor). See Clock below.
+	// keepalive, share watchers, the trash sweeper). See Clock below.
 	// RealClock if nil.
 	Clock Clock
 
@@ -88,7 +88,7 @@ type Options struct {
 
 // Node owns one running syncat instance end to end: config, identity,
 // index store, transport, peer connections, share/subscription watchers,
-// and the trash janitor. Construct with Open; shut down with Close.
+// and the trash sweeper. Construct with Open; shut down with Close.
 //
 // Every exported method is safe for concurrent use, including concurrently
 // with the peer manager's own background activity. See mutations.go's
@@ -103,7 +103,6 @@ type Node struct {
 	clock     Clock
 	rand      *rand.Rand
 	trash     *syncsvc.Trash
-	janitor   *syncsvc.Janitor
 
 	startTime time.Time
 
@@ -129,6 +128,12 @@ type Node struct {
 	sharesMu     sync.Mutex
 	shareWatches map[string]*shareWatch // key: share id
 
+	// holdsMu/holds mirror the store's holds table (see holds.go), so the
+	// guard every reconcile pass consults never has to query the database.
+	// Writes go to the store first and to the map only once that succeeded.
+	holdsMu sync.Mutex
+	holds   map[holdKey]index.Hold
+
 	rejectedMu sync.Mutex
 	rejected   []RejectedConnection
 
@@ -150,14 +155,15 @@ const maxInboundHandshakes = 32
 const maxInboundHandshakesPerPeer = 4
 
 // Open loads (or accepts, via Options) config and identity, opens the
-// index store, starts the transport, share watchers, trash janitor, and
+// index store, starts the transport, share watchers, trash sweeper, and
 // peer manager, and returns a fully running Node. The returned Node must
 // be shut down with Close.
 //
 // Startup order matches the SPEC.md §1/§10 lifecycle: config+keys+paths,
 // index store, transport (accepting connections from the moment Start
-// returns), an initial synchronous scan of every configured share and
-// non-paused subscription, the trash janitor, then the peer manager's
+// returns), moving any old data-dir trash into the shares, an initial
+// synchronous scan of every configured share and non-paused subscription,
+// the trash sweeper, then the peer manager's
 // dial supervisors.
 func Open(ctx context.Context, opts Options) (*Node, error) {
 	if opts.Paths == nil {
@@ -178,6 +184,11 @@ func Open(ctx context.Context, opts Options) (*Node, error) {
 	if err != nil {
 		return nil, fmt.Errorf("core: open: %w", err)
 	}
+	holds, err := loadHolds(ctx, store)
+	if err != nil {
+		store.Close()
+		return nil, fmt.Errorf("core: open: %w", err)
+	}
 
 	nodeCtx, cancel := context.WithCancel(context.Background())
 
@@ -192,15 +203,14 @@ func Open(ctx context.Context, opts Options) (*Node, error) {
 		cfg:               in.cfg,
 		peers:             map[string]*peerConn{},
 		shareWatches:      map[string]*shareWatch{},
+		holds:             holds,
 		ctx:               nodeCtx,
 		cancel:            cancel,
 		startTime:         in.clock.Now(),
 		inboundHandshakes: make(chan struct{}, maxInboundHandshakes),
 		inboundPeerCounts: make(map[string]int),
 	}
-	n.trash = syncsvc.NewTrash(opts.Paths.TrashDir(), asSyncClock(in.clock))
-	n.janitor = syncsvc.NewJanitor(n.trash, time.Duration(in.cfg.TrashRetentionDays)*24*time.Hour, asJanitorClock(in.clock), 0, n.onTrashSweep)
-	n.janitor.Start(nodeCtx)
+	n.trash = syncsvc.NewTrash(asSyncClock(in.clock))
 
 	// From here on a failure has to unwind what has already been started.
 	// Once Start is attempted, Close is mandatory even if Start returns an
@@ -208,7 +218,6 @@ func Open(ctx context.Context, opts Options) (*Node, error) {
 	// uninterruptible startup asynchronously.
 	ok, transportAttempted := false, false
 	cleanup := func() {
-		n.janitor.Close()
 		store.Close()
 		if transportAttempted {
 			opts.Transport.Close()
@@ -247,7 +256,9 @@ func Open(ctx context.Context, opts Options) (*Node, error) {
 	n.tokenMu.Unlock()
 
 	n.startJournalSweeper()
+	n.migrateLegacyTrash(in.cfg)
 	n.startConfiguredWatches(in.cfg)
+	n.startTrashSweeper()
 	n.startConfiguredPeers(in.cfg)
 
 	ok = true
@@ -400,7 +411,7 @@ func (n *Node) startConfiguredPeers(cfg *config.Config) {
 // Close shuts the node down in order: stop dialing/accepting new work
 // (cancel the root context), wait for every peer connection and
 // background goroutine Node started to finish tearing itself down, stop
-// the share watchers and trash janitor, close the index store, and
+// the share watchers, close the index store, and
 // finally close the transport. Safe to call more than once; only the
 // first call does anything.
 func (n *Node) Close() error {
@@ -424,9 +435,6 @@ func (n *Node) Close() error {
 			if err := sw.watcher.Close(); err != nil {
 				errs = append(errs, fmt.Errorf("close watcher %s: %w", id, err))
 			}
-		}
-		if err := n.janitor.Close(); err != nil {
-			errs = append(errs, err)
 		}
 		if err := n.store.Close(); err != nil {
 			errs = append(errs, err)
@@ -469,26 +477,6 @@ func (n *Node) goTracked(fn func()) bool {
 		fn()
 	}()
 	return true
-}
-
-// onTrashSweep reports the trash janitor's periodic purge (SPEC.md §7).
-//
-// This callback was previously left nil, which made the janitor completely
-// silent: a sweep that failed (a permissions problem on the trash
-// directory, a disk error) was discarded by the janitor's loop with
-// nothing recorded anywhere, and successful purges deleted the user's only
-// remaining copy of a file with no record that it had happened. Retention
-// deletion is irreversible, so it gets a log line whenever it actually
-// removes something; a sweep that purges nothing (the overwhelmingly
-// common case, once a day) stays quiet.
-func (n *Node) onTrashSweep(purged int, err error) {
-	if err != nil {
-		n.logger.Printf("core: trash sweep failed after purging %d entr%s: %v", purged, plural(purged, "y", "ies"), err)
-		return
-	}
-	if purged > 0 {
-		n.logger.Printf("core: trash sweep purged %d expired entr%s past the retention window", purged, plural(purged, "y", "ies"))
-	}
 }
 
 func plural(n int, one, many string) string {
@@ -685,7 +673,7 @@ func (n *Node) recordRejected(peerKeyHex, peerName, reason string) {
 // Clock abstracts wall-clock time for every timing-dependent piece Node
 // wires together: dial backoff (transport.Backoff/Supervisor), handshake
 // keepalive (protocol.Keepalive), share watchers (index.Watcher), and the
-// trash janitor (sync.Janitor). Each of those packages defines its own
+// trash sweeper. Each of those packages defines its own
 // narrow Clock interface (Now/After, or just After for transport.Clock) for
 // leaf-package independence. Clock here has both methods, so a single
 // value satisfies all of them structurally, letting a test drive every
@@ -720,9 +708,6 @@ func asProtocolClock(c Clock) protocol.Clock { return c }
 
 // asIndexClock adapts a Clock to index.Clock (Now+After).
 func asIndexClock(c Clock) index.Clock { return c }
-
-// asJanitorClock adapts a Clock to syncsvc.JanitorClock (Now+After).
-func asJanitorClock(c Clock) syncsvc.JanitorClock { return c }
 
 // asSyncClock adapts a Clock to syncsvc.Clock (a plain func() time.Time used
 // only to timestamp conflict copies and trash entries).

@@ -798,9 +798,19 @@ func (pc *peerConn) currentSession() *syncsvc.Session {
 func (pc *peerConn) grantShare(sess *syncsvc.Session, shareID, root string, dir syncsvc.Direction) {
 	pc.mu.Lock()
 	defer pc.mu.Unlock()
-	sess.AddShare(syncsvc.ShareConfig{ShareID: shareID, Root: root, Direction: dir, Ignore: pc.node.shareIgnoreFunc(shareID)})
+	sess.AddShare(pc.shareConfig(shareID, root, dir))
 	if pc.session == sess && pc.activeShares != nil {
 		pc.activeShares[shareID] = true
+	}
+}
+
+// shareConfig builds the ShareConfig for shareID on this peer's sessions,
+// with the node's ignore rules and hold guard wired in.
+func (pc *peerConn) shareConfig(shareID, root string, dir syncsvc.Direction) syncsvc.ShareConfig {
+	return syncsvc.ShareConfig{
+		ShareID: shareID, Root: root, Direction: dir,
+		Ignore: pc.node.shareIgnoreFunc(shareID),
+		Guard:  pc.node.shareGuardFunc(shareID, pc.peerKeyHex),
 	}
 }
 
@@ -812,7 +822,7 @@ func (pc *peerConn) reconfigureShare(shareID, root string, dir syncsvc.Direction
 	if pc.session == nil || !pc.activeShares[shareID] {
 		return
 	}
-	pc.session.AddShare(syncsvc.ShareConfig{ShareID: shareID, Root: root, Direction: dir, Ignore: pc.node.shareIgnoreFunc(shareID)})
+	pc.session.AddShare(pc.shareConfig(shareID, root, dir))
 }
 
 // neuterShare blocks a share on this peer's current session, if any (both

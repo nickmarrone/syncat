@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/nickmarrone/syncat/internal/config"
 	"github.com/nickmarrone/syncat/internal/core"
-	syncsvc "github.com/nickmarrone/syncat/internal/sync"
 	"github.com/nickmarrone/syncat/internal/version"
 )
 
@@ -49,6 +49,7 @@ type statusResponse struct {
 	Shares        []shareDTO        `json:"shares"`
 	RemoteShares  []remoteShareDTO  `json:"remote_shares"`
 	Subscriptions []subscriptionDTO `json:"subscriptions"`
+	Holds         []holdDTO         `json:"holds"`
 	Rejected      []rejectedConnDTO `json:"rejected_connections"`
 	Network       map[string]any    `json:"network"`
 }
@@ -102,6 +103,40 @@ type shareDTO struct {
 	Permission       string           `json:"permission"`
 	ApprovalRequired bool             `json:"approval_required"`
 	Access           []shareAccessDTO `json:"access"`
+	Safety           safetyDTO        `json:"safety"`
+}
+
+// safetyDTO is a share's or subscription's hold and trash settings, with
+// defaults filled in.
+type safetyDTO struct {
+	HoldDeletePercent  int    `json:"hold_delete_percent"`
+	HoldDeleteMin      int    `json:"hold_delete_min"`
+	TrashRetentionDays int    `json:"trash_retention_days"`
+	TrashMaxSize       string `json:"trash_max_size"`
+}
+
+func toSafetyDTO(s config.Safety) safetyDTO { return safetyDTO(s) }
+
+// holdDTO is one share, or one peer's link to it, on hold.
+type holdDTO struct {
+	ShareID     string    `json:"share_id"`
+	ShareName   string    `json:"share_name,omitempty"`
+	PeerKey     string    `json:"peer_key,omitempty"` // empty for this node's own copy
+	PeerName    string    `json:"peer_name,omitempty"`
+	Reason      string    `json:"reason"`
+	Deletes     int       `json:"deletes"`
+	Live        int       `json:"live"`
+	Since       time.Time `json:"since"`
+	Confirmed   bool      `json:"confirmed"`
+	Confirmable bool      `json:"confirmable"`
+}
+
+func toHoldDTO(h core.HoldStatus) holdDTO {
+	return holdDTO{
+		ShareID: h.ShareID, ShareName: h.ShareName, PeerKey: h.PeerKey, PeerName: h.PeerName,
+		Reason: h.Reason, Deletes: h.Deletes, Live: h.Live, Since: h.Since,
+		Confirmed: h.Confirmed, Confirmable: h.Confirmable,
+	}
 }
 
 type remoteShareDTO struct {
@@ -134,6 +169,7 @@ type subscriptionDTO struct {
 	Access    string       `json:"access"`
 	Connected bool         `json:"connected"`
 	Warnings  []warningDTO `json:"warnings,omitempty"`
+	Safety    safetyDTO    `json:"safety"`
 }
 
 type rejectedConnDTO struct {
@@ -143,11 +179,29 @@ type rejectedConnDTO struct {
 	Reason   string    `json:"reason"`
 }
 
-type trashEntryDTO struct {
-	ShareID   string    `json:"share_id"`
-	RelPath   string    `json:"rel_path"`
-	TrashedAt time.Time `json:"trashed_at"`
-	Size      int64     `json:"size"`
+// trashDTO is one share's trash: its events, newest first, and its size
+// against its limit.
+type trashDTO struct {
+	ShareID       string          `json:"share_id"`
+	Events        []trashEventDTO `json:"events"`
+	Size          int64           `json:"size"`
+	Limit         int64           `json:"limit"`
+	RetentionDays int             `json:"retention_days"`
+}
+
+type trashEventDTO struct {
+	ID     string         `json:"id"`
+	At     time.Time      `json:"at"`
+	Label  string         `json:"label"`
+	Source string         `json:"source,omitempty"`
+	Size   int64          `json:"size"`
+	Items  []trashItemDTO `json:"items"`
+}
+
+type trashItemDTO struct {
+	RelPath string `json:"rel_path"`
+	Kind    string `json:"kind,omitempty"`
+	Size    int64  `json:"size"`
 }
 
 func toPeerDTO(p core.PeerStatus) peerDTO {
@@ -214,7 +268,7 @@ func toShareDTO(s core.ShareStatus) shareDTO {
 	}
 	return shareDTO{
 		ID: s.ShareID, Name: s.Name, Path: s.Path, Permission: s.Permission,
-		ApprovalRequired: s.ApprovalRequired, Access: access,
+		ApprovalRequired: s.ApprovalRequired, Access: access, Safety: toSafetyDTO(s.Safety),
 	}
 }
 
@@ -237,7 +291,7 @@ func toSubscriptionDTO(s core.SubscriptionStatus) subscriptionDTO {
 	return subscriptionDTO{
 		ID: subscriptionID(s.PeerKey, s.ShareID), PeerKey: s.PeerKey, PeerName: s.PeerName,
 		ShareID: s.ShareID, ShareName: s.ShareName, LocalPath: s.LocalPath, Mode: s.Mode, Paused: s.Paused,
-		Access: s.Access, Connected: s.Connected, Warnings: warnings,
+		Access: s.Access, Connected: s.Connected, Warnings: warnings, Safety: toSafetyDTO(s.Safety),
 	}
 }
 
@@ -245,8 +299,16 @@ func toRejectedConnDTO(r core.RejectedConnection) rejectedConnDTO {
 	return rejectedConnDTO{PeerKey: r.PeerKey, PeerName: r.PeerName, At: r.At, Reason: r.Reason}
 }
 
-func toTrashEntryDTO(e syncsvc.TrashEntry) trashEntryDTO {
-	return trashEntryDTO{ShareID: e.ShareID, RelPath: e.RelPath, TrashedAt: e.TrashedAt, Size: e.Size}
+func toTrashDTO(st core.TrashStatus) trashDTO {
+	out := trashDTO{ShareID: st.ShareID, Size: st.Size, Limit: st.Limit, RetentionDays: st.RetentionDays, Events: make([]trashEventDTO, 0, len(st.Events))}
+	for _, ev := range st.Events {
+		items := make([]trashItemDTO, 0, len(ev.Items))
+		for _, it := range ev.Items {
+			items = append(items, trashItemDTO{RelPath: it.RelPath, Kind: it.Kind, Size: it.Size})
+		}
+		out.Events = append(out.Events, trashEventDTO{ID: ev.ID, At: ev.At, Label: ev.Label, Source: ev.Source, Size: ev.Size, Items: items})
+	}
+	return out
 }
 
 func toStatusResponse(st core.Status) statusResponse {
@@ -266,6 +328,10 @@ func toStatusResponse(st core.Status) statusResponse {
 	for _, s := range st.Subscriptions {
 		subs = append(subs, toSubscriptionDTO(s))
 	}
+	holds := make([]holdDTO, 0, len(st.Holds))
+	for _, h := range st.Holds {
+		holds = append(holds, toHoldDTO(h))
+	}
 	rejected := make([]rejectedConnDTO, 0, len(st.RejectedConnections))
 	for _, r := range st.RejectedConnections {
 		rejected = append(rejected, toRejectedConnDTO(r))
@@ -275,7 +341,7 @@ func toStatusResponse(st core.Status) statusResponse {
 		NodeName: st.NodeName, NodeToken: st.NodeToken, ShortID: st.ShortID, PeerKey: st.PeerKey,
 		StartedAt: st.StartedAt, UptimeSeconds: st.UptimeSeconds,
 		Peers: peers, Shares: shares, RemoteShares: remoteShares, Subscriptions: subs,
-		Rejected: rejected, Network: toNetworkDTO(st.Network),
+		Holds: holds, Rejected: rejected, Network: toNetworkDTO(st.Network),
 	}
 }
 

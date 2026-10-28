@@ -1,14 +1,12 @@
 package core
 
 import (
-	"context"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
 
 	"github.com/nickmarrone/syncat/internal/config"
-	"github.com/nickmarrone/syncat/internal/index"
 	"github.com/nickmarrone/syncat/internal/protocol"
 	syncsvc "github.com/nickmarrone/syncat/internal/sync"
 )
@@ -243,6 +241,9 @@ func (n *Node) AddShare(path, name, permission string, approvalRequired bool) (s
 	id, err := config.NewShareID()
 	if err != nil {
 		return "", fmt.Errorf("core: add share: %w", err)
+	}
+	if err := syncsvc.EnsureReservedDir(path); errors.Is(err, syncsvc.ErrReservedDirTaken) {
+		return "", mutationError(MutationConflict, fmt.Errorf("core: add share: %w; move it away first", err))
 	}
 
 	if _, err := n.mutateConfig(func(cfg *config.Config) error {
@@ -496,6 +497,9 @@ func (n *Node) AddSubscription(peerRef, shareRef, localPath, mode string) error 
 	if err := os.MkdirAll(localPath, 0o700); err != nil {
 		return fmt.Errorf("core: add subscription: create local path: %w", err)
 	}
+	if err := syncsvc.EnsureReservedDir(localPath); errors.Is(err, syncsvc.ErrReservedDirTaken) {
+		return mutationError(MutationConflict, fmt.Errorf("core: add subscription: %w; move it away first", err))
+	}
 
 	if _, err := n.mutateConfig(func(cfg *config.Config) error {
 		if err := cfg.CheckSubscriptionPath(localPath); err != nil {
@@ -597,6 +601,61 @@ func (n *Node) PauseSubscription(peerRef, shareRef string, paused bool) error {
 	return nil
 }
 
+// SetSafety replaces the hold and trash settings of a share this node
+// offers or subscribes to (see config.Safety; zero fields mean "use the
+// default"). It returns the settings now in force, defaults filled in.
+// They are read fresh by every scan, reconcile pass, and trash sweep, so
+// nothing else needs restarting.
+func (n *Node) SetSafety(shareRef string, s config.Safety) (config.Safety, error) {
+	shareID, err := n.resolveShareOrSubscriptionRef(shareRef)
+	if err != nil {
+		return config.Safety{}, fmt.Errorf("core: set safety: %w", err)
+	}
+	if err := s.Validate(); err != nil {
+		return config.Safety{}, mutationError(MutationInvalid, fmt.Errorf("core: set safety: %w", err))
+	}
+	cfg, err := n.mutateConfig(func(cfg *config.Config) error {
+		found := false
+		if i := findShareIndex(cfg, shareID); i >= 0 {
+			cfg.Shares[i].Safety, found = s, true
+		}
+		for i := range cfg.Subscriptions {
+			if cfg.Subscriptions[i].ShareID == shareID {
+				cfg.Subscriptions[i].Safety, found = s, true
+			}
+		}
+		if !found {
+			return mutationErrorf(MutationNotFound, "share %s is not a local share or subscription", shareID)
+		}
+		return nil
+	})
+	if err != nil {
+		return config.Safety{}, fmt.Errorf("core: set safety: %w", err)
+	}
+	n.debugf("core: share %s safety set to %+v", shareID, s)
+	return cfg.SafetyFor(shareID), nil
+}
+
+// Safety returns the raw (unfilled) settings for a share or subscription,
+// for a caller that wants to change one field and keep the rest.
+func (n *Node) Safety(shareRef string) (config.Safety, error) {
+	shareID, err := n.resolveShareOrSubscriptionRef(shareRef)
+	if err != nil {
+		return config.Safety{}, fmt.Errorf("core: safety: %w", err)
+	}
+	n.cfgMu.RLock()
+	defer n.cfgMu.RUnlock()
+	if i := findShareIndex(n.cfg, shareID); i >= 0 {
+		return n.cfg.Shares[i].Safety, nil
+	}
+	for _, sub := range n.cfg.Subscriptions {
+		if sub.ShareID == shareID {
+			return sub.Safety, nil
+		}
+	}
+	return config.Safety{}, mutationErrorf(MutationNotFound, "share %s is not a local share or subscription", shareID)
+}
+
 // --- node mutation -----------------------------------------------------------
 
 // RenameNode changes this node's display name, persisting it and
@@ -619,89 +678,4 @@ func (n *Node) RenameNode(name string) error {
 	}
 	n.debugf("core: node renamed to %q", name)
 	return nil
-}
-
-// --- trash (SPEC.md §7) -----------------------------------------------------
-
-// shareOrSubscriptionRoot resolves shareID to the local directory its
-// trash entries live under: the share's own path if this node offers it,
-// or the local subscription path if this node subscribes to it from a
-// peer. Reads the live in-memory config under cfgMu, so it reflects any
-// mutation that has already been applied in this process.
-func (n *Node) shareOrSubscriptionRoot(shareID string) (string, error) {
-	n.cfgMu.RLock()
-	defer n.cfgMu.RUnlock()
-	for _, s := range n.cfg.Shares {
-		if s.ID == shareID {
-			return s.Path, nil
-		}
-	}
-	for _, sub := range n.cfg.Subscriptions {
-		if sub.ShareID == shareID {
-			return sub.LocalPath, nil
-		}
-	}
-	return "", mutationErrorf(MutationNotFound, "share %s is not a local share or subscription", shareID)
-}
-
-// ListTrash returns every trashed entry for shareID (SPEC.md §7),
-// most-recently-trashed first. shareID must be a locally offered share or
-// subscription; an empty result (not an error) means nothing has been
-// trashed for it yet.
-func (n *Node) ListTrash(shareRef string) ([]syncsvc.TrashEntry, error) {
-	shareID, err := n.resolveShareOrSubscriptionRef(shareRef)
-	if err != nil {
-		return nil, fmt.Errorf("core: list trash: %w", err)
-	}
-	if _, err := n.shareOrSubscriptionRoot(shareID); err != nil {
-		return nil, fmt.Errorf("core: list trash: %w", err)
-	}
-	entries, err := n.trash.List(shareID)
-	if err != nil {
-		return nil, fmt.Errorf("core: list trash: %w", err)
-	}
-	return entries, nil
-}
-
-// RestoreTrash restores the most-recently-trashed entry for shareID/relPath
-// (SPEC.md §7): copies the trashed content back into the share's live root
-// with a bumped version vector, then triggers an immediate rescan so the
-// restore propagates to peers right away (unlike the offline `syncat
-// trash restore` path, which requires a later rescan since no daemon is
-// running to trigger one). Returns an error wrapping
-// syncsvc.ErrRestoreDestExists if the destination is already occupied.
-func (n *Node) RestoreTrash(ctx context.Context, shareRef, relPath string) (index.FileRow, error) {
-	shareID, err := n.resolveShareOrSubscriptionRef(shareRef)
-	if err != nil {
-		return index.FileRow{}, fmt.Errorf("core: restore trash: %w", err)
-	}
-	root, err := n.shareOrSubscriptionRoot(shareID)
-	if err != nil {
-		return index.FileRow{}, fmt.Errorf("core: restore trash: %w", err)
-	}
-
-	entries, err := n.trash.List(shareID)
-	if err != nil {
-		return index.FileRow{}, fmt.Errorf("core: restore trash: %w", err)
-	}
-	var match *syncsvc.TrashEntry
-	for i := range entries {
-		if entries[i].RelPath == relPath {
-			match = &entries[i]
-			break
-		}
-	}
-	if match == nil {
-		return index.FileRow{}, mutationErrorf(MutationNotFound, "core: restore trash: no trashed entry %q for share %s", relPath, shareID)
-	}
-
-	row, err := n.trash.Restore(ctx, n.store, n.identity.ShortID(), root, *match)
-	if err != nil {
-		return index.FileRow{}, fmt.Errorf("core: restore trash: %w", err)
-	}
-	if err := n.rescanShare(ctx, shareID); err != nil {
-		n.logger.Printf("core: restore trash: rescan %s after restore: %v", shareID, err)
-	}
-	n.debugf("core: restored %s/%s from trash", shareID, relPath)
-	return row, nil
 }

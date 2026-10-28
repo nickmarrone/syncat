@@ -786,7 +786,7 @@ func TestIntegration_ReceiveOnlyRevertsLocalEditViaTrash(t *testing.T) {
 	dirOfferer := DirectionFor(config.PermissionReadWrite, "")
 	dirSubscriber := DirectionFor("", config.ModeReceiveOnly)
 
-	tr := NewTrash(filepath.Join(t.TempDir(), "trash"), nil)
+	tr := NewTrash(nil)
 	sOfferer, sSubscriber := connectSessionsWithOptions(t, offerer, subscriber, dirOfferer, dirSubscriber, SessionOptions{}, SessionOptions{Trash: tr})
 
 	mustSync(t, sOfferer, testShareID)
@@ -819,15 +819,15 @@ func TestIntegration_ReceiveOnlyRevertsLocalEditViaTrash(t *testing.T) {
 	})
 
 	// The subscriber's locally-modified content must have been trashed,
-	// not just discarded.
-	entries, err := tr.List(testShareID)
+	// not just discarded, in the subscription's own folder.
+	events, err := tr.List(subscriber.root)
 	if err != nil {
 		t.Fatalf("trash List: %v", err)
 	}
-	if len(entries) != 1 || entries[0].RelPath != "notes.txt" {
-		t.Fatalf("expected exactly one trashed notes.txt entry, got %+v", entries)
+	if len(events) != 1 || len(events[0].Items) != 1 || events[0].Items[0].RelPath != "notes.txt" || events[0].Items[0].Kind != TrashOverwritten {
+		t.Fatalf("expected exactly one overwritten notes.txt in the trash, got %+v", events)
 	}
-	trashedData, err := os.ReadFile(entries[0].trashAbs)
+	trashedData, err := os.ReadFile(filepath.Join(subscriber.root, ReservedDirName, "trash", events[0].ID, "notes.txt"))
 	if err != nil {
 		t.Fatalf("read trashed copy: %v", err)
 	}
@@ -862,7 +862,7 @@ func TestIntegration_RestorePropagatesAsNewChange(t *testing.T) {
 	writeFile(t, a.root, "keepme.txt", "original content")
 	indexFile(t, a.store, a.id, "keepme.txt", a.root)
 
-	tr := NewTrash(filepath.Join(t.TempDir(), "trash"), nil)
+	tr := NewTrash(nil)
 	sa, sb := connectSessionsWithOptions(t, a, b, Direction{}, Direction{}, SessionOptions{Trash: tr}, SessionOptions{})
 
 	mustSync(t, sa, testShareID)
@@ -885,20 +885,21 @@ func TestIntegration_RestorePropagatesAsNewChange(t *testing.T) {
 		_, err := os.Stat(filepath.Join(a.root, "keepme.txt"))
 		return os.IsNotExist(err)
 	})
-	entries, err := tr.List(testShareID)
+	events, err := tr.List(a.root)
 	if err != nil {
 		t.Fatalf("trash List: %v", err)
 	}
-	if len(entries) != 1 || entries[0].RelPath != "keepme.txt" {
-		t.Fatalf("expected keepme.txt to be trashed on A, got %+v", entries)
+	if len(events) != 1 || len(events[0].Items) != 1 || events[0].Items[0].RelPath != "keepme.txt" {
+		t.Fatalf("expected keepme.txt to be trashed on A, got %+v", events)
 	}
 
 	// Restore on A: content comes back, and the version is bumped so it
 	// dominates the tombstone currently in A's index.
-	row, err := tr.Restore(context.Background(), a.store, a.id, a.root, entries[0])
-	if err != nil {
-		t.Fatalf("Restore: %v", err)
+	rows, err := tr.Restore(context.Background(), a.store, a.id, testShareID, a.root, events[0].ID, nil)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("Restore: %v (rows %+v)", err, rows)
 	}
+	row := rows[0]
 	if row.Deleted {
 		t.Fatal("restored row must not be a tombstone")
 	}

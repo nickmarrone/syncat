@@ -187,7 +187,9 @@ func (sc *Scanner) visit(result *ScanResult, existing map[string]FileRow, seen m
 		// between being listed by its parent and being visited here.
 		// Skip and continue (never abort the whole scan).
 		result.warnf("index: scan %s: skip %s (vanished or unreadable): %v", shareID, p, err)
-		if d != nil && d.IsDir() {
+		isDir := d != nil && d.IsDir()
+		keepUnreadable(existing, seen, path.Clean(p), isDir, err)
+		if isDir {
 			return fs.SkipDir
 		}
 		return nil
@@ -206,6 +208,11 @@ func (sc *Scanner) visit(result *ScanResult, existing map[string]FileRow, seen m
 		return nil
 	}
 
+	if relpath == ReservedDirName && d.IsDir() {
+		// syncat's own directory: never descend, whatever the ignore
+		// rules say about pruning.
+		return fs.SkipDir
+	}
 	if sc.ignore.MatchPath(relpath, d.IsDir()) {
 		sc.noteIgnored(result, existing, seen, relpath)
 		if d.IsDir() && sc.ignore.PruneDirs() {
@@ -230,6 +237,7 @@ func (sc *Scanner) visit(result *ScanResult, existing map[string]FileRow, seen m
 	info, err := d.Info()
 	if err != nil {
 		result.warnf("index: scan %s: skip %s (stat failed, likely vanished): %v", shareID, relpath, err)
+		keepUnreadable(existing, seen, relpath, d.IsDir(), err)
 		if d.IsDir() {
 			return fs.SkipDir
 		}
@@ -318,6 +326,33 @@ func (sc *Scanner) noteIgnoredSubtree(result *ScanResult, existing map[string]Fi
 	for relpath := range existing {
 		if strings.HasPrefix(relpath, prefix) {
 			sc.noteIgnored(result, existing, seen, relpath)
+		}
+	}
+}
+
+// keepUnreadable marks relpath, and every indexed path beneath it when it
+// is a directory, as seen when the scan could not read it for any reason
+// other than its being gone. Those rows then keep their current index
+// entries instead of falling through to Scan's tail loop and being
+// tombstoned.
+//
+// This is the same rule noteIgnored enforces for ignored paths: a
+// tombstone propagates and deletes every peer's copy, so only a path that
+// is really absent (fs.ErrNotExist) may become one. A permissions change
+// that makes a subtree unreadable leaves the files on disk, and must not
+// tell peers to delete them.
+func keepUnreadable(existing map[string]FileRow, seen map[string]bool, relpath string, isDir bool, err error) {
+	if errors.Is(err, fs.ErrNotExist) {
+		return
+	}
+	seen[relpath] = true
+	if !isDir {
+		return
+	}
+	prefix := relpath + "/"
+	for p := range existing {
+		if strings.HasPrefix(p, prefix) {
+			seen[p] = true
 		}
 	}
 }
@@ -490,6 +525,11 @@ func (m *Matcher) Match(relpath string) bool {
 // isDir says whether relpath names a directory, which directory-only
 // patterns ("build/") need in order to match.
 func (m *Matcher) MatchPath(relpath string, isDir bool) bool {
+	// syncat's own directory at the share root, before anything else, and
+	// even for a nil Matcher: it is excluded by what it is, not by a rule.
+	if relpath == ReservedDirName || strings.HasPrefix(relpath, ReservedDirName+"/") {
+		return true
+	}
 	if m == nil {
 		return false
 	}

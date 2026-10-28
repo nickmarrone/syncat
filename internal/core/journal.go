@@ -26,13 +26,13 @@ const journalRetention = 7 * 24 * time.Hour
 // journalSweepInterval is how often the retention window is applied. The
 // journal only ever grows between sweeps, and one sweep is a single
 // indexed DELETE (change_journal_retention covers created_at), so there is
-// nothing to gain from running it more often than the trash janitor does.
+// nothing to gain from running it more often than daily.
 const journalSweepInterval = 24 * time.Hour
 
 // startJournalSweeper runs the retention sweep on journalSweepInterval for
 // the life of the node.
 //
-// Like index.Watcher's periodic rescan and the trash janitor, the first
+// Like index.Watcher's periodic rescan and the trash sweeper, the first
 // pass happens after one interval rather than at startup: nothing here is
 // urgent, and a daemon that restarts frequently should not spend each
 // start deleting rows.

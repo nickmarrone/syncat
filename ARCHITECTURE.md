@@ -50,8 +50,7 @@ flowchart LR
             API["REST API + web UI<br/>127.0.0.1:8347"]
             Core["Node<br/>(internal/core)"]
             DB[("index.db<br/>SQLite")]
-            FS[/"Share and<br/>subscription dirs"/]
-            Trash[/"Trash"/]
+            FS[/"Share and subscription dirs<br/>(trash in .syncat/)"/]
         end
     end
     subgraph remote["Remote machine"]
@@ -63,7 +62,6 @@ flowchart LR
     API --> Core
     Core <--> DB
     Core <--> FS
-    Core --> Trash
     Core <-- "tailcat tunnel<br/>TCP 4197<br/>framed CBOR" --> Peer
 ```
 
@@ -118,7 +116,7 @@ Dependency rules:
   `VersionVector`.
 - `internal/transport` returns a plain `net.Conn`. It knows nothing about the
   protocol that runs on that connection.
-- `internal/api` imports `internal/sync` only for the `TrashEntry` type.
+- `internal/api` imports `internal/sync` only to classify `ErrRestoreDestExists`.
 
 ### Package summary
 
@@ -128,7 +126,7 @@ Dependency rules:
 | `internal/api` | Expose the node over loopback HTTP as JSON. | `Server` |
 | `internal/webui` | Serve the embedded single-page UI. | `Handler`, `Assets` |
 | `internal/core` | Own the running node and connect every other part. | `Node`, `peerConn`, `shareWatch`, `Status` |
-| `internal/sync` | Keep shares in agreement with one peer over one connection. | `Session`, `Action`, `Direction`, `Trash`, `Janitor` |
+| `internal/sync` | Keep shares in agreement with one peer over one connection. | `Session`, `Action`, `Direction`, `Trash`, `TrashEvent` |
 | `internal/index` | Record what is on disk and what peers report. | `Store`, `Scanner`, `Watcher`, `Matcher` |
 | `internal/protocol` | Define and encode the peer wire protocol. | `MsgType`, `Reader`, `StreamWriter`, `Keepalive` |
 | `internal/transport` | Create connections to peers. | `Transport`, `TailcatTransport`, `PipeTransport`, `Supervisor` |
@@ -417,7 +415,7 @@ the standard `sync` package.
 | `transfer.go` | Pull and serve file data, cancel transfers, and detect stalls |
 | `apply.go` | Carry out actions on disk and move replaced files to the trash |
 | `path.go` | Validate a peer path and join it to a share root |
-| `trash.go` | Trash store, restore, and the retention `Janitor` |
+| `trash.go` | The in-share trash: events, listing, restore, expiry, and migrating the old trash |
 
 **Session anatomy.** `Session` spans four files. `session.go` owns lifecycle
 and index work. `dispatch.go` checks and schedules received frames.
@@ -490,10 +488,20 @@ destination. syncat checks the size and SHA-256, moves any existing file to
 the trash, and renames the temporary file into place. `SweepTempFiles` removes
 temporary files left by a crash. It runs at startup.
 
-**Trash.** `Trash.Put` moves a file to
-`trash/<share-id>/<relpath>.<unix-time>`. `Trash.Restore` moves it back and
-writes a new index row. The `Janitor` deletes entries older than the retention
-period (30 days by default).
+**Trash.** Each reconcile pass starts a `TrashEvent` (`Trash.BeginPeerEvent`)
+and carries it in the context to `trashHook`. `TrashEvent.Put` moves a file to
+`<share>/.syncat/trash/<event>/<relpath>` and appends a line to the event's log
+in `.syncat/trash-events/`. A hook with no event fails closed. `Trash.Restore`
+moves files back (trashing whatever is in the way into a new event) and writes
+bumped index rows. `Trash.Sweep` removes whole events past the retention period
+or, oldest first, over the size limit, never the newest. `ValidateRelPath`
+rejects any peer path into `.syncat/`, and the scanner never indexes it.
+
+**Hold guard.** `ShareConfig.Guard` is asked before a reconcile pass applies
+anything, with how many live files the pass would delete. Core supplies it (see
+`core/holds.go`). When it says no, the pass is skipped; the peer's rows are
+already in `peer_files`, so a later `ReconcileShare` applies exactly what was
+held.
 
 ### `internal/core`
 
@@ -525,7 +533,8 @@ flowchart LR
         peers["peers<br/>map key → *peerConn"]
         watches["shareWatches<br/>map share ID → *shareWatch"]
         store[("store")]
-        trash["trash + janitor"]
+        trash["trash + sweeper"]
+        holds["holds<br/>(holdsMu)"]
         tr["transport"]
     end
     subgraph peerConn
@@ -548,7 +557,7 @@ flowchart LR
   `KeepConnection`. The losing connection is closed. A second winning
   connection is closed as redundant.
 - When a connection is adopted, core creates a `Session`, connects the session
-  to the trash and the control handler, and then sends the
+  to the trash, the hold guard, and the control handler, and then sends the
   share list and subscription requests.
 - `provisionShareForRequest` and `provisionAccessUpdate` run on the session's
   read-loop goroutine. The share must be known to the session before the next
@@ -607,7 +616,9 @@ hand-written single-page UI (`index.html`, `app.js`, `style.css`) with
 | `GET, POST /api/shares`, `PATCH, DELETE /api/shares/{id}` | `AddShare`, `RenameShare`, `SetSharePermission`, `SetShareApprovalRequired`, `SetShareAccess`, `RemoveShare` |
 | `GET /api/remote-shares` | `Status` |
 | `GET, POST /api/subscriptions`, `PATCH, DELETE /api/subscriptions/{id}` | `AddSubscription`, `PauseSubscription`, `RemoveSubscription` |
-| `GET /api/shares/{id}/trash`, `POST /api/shares/{id}/trash/restore` | `ListTrash`, `RestoreTrash` |
+| `GET /api/shares/{id}/trash`, `POST /api/shares/{id}/trash/undo` | `ListTrash`, `UndoTrash` |
+| `PATCH /api/shares/{id}/safety` | `Safety`, `SetSafety` |
+| `GET /api/holds`, `POST /api/shares/{id}/holds/confirm` | `Holds`, `ConfirmHold` |
 | `GET /ui-token` | Returns the API token to the web UI |
 | `GET /` | Embedded web UI |
 
@@ -668,21 +679,23 @@ sequenceDiagram
     CLI->>Tr: NewTailcatTransport
     CLI->>Core: Open(paths, config, transport)
     Core->>Cfg: load or create identity key
-    Core->>Idx: Open index.db, run migrations
-    Core->>Sync: NewTrash, NewJanitor
+    Core->>Idx: Open index.db, run migrations, load holds
+    Core->>Sync: NewTrash
     Core->>Tr: Start(onAccept)
     Core->>Tr: LocalAddress
     Core->>Cfg: EncodeToken (local sc1 token)
     Core->>Core: start journal sweeper
+    Core->>Sync: move old data-dir trash into each share
     Core->>Idx: watcher + first scan for each share and subscription
+    Core->>Core: start trash sweeper
     Core->>Tr: one dial supervisor for each enabled peer
     Core-->>CLI: *Node
     CLI->>API: NewServer(node), Serve
 ```
 
-On a start failure, cleanup closes the janitor, the store, and the transport.
-On shutdown, the node cancels its context, waits for every tracked goroutine,
-then closes watchers, trash, store, and transport.
+On a start failure, cleanup closes the store and the transport. On shutdown,
+the node cancels its context, waits for every tracked goroutine (the sweepers
+among them), then closes watchers, store, and transport.
 
 ### Connect to a peer
 
@@ -916,8 +929,13 @@ identity as hostile.
 
 - Every peer path passes through `ValidateRelPath` and `JoinSharePath`.
   `Reconcile` drops a remote row with an invalid path.
-- A remote delete or overwrite moves the old file to the trash first.
+- A remote delete or overwrite moves the old file to the trash first. A trash
+  failure aborts the delete or overwrite.
 - A local delete does not use the trash.
+- A scan or a peer's pass that would delete a bulk of a share, or all of it,
+  or that finds the share root missing, is held instead of applied
+  (`core/holds.go`). An unreadable path is never a delete.
+- No peer path may point into `.syncat/`.
 - A pulled file is written to a temporary file and checked against its
   SHA-256 before it replaces anything.
 - The scanner does not follow symbolic links.
@@ -935,7 +953,7 @@ or base64 does not encrypt the data. Files that contain credentials have mode
 | `~/.local/share/syncat/keys/identity.key` | Ed25519 private identity key | The key can impersonate this syncat node. |
 | `~/.local/share/syncat/keys/tailcat.key` | Tailcat private key and WireGuard pre-shared key | The key can reproduce this node's tailcat server identity and address. |
 | `~/.local/share/syncat/db/index.db` | File metadata, hashes, peer state, and journal data | The database can disclose names and synchronization history. |
-| `~/.local/share/syncat/trash/...` | File content that syncat replaced or deleted | The trash can contain sensitive historical content. |
+| `<share>/.syncat/trash/...` | File content that a peer's change replaced or deleted | The trash can contain sensitive historical content. It sits inside the share, with the share's own permissions. |
 
 The file modes prevent access by other unprivileged users when ownership and
 directory permissions are correct. They do not prevent access by the same
@@ -994,6 +1012,7 @@ Some environments need `TS_PERMIT_TOOLCHAIN_MISMATCH=1` for tailcat tests.
 | Name or ID resolution | `core/resolve.go` |
 | Share access or approval | `core/access.go`, `core/approvals.go`, `core/mutations.go` |
 | Peer path check | `sync/path.go` |
-| Trash retention | `sync/trash.go` |
+| Trash events and retention | `sync/trash.go`, `core/trash.go` |
+| Holds | `core/holds.go`, `sync/session.go` `ShareConfig.Guard`, `index/holds.go` |
 | Wire format | `protocol/message.go` |
 | Web UI token check | `api/server.go`, `webui/static/app.js` |
