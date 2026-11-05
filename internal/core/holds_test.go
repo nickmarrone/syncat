@@ -16,6 +16,7 @@ import (
 	"github.com/nickmarrone/syncat/internal/config"
 	"github.com/nickmarrone/syncat/internal/hold"
 	"github.com/nickmarrone/syncat/internal/index"
+	"github.com/nickmarrone/syncat/internal/protocol"
 	"github.com/nickmarrone/syncat/internal/transport"
 )
 
@@ -295,6 +296,60 @@ func TestRemovingASubscriptionForgetsItsPeerHold(t *testing.T) {
 	}
 }
 
+// Revoking a peer's access to a share shuts it out as surely as removing
+// it, so the peer's hold on that share has to go too. It used to stay
+// listed until the peer was removed or let back in.
+func TestRevokingAccessForgetsThePeersHold(t *testing.T) {
+	nodeA := newTestNode(t, "nodeA")
+	nodeB := newTestNode(t, "nodeB")
+
+	shareDir := t.TempDir()
+	writeNumberedFiles(t, shareDir, 25)
+	shareID, err := nodeA.AddShare(shareDir, "docs", config.PermissionReadWrite, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := nodeA.AddPeer("nodeB", peerToken(t, nodeB)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := nodeB.AddPeer("nodeA", peerToken(t, nodeA)); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool { return peerConnected(nodeA) && peerConnected(nodeB) })
+
+	localDir := t.TempDir()
+	if err := nodeB.AddSubscription(nodeA.PeerKey(), shareID, localDir, config.ModeMirror); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool { return countFiles(localDir) == 25 })
+	// The subscriber's own guard is loosened, so the delete leaves it.
+	if _, err := nodeB.SetSafety(shareID, config.Safety{HoldDeletePercent: 100, HoldDeleteMin: 1000}); err != nil {
+		t.Fatal(err)
+	}
+
+	removeNumberedFiles(t, localDir, 22)
+	if err := nodeB.RescanShare(context.Background(), shareID); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool { return len(nodeA.Holds()) == 1 })
+	if h := nodeA.Holds()[0]; h.PeerKey != nodeB.PeerKey() {
+		t.Fatalf("hold on A = %+v, want one on nodeB's changes", h)
+	}
+
+	if err := nodeA.SetShareAccess(shareID, nodeB.PeerKey(), protocol.AccessRevoked); err != nil {
+		t.Fatalf("SetShareAccess revoke: %v", err)
+	}
+	if holds := nodeA.Holds(); len(holds) != 0 {
+		t.Errorf("Holds() on A after revoking nodeB = %+v, want none", holds)
+	}
+	if stored := storedHolds(t, nodeA); len(stored) != 0 {
+		t.Errorf("stored holds on A = %+v, want none", stored)
+	}
+	if got := countFiles(shareDir); got != 25 {
+		t.Errorf("A's share has %d files after the revoke, want all 25 kept", got)
+	}
+}
+
 // A hold left behind by a removal on an older release is dropped at
 // startup.
 func TestOpenForgetsHoldsOfUnconfiguredShares(t *testing.T) {
@@ -350,7 +405,15 @@ func TestConfiguredLinks(t *testing.T) {
 	const offerer = "ffff"
 	cfg := config.Default()
 	cfg.Peers = []config.Peer{{Name: "laptop", Token: tok, Enabled: true}}
-	cfg.Shares = []config.Share{{ID: "mine"}}
+	cfg.Shares = []config.Share{
+		{ID: "mine"},
+		{ID: "revoked", Access: map[string]string{peerKey: protocol.AccessRevoked}},
+		{ID: "denied", Access: map[string]string{peerKey: protocol.AccessDenied}},
+		{ID: "pending-open", Access: map[string]string{peerKey: protocol.AccessPending}},
+		{ID: "approval", ApprovalRequired: true},
+		{ID: "approval-pending", ApprovalRequired: true, Access: map[string]string{peerKey: protocol.AccessPending}},
+		{ID: "approval-granted", ApprovalRequired: true, Access: map[string]string{peerKey: protocol.AccessGranted}},
+	}
 	cfg.Subscriptions = []config.Subscription{{Peer: offerer, ShareID: "theirs"}}
 
 	keep := configuredLinks(cfg)
@@ -366,6 +429,13 @@ func TestConfiguredLinks(t *testing.T) {
 		{hold.Link{ShareID: "theirs", PeerKey: offerer}, true},
 		{hold.Link{ShareID: "theirs", PeerKey: peerKey}, false},
 		{hold.Link{ShareID: "gone", PeerKey: peerKey}, false},
+		{hold.Link{ShareID: "revoked"}, true},
+		{hold.Link{ShareID: "revoked", PeerKey: peerKey}, false},
+		{hold.Link{ShareID: "denied", PeerKey: peerKey}, false},
+		{hold.Link{ShareID: "pending-open", PeerKey: peerKey}, true},
+		{hold.Link{ShareID: "approval", PeerKey: peerKey}, false},
+		{hold.Link{ShareID: "approval-pending", PeerKey: peerKey}, false},
+		{hold.Link{ShareID: "approval-granted", PeerKey: peerKey}, true},
 	} {
 		if got := keep(tc.link); got != tc.want {
 			t.Errorf("keep(%+v) = %v, want %v", tc.link, got, tc.want)

@@ -14,7 +14,8 @@ holds that 0.5.0 left behind for removed shares are dropped (see below).
   `syncat status` and in a web UI banner that couldn't be dismissed, and
   confirming them failed because the share was gone. Removing one now forgets
   its holds, and holds already left behind are dropped when the daemon
-  starts.
+  starts. Denying or revoking a peer's access to a share forgets that peer's
+  hold on it too.
 - **`syncat share set NAME` said the share wasn't configured.** Changing a
   share's name, permission, or approval setting worked only with its full id,
   though the usage text says names and id prefixes work. `syncat subscription

@@ -9,6 +9,7 @@ import (
 	"github.com/nickmarrone/syncat/internal/config"
 	"github.com/nickmarrone/syncat/internal/hold"
 	"github.com/nickmarrone/syncat/internal/index"
+	"github.com/nickmarrone/syncat/internal/protocol"
 )
 
 // This file connects the node to its hold guard (n.holds, see
@@ -49,18 +50,27 @@ func (n *Node) peerDisplayName(peerKey string) string {
 
 // configuredLinks returns whether a hold's link still names something cfg
 // configures: this node's own copy of a share it offers or subscribes to,
-// or a peer's link to one (a configured peer for a share this node offers,
-// or this node's subscription to that peer's share). Everything else can
-// never be scanned or synced again, so its hold could never clear.
+// or a peer's link to one (a configured peer with access to a share this
+// node offers, or this node's subscription to that peer's share).
+// Everything else can never be scanned or synced again, so its hold could
+// never clear. Forgetting one is always safe: if the link comes back, its
+// next change is measured afresh and held again if it still needs to be.
 //
 // It copies what it needs out of cfg, so the result stays valid after cfg
 // is replaced.
 func configuredLinks(cfg *config.Config) func(hold.Link) bool {
-	offered := make(map[string]bool, len(cfg.Shares))
 	local := make(map[string]bool, len(cfg.Shares)+len(cfg.Subscriptions))
+	access := make(map[hold.Link]bool)
+	open := make(map[string]bool, len(cfg.Shares))
 	for _, s := range cfg.Shares {
-		offered[s.ID] = true
 		local[s.ID] = true
+		open[s.ID] = !s.ApprovalRequired
+		for key, a := range s.Access {
+			switch a {
+			case protocol.AccessGranted, protocol.AccessDenied, protocol.AccessRevoked:
+				access[hold.Link{ShareID: s.ID, PeerKey: key}] = a == protocol.AccessGranted
+			}
+		}
 	}
 	subscribed := make(map[hold.Link]bool, len(cfg.Subscriptions))
 	for _, s := range cfg.Subscriptions {
@@ -77,8 +87,21 @@ func configuredLinks(cfg *config.Config) func(hold.Link) bool {
 		if l.PeerKey == "" {
 			return local[l.ShareID]
 		}
-		return subscribed[l] || (offered[l.ShareID] && peers[l.PeerKey])
+		return subscribed[l] || (peers[l.PeerKey] && hasAccess(l, access, open))
 	}
+}
+
+// hasAccess returns whether l's peer may sync l's share, which this node
+// offers: a grant always counts, a denial or revocation never does, and
+// otherwise (no decision, or one still pending) the peer may only if the
+// share needs no approval. That last part is provisionShareForRequest's
+// rule, but here a revocation counts even on such a share, since it shuts
+// the peer out until it subscribes again.
+func hasAccess(l hold.Link, access map[hold.Link]bool, open map[string]bool) bool {
+	if granted, decided := access[l]; decided {
+		return granted
+	}
+	return open[l.ShareID]
 }
 
 // shareGuardFunc returns the syncsvc.ShareConfig.Guard for shareID on the
