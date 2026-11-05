@@ -15,7 +15,7 @@
 // peers' changes into a folder in that state is how the damage would spread
 // the other way.
 //
-// A hold ends one of two ways:
+// A hold ends one of three ways:
 //
 //   - The folder is fixed, so the next scan or pass would delete nothing and
 //     the hold clears itself. Getting back under the thresholds is not
@@ -24,6 +24,9 @@
 //     deletes.
 //   - The user confirms it (Confirm), and the next change that would have
 //     been held applies instead.
+//   - The share, subscription, or peer is no longer configured, and Retain
+//     forgets it. Nothing would ever scan or sync that link again, so the
+//     hold could not clear any other way.
 package hold
 
 import (
@@ -127,7 +130,7 @@ type Options struct {
 	// Now stamps a new hold. nil means time.Now.
 	Now func() time.Time
 
-	// Logger gets a line when a hold is placed or cleared. nil
+	// Logger gets a line when a hold is placed, cleared, or forgotten. nil
 	// discards them.
 	Logger *log.Logger
 
@@ -396,6 +399,35 @@ func (g *Guard) Confirm(link Link) (Hold, error) {
 	}
 	held := Hold{h}
 	return Hold{}, fmt.Errorf("share %s is on hold because %s; there is nothing to confirm. %s", link.ShareID, held.Problem(), sentence(held.Remedy()))
+}
+
+// Retain forgets every hold whose link keep rejects. keep is called with
+// the Guard's lock held, so it must not call back into the Guard.
+func (g *Guard) Retain(keep func(Link) bool) {
+	type forgotten struct {
+		link Link
+		err  error
+	}
+	var gone []forgotten
+	g.mu.Lock()
+	for link := range g.held {
+		if keep(link) {
+			continue
+		}
+		err := g.store.DeleteHold(g.ctx, link.ShareID, link.PeerKey)
+		if err == nil {
+			delete(g.held, link)
+		}
+		gone = append(gone, forgotten{link, err})
+	}
+	g.mu.Unlock()
+	for _, f := range gone {
+		if f.err != nil {
+			g.opts.Logger.Printf("hold: forget hold on share %s%s: %v", f.link.ShareID, g.peerSuffix(f.link.PeerKey), f.err)
+			continue
+		}
+		g.opts.Logger.Printf("hold: share %s hold%s forgotten: it is no longer configured", f.link.ShareID, g.peerSuffix(f.link.PeerKey))
+	}
 }
 
 // --- state changes, with g.mu held -----------------------------------------

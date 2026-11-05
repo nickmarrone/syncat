@@ -7,6 +7,7 @@ import (
 	"os"
 
 	"github.com/nickmarrone/syncat/internal/config"
+	"github.com/nickmarrone/syncat/internal/hold"
 	"github.com/nickmarrone/syncat/internal/protocol"
 	syncsvc "github.com/nickmarrone/syncat/internal/sync"
 )
@@ -50,18 +51,34 @@ func cloneConfig(cfg *config.Config) *config.Config {
 // swaps it in as the live config. Callers apply live effects (starting/
 // stopping watchers and sessions) after mutateConfig returns successfully,
 // outside cfgMu, matching every mutation method in this file.
+//
+// The one live effect it applies itself is forgetting holds: whatever the
+// change removed (a share, a subscription, a peer) can never be scanned or
+// synced again, so a hold on it could never clear. Doing that here, for
+// every mutation, means no removal path can leave one behind.
 func (n *Node) mutateConfig(fn func(cfg *config.Config) error) (*config.Config, error) {
+	newCfg, keep, err := n.swapConfig(fn)
+	if err != nil {
+		return nil, err
+	}
+	n.holds.Retain(keep)
+	return newCfg, nil
+}
+
+// swapConfig is mutateConfig under cfgMu. It also returns which hold links
+// the new config still has, read while the lock is held.
+func (n *Node) swapConfig(fn func(cfg *config.Config) error) (*config.Config, func(hold.Link) bool, error) {
 	n.cfgMu.Lock()
 	defer n.cfgMu.Unlock()
 	newCfg := cloneConfig(n.cfg)
 	if err := fn(newCfg); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if err := config.Save(n.paths.ConfigFile(), newCfg); err != nil {
-		return nil, fmt.Errorf("save config: %w", err)
+		return nil, nil, fmt.Errorf("save config: %w", err)
 	}
 	n.cfg = newCfg
-	return newCfg, nil
+	return newCfg, configuredLinks(newCfg), nil
 }
 
 func findPeerIndex(cfg *config.Config, peerKeyHex string) int {

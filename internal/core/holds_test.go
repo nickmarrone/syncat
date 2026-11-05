@@ -2,7 +2,12 @@ package core
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
+	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"testing"
@@ -10,6 +15,8 @@ import (
 
 	"github.com/nickmarrone/syncat/internal/config"
 	"github.com/nickmarrone/syncat/internal/hold"
+	"github.com/nickmarrone/syncat/internal/index"
+	"github.com/nickmarrone/syncat/internal/transport"
 )
 
 // writeNumberedFiles writes count small files named f00.txt, f01.txt, ...
@@ -227,6 +234,142 @@ func TestPeerBulkDeleteIsHeldOnReceiver(t *testing.T) {
 	waitFor(t, 5*time.Second, func() bool { return countFiles(localDir) == 3 })
 	if holds := nodeB.Holds(); len(holds) != 0 {
 		t.Errorf("Holds() on B after confirming = %+v, want none", holds)
+	}
+}
+
+// storedHolds returns the holds n's index has on disk, which is what a
+// restart would load.
+func storedHolds(t *testing.T, n *Node) []index.Hold {
+	t.Helper()
+	list, err := n.store.ListHolds(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return list
+}
+
+// Removing a share is one of the two ways out its missing-root hold offers,
+// so it has to take the hold with it. It used to stay, listed and on disk,
+// with nothing that could ever clear it.
+func TestRemovingAShareForgetsItsHold(t *testing.T) {
+	ctx := context.Background()
+	node := newTestNode(t, "node")
+	dir := filepath.Join(t.TempDir(), "share")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeNumberedFiles(t, dir, 5)
+	shareID, err := node.AddShare(dir, "docs", config.PermissionReadWrite, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := node.RescanShare(ctx, shareID); err == nil {
+		t.Fatal("RescanShare of a missing root succeeded, want an error")
+	}
+	onlyHold(t, node)
+
+	if err := node.RemoveShare("docs"); err != nil {
+		t.Fatalf("RemoveShare: %v", err)
+	}
+	if holds := node.Holds(); len(holds) != 0 {
+		t.Errorf("Holds() after removing the share = %+v, want none", holds)
+	}
+	if stored := storedHolds(t, node); len(stored) != 0 {
+		t.Errorf("stored holds after removing the share = %+v, want none", stored)
+	}
+}
+
+func TestRemovingASubscriptionForgetsItsPeerHold(t *testing.T) {
+	nodeA, nodeB, shareID, _ := heldPeerDelete(t)
+	if err := nodeB.RemoveSubscription(nodeA.PeerKey(), shareID); err != nil {
+		t.Fatalf("RemoveSubscription: %v", err)
+	}
+	if holds := nodeB.Holds(); len(holds) != 0 {
+		t.Errorf("Holds() on B after removing the subscription = %+v, want none", holds)
+	}
+	if stored := storedHolds(t, nodeB); len(stored) != 0 {
+		t.Errorf("stored holds on B = %+v, want none", stored)
+	}
+}
+
+// A hold left behind by a removal on an older release is dropped at
+// startup.
+func TestOpenForgetsHoldsOfUnconfiguredShares(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	paths, err := config.ResolvePaths(filepath.Join(dir, "config"), filepath.Join(dir, "data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := paths.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := index.Open(ctx, paths.DBFile())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutHold(ctx, index.Hold{ShareID: "0123456789abcdef", Reason: hold.RootUnavailable, Deletes: 5, Live: 5, Since: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
+
+	identity, _, err := config.LoadOrCreateIdentityKey(paths.IdentityKeyFile())
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, err := Open(ctx, Options{
+		Paths: paths, Config: config.Default(), Identity: identity,
+		Transport: transport.NewPipeTransport(newPipeAddr(t)),
+		Logger:    log.New(io.Discard, "", 0), DisableJitter: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { node.Close() })
+	if holds := node.Holds(); len(holds) != 0 {
+		t.Errorf("Holds() = %+v, want the orphan dropped", holds)
+	}
+	if stored := storedHolds(t, node); len(stored) != 0 {
+		t.Errorf("stored holds = %+v, want the orphan deleted", stored)
+	}
+}
+
+func TestConfiguredLinks(t *testing.T) {
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tok, err := config.EncodeToken("pipe-unreachable", pub, "laptop")
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerKey := hex.EncodeToString(pub)
+	const offerer = "ffff"
+	cfg := config.Default()
+	cfg.Peers = []config.Peer{{Name: "laptop", Token: tok, Enabled: true}}
+	cfg.Shares = []config.Share{{ID: "mine"}}
+	cfg.Subscriptions = []config.Subscription{{Peer: offerer, ShareID: "theirs"}}
+
+	keep := configuredLinks(cfg)
+	for _, tc := range []struct {
+		link hold.Link
+		want bool
+	}{
+		{hold.Link{ShareID: "mine"}, true},
+		{hold.Link{ShareID: "theirs"}, true},
+		{hold.Link{ShareID: "gone"}, false},
+		{hold.Link{ShareID: "mine", PeerKey: peerKey}, true},
+		{hold.Link{ShareID: "mine", PeerKey: "removed-peer"}, false},
+		{hold.Link{ShareID: "theirs", PeerKey: offerer}, true},
+		{hold.Link{ShareID: "theirs", PeerKey: peerKey}, false},
+		{hold.Link{ShareID: "gone", PeerKey: peerKey}, false},
+	} {
+		if got := keep(tc.link); got != tc.want {
+			t.Errorf("keep(%+v) = %v, want %v", tc.link, got, tc.want)
+		}
 	}
 }
 

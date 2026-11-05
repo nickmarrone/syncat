@@ -309,6 +309,8 @@ every peer's changes into it.
 - Holds are stored in the index, so a restart doesn't forget them. They show in
   `syncat status`, `GET /api/holds`, and as a banner on every page of the web UI,
   each with the daemon's own description of the problem and the remedy.
+- Removing a share, subscription, or peer forgets its holds, since nothing would
+  ever scan or sync that link again. Startup does the same for any left behind.
 
 ## 8. REST API & CLI
 

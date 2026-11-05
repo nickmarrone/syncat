@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 
@@ -17,6 +18,8 @@ import (
 //   - rescanShare asks it before a local scan result is applied;
 //   - every session asks the closure shareGuardFunc builds before it
 //     applies a peer's changes;
+//   - mutateConfig has it forget the holds of whatever a config change
+//     removed, and Open does the same at startup;
 //   - the API lists holds and confirms them through the methods below.
 
 // holdOptions is what n's hold guard needs from the node.
@@ -42,6 +45,40 @@ func (n *Node) peerDisplayName(peerKey string) string {
 		return pc.name
 	}
 	return ""
+}
+
+// configuredLinks returns whether a hold's link still names something cfg
+// configures: this node's own copy of a share it offers or subscribes to,
+// or a peer's link to one (a configured peer for a share this node offers,
+// or this node's subscription to that peer's share). Everything else can
+// never be scanned or synced again, so its hold could never clear.
+//
+// It copies what it needs out of cfg, so the result stays valid after cfg
+// is replaced.
+func configuredLinks(cfg *config.Config) func(hold.Link) bool {
+	offered := make(map[string]bool, len(cfg.Shares))
+	local := make(map[string]bool, len(cfg.Shares)+len(cfg.Subscriptions))
+	for _, s := range cfg.Shares {
+		offered[s.ID] = true
+		local[s.ID] = true
+	}
+	subscribed := make(map[hold.Link]bool, len(cfg.Subscriptions))
+	for _, s := range cfg.Subscriptions {
+		local[s.ShareID] = true
+		subscribed[hold.Link{ShareID: s.ShareID, PeerKey: s.Peer}] = true
+	}
+	peers := make(map[string]bool, len(cfg.Peers))
+	for _, p := range cfg.Peers {
+		if tok, err := config.ParseToken(p.Token); err == nil {
+			peers[hex.EncodeToString(tok.ID)] = true
+		}
+	}
+	return func(l hold.Link) bool {
+		if l.PeerKey == "" {
+			return local[l.ShareID]
+		}
+		return subscribed[l] || (offered[l.ShareID] && peers[l.PeerKey])
+	}
 }
 
 // shareGuardFunc returns the syncsvc.ShareConfig.Guard for shareID on the

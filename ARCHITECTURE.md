@@ -520,7 +520,7 @@ or know about sessions; core asks it questions and acts on the answers.
 
 | File | Purpose |
 |---|---|
-| `hold.go` | `Guard`: the checks, the reasons and their explanations, and confirm |
+| `hold.go` | `Guard`: the checks, the reasons and their explanations, confirm, and forgetting |
 
 **Details.**
 
@@ -537,6 +537,8 @@ or know about sessions; core asks it questions and acts on the answers.
   under the thresholds is not enough.
 - `Guard.Confirm` marks a hold so the next change it would have held applies.
   The caller runs that scan or pass.
+- `Guard.Retain` forgets holds whose share, subscription, or peer is gone. Core
+  calls it after every config change and at startup.
 - Every held link is kept in memory and in the index's `holds` table, so the
   checks never query the database and a restart keeps them.
 - `Hold.Problem` and `Hold.Remedy` are the words the CLI and web UI show, so
@@ -720,7 +722,7 @@ sequenceDiagram
     CLI->>Core: Open(paths, config, transport)
     Core->>Cfg: load or create identity key
     Core->>Idx: Open index.db, run migrations
-    Core->>Core: load holds
+    Core->>Core: load holds, forget any for removed shares
     Core->>Sync: NewTrash
     Core->>Tr: Start(onAccept)
     Core->>Tr: LocalAddress
