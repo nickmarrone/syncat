@@ -1,4 +1,4 @@
-# Unreleased
+# syncat 0.5.0
 
 A safety release. syncat now refuses to spread a disaster, and its trash
 moves into your folders where you can see it.
