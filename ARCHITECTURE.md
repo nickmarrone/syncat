@@ -73,6 +73,7 @@ Packages import down this graph. An arrow means "imports".
 flowchart TD
     cmd["cmd/syncat<br/><i>CLI and daemon entry point</i>"]
     api["internal/api<br/><i>REST server, auth, JSON</i>"]
+    wire["internal/api/wire<br/><i>the API's JSON shapes</i>"]
     webui["internal/webui<br/><i>embedded static UI</i>"]
     core["internal/core<br/><i>node, peers, shares, config changes</i>"]
     sync["internal/sync (syncsvc)<br/><i>sessions, reconcile, transfer, trash</i>"]
@@ -84,10 +85,12 @@ flowchart TD
     version["internal/version"]
 
     cmd --> api
+    cmd --> wire
     cmd --> core
     cmd --> transport
     cmd --> config
     cmd --> version
+    api --> wire
     api --> webui
     api --> core
     api --> sync
@@ -114,8 +117,12 @@ Dependency rules:
 - `internal/core` and every package below it must not import HTTP, CLI, or
   UI code (§12).
 - All packages must build with `CGO_ENABLED=0`. The SQLite driver is pure Go.
-- `internal/config`, `internal/transport`, `internal/version`, and
-  `internal/webui` are leaf packages. They import no other syncat package.
+- `internal/config`, `internal/transport`, `internal/version`,
+  `internal/webui`, and `internal/api/wire` are leaf packages. They import no
+  other syncat package.
+- The CLI decodes API responses into `internal/api/wire`'s types, the same
+  ones the server encodes, so there is one copy of every JSON shape. Its
+  commands other than `daemon` reach the node only through HTTP.
 - `internal/protocol` imports `config` only to parse `sc1` tokens.
 - `internal/index` imports `protocol` only for `FileInfo`, `FileType`, and
   `VersionVector`.
@@ -132,6 +139,7 @@ Dependency rules:
 |---|---|---|
 | `cmd/syncat` | Parse CLI commands. Run the daemon or call its API. | `command`, `apiClient` |
 | `internal/api` | Expose the node over loopback HTTP as JSON. | `Server` |
+| `internal/api/wire` | Define the API's JSON request results, shared by server and CLI. | `Status`, `Share`, `Hold`, `Error` |
 | `internal/webui` | Serve the embedded single-page UI. | `Handler`, `Assets` |
 | `internal/core` | Own the running node and connect every other part. | `Node`, `peerConn`, `shareWatch`, `Status` |
 | `internal/sync` | Keep shares in agreement with one peer over one connection. | `Session`, `Action`, `Direction`, `Trash`, `TrashEvent` |
@@ -645,7 +653,8 @@ hand-written single-page UI (`index.html`, `app.js`, `style.css`) with
 |---|---|
 | `api/server.go` | Loopback listener, routes, token check, `/ui-token`, middleware, and HTTP helpers |
 | `api/handlers.go` | One handler for each API operation |
-| `api/dto.go` | JSON response types and converters from core types |
+| `api/dto.go` | Converters from core types to `wire` types |
+| `api/wire/wire.go` | Every JSON response shape, used by the server and the CLI |
 | `webui/embed.go` | Embedded files and a static file handler with fixed content types |
 
 **Routes.**
@@ -685,7 +694,7 @@ the result.
 | File | Purpose |
 |---|---|
 | `main.go` | Global flags, command table, and usage |
-| `client.go` | API client: reads the API token and address, sends requests |
+| `client.go` | API client: reads the API token and address, sends requests, decodes into `wire` types |
 | `cmd_node.go` | `init`, `token`, `version`, `config`, `daemon`, and `status` |
 | `cmd_peer.go` | `peer`, `remote`, and `approvals` |
 | `cmd_share.go` | `share`, `subscription`, and `trash` |
@@ -1066,7 +1075,7 @@ Some environments need `TS_PERMIT_TOOLCHAIN_MISMATCH=1` for tailcat tests.
 | Slow control messages | `protocol/stream.go` |
 | Ignore rules | `index/ignore.go`, `index/scanner.go` `Matcher`, `core/shares.go` `refreshIgnore` |
 | CLI API request | `cmd/syncat/cmd_*.go`, then `api/handlers.go` |
-| API response | `api/dto.go` |
+| API response | `api/wire/wire.go`, then `api/dto.go` |
 | Name or ID resolution | `core/resolve.go` |
 | Share access or approval | `core/access.go`, `core/approvals.go`, `core/mutations.go`, `core/effects.go` `applyAccess` |
 | A config change's live effects | `core/effects.go` `diffConfig`, `applyConfigChange` |

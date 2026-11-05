@@ -3,6 +3,7 @@ package api
 import (
 	"net/http"
 
+	"github.com/nickmarrone/syncat/internal/api/wire"
 	"github.com/nickmarrone/syncat/internal/core"
 )
 
@@ -40,12 +41,12 @@ func (s *Server) handleNodePatch(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handlePeersList(w http.ResponseWriter, r *http.Request) {
 	st := s.node.Status()
-	peers := make([]peerDTO, 0, len(st.Peers))
+	peers := make([]wire.Peer, 0, len(st.Peers))
 	for _, p := range st.Peers {
 		peers = append(peers, toPeerDTO(p))
 	}
 	approvals := s.node.Approvals()
-	pending := make([]pendingPeerDTO, 0)
+	pending := make([]wire.PendingPeer, 0)
 	for _, approval := range approvals {
 		if approval.Kind != core.ApprovalPeer {
 			continue
@@ -54,9 +55,9 @@ func (s *Server) handlePeersList(w http.ResponseWriter, r *http.Request) {
 		if len(shortID) > 16 {
 			shortID = shortID[:16]
 		}
-		pending = append(pending, pendingPeerDTO{ID: approval.ID, PeerKey: approval.PeerKey, ShortID: shortID, Name: approval.PeerName, FirstSeen: approval.CreatedAt})
+		pending = append(pending, wire.PendingPeer{ID: approval.ID, PeerKey: approval.PeerKey, ShortID: shortID, Name: approval.PeerName, FirstSeen: approval.CreatedAt})
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"peers": peers, "pending_peers": pending})
+	writeJSON(w, http.StatusOK, wire.PeerList{Peers: peers, PendingPeers: pending})
 }
 
 type addPeerRequest struct {
@@ -106,11 +107,11 @@ func (s *Server) handlePeerApprove(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleApprovalsList(w http.ResponseWriter, r *http.Request) {
 	approvals := s.node.Approvals()
-	out := make([]approvalDTO, 0, len(approvals))
+	out := make([]wire.Approval, 0, len(approvals))
 	for _, approval := range approvals {
 		out = append(out, toApprovalDTO(approval))
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"approvals": out})
+	writeJSON(w, http.StatusOK, wire.ApprovalList{Approvals: out})
 }
 
 type approvalDecisionRequest struct {
@@ -133,11 +134,11 @@ func (s *Server) handleApprovalDecision(w http.ResponseWriter, r *http.Request) 
 
 func (s *Server) handleSharesList(w http.ResponseWriter, r *http.Request) {
 	st := s.node.Status()
-	shares := make([]shareDTO, 0, len(st.Shares))
+	shares := make([]wire.Share, 0, len(st.Shares))
 	for _, sh := range st.Shares {
 		shares = append(shares, toShareDTO(sh))
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"shares": shares})
+	writeJSON(w, http.StatusOK, wire.ShareList{Shares: shares})
 }
 
 type addShareRequest struct {
@@ -227,11 +228,11 @@ func (s *Server) handleSharesDelete(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleRemoteShares(w http.ResponseWriter, r *http.Request) {
 	st := s.node.Status()
-	shares := make([]remoteShareDTO, 0, len(st.RemoteShares))
+	shares := make([]wire.RemoteShare, 0, len(st.RemoteShares))
 	for _, rs := range st.RemoteShares {
 		shares = append(shares, toRemoteShareDTO(rs))
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"remote_shares": shares})
+	writeJSON(w, http.StatusOK, wire.RemoteShareList{RemoteShares: shares})
 }
 
 // --- subscriptions -----------------------------------------------------------
@@ -239,11 +240,11 @@ func (s *Server) handleRemoteShares(w http.ResponseWriter, r *http.Request) {
 // handleSubscriptionsList enumerates every configured subscription.
 func (s *Server) handleSubscriptionsList(w http.ResponseWriter, r *http.Request) {
 	st := s.node.Status()
-	subs := make([]subscriptionDTO, 0, len(st.Subscriptions))
+	subs := make([]wire.Subscription, 0, len(st.Subscriptions))
 	for _, sub := range st.Subscriptions {
 		subs = append(subs, toSubscriptionDTO(sub))
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"subscriptions": subs})
+	writeJSON(w, http.StatusOK, wire.SubscriptionList{Subscriptions: subs})
 }
 
 type addSubscriptionRequest struct {
@@ -366,5 +367,5 @@ func (s *Server) handleTrashUndo(w http.ResponseWriter, r *http.Request) {
 	for _, row := range rows {
 		restored = append(restored, row.RelPath)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"restored": restored})
+	writeJSON(w, http.StatusOK, wire.Restored{Restored: restored})
 }

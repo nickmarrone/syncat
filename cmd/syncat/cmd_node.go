@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/nickmarrone/syncat/internal/api"
+	"github.com/nickmarrone/syncat/internal/api/wire"
 	"github.com/nickmarrone/syncat/internal/config"
 	"github.com/nickmarrone/syncat/internal/core"
 	"github.com/nickmarrone/syncat/internal/transport"
@@ -622,7 +623,7 @@ func cmdStatus(paths *config.Paths, args []string) error {
 }
 
 func printStatus(c *apiClient, asJSON bool) error {
-	var st statusView
+	var st wire.Status
 	if err := c.do(context.Background(), http.MethodGet, "/api/status", nil, &st); err != nil {
 		return err
 	}

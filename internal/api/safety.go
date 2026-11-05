@@ -1,6 +1,10 @@
 package api
 
-import "net/http"
+import (
+	"net/http"
+
+	"github.com/nickmarrone/syncat/internal/api/wire"
+)
 
 // --- holds and safety settings (see GLOSSARY.md) ------------------------
 //
@@ -10,11 +14,11 @@ import "net/http"
 
 func (s *Server) handleHoldsList(w http.ResponseWriter, r *http.Request) {
 	holds := s.node.Holds()
-	out := make([]holdDTO, 0, len(holds))
+	out := make([]wire.Hold, 0, len(holds))
 	for _, h := range holds {
 		out = append(out, toHoldDTO(h))
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"holds": out})
+	writeJSON(w, http.StatusOK, wire.HoldList{Holds: out})
 }
 
 type confirmHoldRequest struct {

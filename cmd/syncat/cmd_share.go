@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/nickmarrone/syncat/internal/api/wire"
 	"github.com/nickmarrone/syncat/internal/config"
 )
 
@@ -62,7 +63,7 @@ func cmdShareAdd(paths *config.Paths, args []string) error {
 		return err
 	}
 	body := map[string]any{"path": abs, "name": *name, "permission": *perm, "approval_required": *approval}
-	var share shareView
+	var share wire.Share
 	if err := c.do(context.Background(), http.MethodPost, "/api/shares", body, &share); err != nil {
 		return err
 	}
@@ -81,9 +82,7 @@ func cmdShareLs(paths *config.Paths, args []string) error {
 	if err != nil {
 		return err
 	}
-	var resp struct {
-		Shares []shareView `json:"shares"`
-	}
+	var resp wire.ShareList
 	if err := c.do(context.Background(), http.MethodGet, "/api/shares", nil, &resp); err != nil {
 		return err
 	}
@@ -161,7 +160,7 @@ func cmdShareSet(paths *config.Paths, args []string) error {
 	if err != nil {
 		return err
 	}
-	var share shareView
+	var share wire.Share
 	if err := c.do(context.Background(), http.MethodPatch, "/api/shares/"+url.PathEscape(positional[0]), patch, &share); err != nil {
 		return err
 	}
@@ -215,7 +214,7 @@ func cmdSubscriptionAdd(paths *config.Paths, args []string) error {
 		return err
 	}
 	body := map[string]any{"peer": peer, "share_id": shareID, "local_path": abs, "mode": *mode}
-	var view subscriptionView
+	var view wire.Subscription
 	if err := c.do(context.Background(), http.MethodPost, "/api/subscriptions", body, &view); err != nil {
 		return err
 	}
@@ -234,9 +233,7 @@ func cmdSubscriptionLs(paths *config.Paths, args []string) error {
 	if err != nil {
 		return err
 	}
-	var resp struct {
-		Subscriptions []subscriptionView `json:"subscriptions"`
-	}
+	var resp wire.SubscriptionList
 	if err := c.do(context.Background(), http.MethodGet, "/api/subscriptions", nil, &resp); err != nil {
 		return err
 	}
@@ -296,7 +293,7 @@ func cmdSubscriptionSetPaused(paths *config.Paths, args []string, paused bool) e
 	if err != nil {
 		return err
 	}
-	var view subscriptionView
+	var view wire.Subscription
 	body := map[string]any{"paused": paused}
 	if err := c.do(context.Background(), http.MethodPatch, "/api/subscriptions/"+subscriptionPath(peer, shareID), body, &view); err != nil {
 		return err
@@ -330,8 +327,8 @@ func cmdTrash(paths *config.Paths, args []string) error {
 	}
 }
 
-func fetchTrash(c *apiClient, shareRef string) (trashView, error) {
-	var tv trashView
+func fetchTrash(c *apiClient, shareRef string) (wire.Trash, error) {
+	var tv wire.Trash
 	err := c.do(context.Background(), http.MethodGet, "/api/shares/"+url.PathEscape(shareRef)+"/trash", nil, &tv)
 	return tv, err
 }
@@ -387,7 +384,7 @@ func cmdTrashLs(paths *config.Paths, args []string) error {
 
 // summarizeTrashEvent says what an event did in a few words, e.g.
 // "deleted 14 files, overwrote 1".
-func summarizeTrashEvent(ev trashEventView) string {
+func summarizeTrashEvent(ev wire.TrashEvent) string {
 	counts := map[string]int{}
 	for _, it := range ev.Items {
 		counts[it.Kind]++
@@ -439,9 +436,7 @@ func cmdTrashUndo(paths *config.Paths, args []string) error {
 		}
 		eventID = tv.Events[n-1].ID
 	}
-	var resp struct {
-		Restored []string `json:"restored"`
-	}
+	var resp wire.Restored
 	body := map[string]any{"event": eventID, "paths": relPaths}
 	if err := c.do(context.Background(), http.MethodPost, "/api/shares/"+url.PathEscape(shareRef)+"/trash/undo", body, &resp); err != nil {
 		return err

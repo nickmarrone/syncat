@@ -29,6 +29,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/nickmarrone/syncat/internal/api/wire"
 	"github.com/nickmarrone/syncat/internal/config"
 	"github.com/nickmarrone/syncat/internal/core"
 	syncsvc "github.com/nickmarrone/syncat/internal/sync"
@@ -362,16 +363,8 @@ func (s *Server) logMiddleware(next http.Handler) http.Handler {
 
 // --- request/response helpers ---------------------------------------------
 
-// errorBody is the stable JSON shape for every error response.
-type errorBody struct {
-	Error struct {
-		Code    string `json:"code"`
-		Message string `json:"message"`
-	} `json:"error"`
-}
-
 func writeError(w http.ResponseWriter, status int, code, message string) {
-	var body errorBody
+	var body wire.Error
 	body.Error.Code = code
 	body.Error.Message = message
 	w.Header().Set("Content-Type", "application/json")
