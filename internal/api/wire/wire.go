@@ -45,6 +45,19 @@ type Peer struct {
 	LastConnectedAt time.Time      `json:"last_connected_at,omitempty"`
 	ConnectedSince  time.Time      `json:"connected_since,omitempty"`
 	Network         map[string]any `json:"network"`
+	// Path is absent until the current connection's network path has been
+	// sampled, which is the normal state for a peer that is not connected.
+	Path *PeerPath `json:"path,omitempty"`
+}
+
+// PeerPath reports how traffic to a peer is travelling. Exactly one of
+// Endpoint and Relay is set: a direct path names the peer's address, a
+// relayed one names the relay.
+type PeerPath struct {
+	Direct    bool      `json:"direct"`
+	Endpoint  string    `json:"endpoint,omitempty"`
+	Relay     string    `json:"relay,omitempty"`
+	SampledAt time.Time `json:"sampled_at"`
 }
 
 type PendingPeer struct {

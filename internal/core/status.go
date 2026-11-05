@@ -262,7 +262,7 @@ func (pc *peerConn) snapshot() PeerStatus {
 		Enabled: pc.enabled, State: pc.state, LastError: pc.lastErr,
 		LastConnectedAt: pc.lastConnectedAt, ConnectedSince: pc.connectedSince,
 	}
-	counters, totals, sess := pc.network, pc.sessionTotals, pc.session
+	counters, totals, sess, path := pc.network, pc.sessionTotals, pc.session, pc.path
 	pc.mu.Unlock()
 	if sess != nil {
 		totals = addSessionStats(totals, sess.Stats(), true)
@@ -274,6 +274,10 @@ func (pc *peerConn) snapshot() PeerStatus {
 		Connections: counters.connections, Reconnects: counters.reconnects, DedupLosses: counters.dedupLosses,
 		PingsSent: totals.PingsSent, PongsReceived: totals.PongsReceived, DeadConnections: totals.DeadConnections,
 		LastPingRTT: totals.LastPingRTT, Session: toSessionNetworkStatus(totals),
+	}
+	if path != nil {
+		p := *path // a copy: the sampler replaces pc.path, never mutates it, but callers own what Status returns
+		status.Network.Path = &p
 	}
 	return status
 }

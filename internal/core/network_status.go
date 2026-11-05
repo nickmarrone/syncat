@@ -47,6 +47,22 @@ type PeerNetworkStatus struct {
 	PingsSent, PongsReceived, DeadConnections uint64
 	LastPingRTT                               time.Duration
 	Session                                   SessionNetworkStatus
+	// Path is how traffic on the peer's current connection is travelling,
+	// nil until it has been sampled (see peerConn.runPathSampler), which is
+	// the normal state for a disconnected peer and for the first couple of
+	// seconds of a new connection. It describes one live connection, so
+	// NetworkStatus.Totals never carries one.
+	Path *NetworkPath
+}
+
+// NetworkPath is one sample of how traffic to a peer travels: direct
+// between the two hosts, or through a relay. Exactly one of Endpoint and
+// Relay is set.
+type NetworkPath struct {
+	Direct    bool
+	Endpoint  string // the peer's host:port when Direct
+	Relay     string // the relay carrying the traffic when not Direct
+	SampledAt time.Time
 }
 
 // NetworkStatus is the low-cardinality aggregate returned in Node.Status.

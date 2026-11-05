@@ -5,12 +5,15 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/tailscale/tailcat"
+	"tailscale.com/ipn/ipnstate"
+	"tailscale.com/types/key"
 	"tailscale.com/wgengine/filter"
 )
 
@@ -68,6 +71,7 @@ type tailcatServer interface {
 	DrainTCP(context.Context) error
 	Close() error
 	TailcatAddr() tailcat.Addr
+	Status() *ipnstate.Status
 }
 
 type tailcatTransportState uint8
@@ -362,6 +366,107 @@ func (t *TailcatTransport) ValidateAddr(addr string) error {
 			"the other node must upgrade syncat and send a token from a fresh `syncat token`")
 	}
 	return nil
+}
+
+// PeerPath implements Transport, reporting whether the tunnel carrying conn
+// runs direct or over a DERP relay. The two directions are different
+// tunnels with different owners, so they are measured differently.
+//
+// A connection we dialed rides the cached per-peer Client, whose
+// DiscoPing asks the peer and reports how the pong came back. A Client
+// that has not dialed is refused before tailcat sees it: DiscoPing calls
+// Client.up, which on an unstarted client would begin a whole connection
+// attempt and block on Client.Ping's hard 10s internal timeout, past any
+// budget a caller sets.
+//
+// A connection the peer dialed rides our Server, which already knows the
+// path to each of its clients (Server.Status, since tailcat 0.7.0), so it
+// costs no round trip. See inboundPath.
+func (t *TailcatTransport) PeerPath(ctx context.Context, conn net.Conn, addr string, dialed bool) (PeerPath, error) {
+	if !dialed {
+		return t.inboundPath(conn)
+	}
+
+	t.clientsMu.Lock()
+	pc := t.clients[addr]
+	t.clientsMu.Unlock()
+	if pc == nil || !pc.dialed.Load() {
+		return PeerPath{}, errors.New("transport: tailcat: peer path: no live client for this peer")
+	}
+	res, err := pc.c.DiscoPing(ctx)
+	if err != nil {
+		return PeerPath{}, &OpError{Op: "peer path", Err: err}
+	}
+	if res.Endpoint != "" {
+		return PeerPath{Direct: true, Endpoint: res.Endpoint}, nil
+	}
+	// Not direct, so name the relay. The region code is the readable form
+	// ("nyc"); fall back to the ID, which is set whenever DERP carried the
+	// pong, so a relayed path is never reported with a blank relay.
+	relay := res.DERPRegionCode
+	if relay == "" && res.DERPRegionID != 0 {
+		relay = fmt.Sprint(res.DERPRegionID)
+	}
+	if relay == "" {
+		return PeerPath{}, errors.New("transport: tailcat: peer path: pong named neither an endpoint nor a relay")
+	}
+	return PeerPath{Relay: relay}, nil
+}
+
+// inboundPath reads the path of a connection a peer dialed to our Server.
+//
+// Server.Status lists one entry per connected client, keyed by the
+// client's node key. Peers dial us from an ephemeral key (see clientFor),
+// so the key says nothing about which configured peer it is, but it does
+// say which entry carries conn: tailcat derives each node's tunnel address
+// from its key, and conn's remote address is the dialing client's.
+func (t *TailcatTransport) inboundPath(conn net.Conn) (PeerPath, error) {
+	t.mu.Lock()
+	srv, state := t.server, t.state
+	t.mu.Unlock()
+	if state != tailcatStateStarted || srv == nil {
+		return PeerPath{}, errors.New("transport: tailcat: peer path: transport is not started")
+	}
+	tcp, ok := conn.RemoteAddr().(*net.TCPAddr)
+	if !ok {
+		return PeerPath{}, fmt.Errorf("transport: tailcat: peer path: remote address is %T, not TCP", conn.RemoteAddr())
+	}
+	remote := tcp.AddrPort().Addr().Unmap()
+
+	st := srv.Status()
+	if st == nil {
+		return PeerPath{}, errors.New("transport: tailcat: peer path: server reported no status")
+	}
+	for k, ps := range st.Peer {
+		if tailcatAddrForKey(k) != remote {
+			continue
+		}
+		if ps.CurAddr != "" {
+			return PeerPath{Direct: true, Endpoint: ps.CurAddr}, nil
+		}
+		if ps.Relay == "" {
+			return PeerPath{}, errors.New("transport: tailcat: peer path: client has neither a direct address nor a relay")
+		}
+		return PeerPath{Relay: ps.Relay}, nil
+	}
+	return PeerPath{}, errors.New("transport: tailcat: peer path: no server peer carries this connection")
+}
+
+// tailcatAddrForKey returns the tunnel address tailcat assigns to a node
+// key: Tailscale's ULA prefix fd7a:115c:a1e0::/48 followed by the key's
+// first 10 bytes.
+//
+// It mirrors tailcat's unexported tcAddrForKey, since nothing exported maps
+// a Server.Status entry to an address (its TailscaleIPs field is never
+// filled). If tailcat ever changes the derivation, inbound paths stop
+// matching, and TestPeerPathOverRealDERP's inbound half fails, rather than
+// anything here guessing wrong.
+func tailcatAddrForKey(k key.NodePublic) netip.Addr {
+	var a [16]byte
+	r := k.Raw32()
+	copy(a[:6], []byte{0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0})
+	copy(a[6:], r[:10])
+	return netip.AddrFrom16(a)
 }
 
 func (t *TailcatTransport) LocalAddress() (string, error) {

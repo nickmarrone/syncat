@@ -43,7 +43,18 @@ func toPeerDTO(p core.PeerStatus) wire.Peer {
 		Enabled: p.Enabled, State: string(p.State), LastError: p.LastError,
 		LastConnectedAt: p.LastConnectedAt, ConnectedSince: p.ConnectedSince,
 		Network: toPeerNetworkDTO(p.Network),
+		Path:    toPeerPathDTO(p.Network.Path),
 	}
+}
+
+// toPeerPathDTO returns nil for a peer whose path has not been sampled, so
+// it serialises with no "path" key at all rather than an object of zeroes
+// that would read as a measurement.
+func toPeerPathDTO(p *core.NetworkPath) *wire.PeerPath {
+	if p == nil {
+		return nil
+	}
+	return &wire.PeerPath{Direct: p.Direct, Endpoint: p.Endpoint, Relay: p.Relay, SampledAt: p.SampledAt}
 }
 
 func toWriterNetworkDTO(w core.WriterNetworkStatus) map[string]any {

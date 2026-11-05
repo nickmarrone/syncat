@@ -503,6 +503,23 @@ function renderPeerRow(peer, status) {
  * list: the full key, connection history, both share directions, and
  * the destructive Remove, which sits at the bottom where it can't be hit by
  * accident. */
+/** Renders a peer's network path: whether traffic goes straight to the peer
+ * or through a relay, and the keepalive's last round trip. Only called when
+ * the daemon reported a path, which it omits until one has been sampled. */
+function formatPath(peer) {
+  const path = peer.path;
+  const where = path.direct
+    ? 'direct' + (path.endpoint ? ' (' + path.endpoint + ')' : '')
+    : 'relayed' + (path.relay ? ' via ' + path.relay : '');
+  const rtt = peer.network && peer.network.last_ping_rtt_seconds;
+  if (!rtt) return where;
+  // A direct path on a LAN answers in a fraction of a millisecond; rounding
+  // that to '0 ms' would read as a failed measurement rather than a fast one.
+  const ms = rtt * 1000;
+  const shown = ms >= 10 ? Math.round(ms) : ms.toFixed(ms >= 1 ? 1 : 2);
+  return where + ' · ' + shown + ' ms';
+}
+
 function renderPeerDetail(peer, rel) {
   const body = el('div', { class: 'peer-detail' });
 
@@ -514,6 +531,9 @@ function renderPeerDetail(peer, rel) {
     body.append(el('p', { class: 'faint' }, 'Connected since ' + formatTime(peer.connected_since)));
   } else if (!isZeroTime(peer.last_connected_at)) {
     body.append(el('p', { class: 'faint' }, 'Last connected ' + formatTime(peer.last_connected_at)));
+  }
+  if (peer.path) {
+    body.append(el('p', { class: 'faint' }, 'Network path: ' + formatPath(peer)));
   }
 
   body.append(el('h3', {}, 'Shares they offer'));
