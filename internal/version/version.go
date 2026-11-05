@@ -18,7 +18,7 @@ import (
 // `proto_version` in the handshake (internal/protocol), the `sc1` token
 // prefix (SPEC.md §2), and the index's `PRAGMA user_version`
 // (internal/index). Bumping this number says nothing about any of them.
-const Version = "0.5.0"
+const Version = "0.5.1"
 
 // String returns [Version] with the commit it was built from appended as
 // semver build metadata, with a `.dirty` suffix when the working tree had

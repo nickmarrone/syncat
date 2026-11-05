@@ -1,3 +1,41 @@
+# syncat 0.5.1
+
+A bug-fix release for holds and for changing shares by name.
+
+## Upgrading
+
+Nothing on disk changes, and 0.5.1 nodes talk to 0.5.0 nodes. On first start,
+holds that 0.5.0 left behind for removed shares are dropped (see below).
+
+## Fixes
+
+- **A removed share's hold never went away.** Removing a share, a
+  subscription, or a peer left its holds behind. They stayed in
+  `syncat status` and in a web UI banner that couldn't be dismissed, and
+  confirming them failed because the share was gone. Removing one now forgets
+  its holds, and holds already left behind are dropped when the daemon
+  starts.
+- **`syncat share set NAME` said the share wasn't configured.** Changing a
+  share's name, permission, or approval setting worked only with its full id,
+  though the usage text says names and id prefixes work. `syncat subscription
+  pause` and `resume` had the same problem. Both now take names and id
+  prefixes, as `rm` already did.
+
+## Also in this release
+
+- Hold messages come from the daemon. `GET /api/status` and `GET /api/holds`
+  report each hold's `problem` and `remedy`, and `syncat status` and the web
+  UI show them as they are, so the two can no longer disagree.
+- The rules for when a change is held and when a hold ends now live in one
+  package, `internal/hold`, with its own tests.
+
+## Version
+
+`syncat version` reports `0.5.1`, plus the build commit when it was built from
+a git checkout.
+
+---
+
 # syncat 0.5.0
 
 A safety release. syncat now refuses to spread a disaster, and its trash
