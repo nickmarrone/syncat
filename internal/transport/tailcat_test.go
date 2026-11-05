@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/tailscale/tailcat"
+	"tailscale.com/ipn/ipnstate"
+	"tailscale.com/types/key"
 )
 
 // fakeTailcatServer stands in for tailcat.Server so startup can be paused at
@@ -28,6 +30,7 @@ type fakeTailcatServer struct {
 	startErr  error
 	closed    atomic.Int32
 	ln        *fakeListener
+	status    *ipnstate.Status // what Status reports; nil means no status
 }
 
 func (s *fakeTailcatServer) Listen(ctx context.Context, network, address string) (net.Listener, error) {
@@ -61,6 +64,7 @@ func (s *fakeTailcatServer) Close() error {
 	return nil
 }
 func (s *fakeTailcatServer) TailcatAddr() tailcat.Addr { return "fake" }
+func (s *fakeTailcatServer) Status() *ipnstate.Status  { return s.status }
 
 // fakeListener is a net.Listener whose connections the test hands in.
 type fakeListener struct {
@@ -636,4 +640,179 @@ func TestLocalAddressMatchesPersistedKeyAcrossRestarts(t *testing.T) {
 		}
 		cancel()
 	}
+}
+
+// remoteConn is a net.Conn reporting a chosen remote address, standing in
+// for a connection the server accepted from a client at that address.
+type remoteConn struct {
+	net.Conn
+	remote net.Addr
+}
+
+func (c remoteConn) RemoteAddr() net.Addr { return c.remote }
+
+// TestInboundPathMatchesConnectionToServerPeer pins how a connection a peer
+// dialed to us is matched to its entry in Server.Status: by the tunnel
+// address tailcat derives from the client's key, since the key itself is
+// ephemeral and names no configured peer. With two clients connected, each
+// connection must get its own client's path, not the other's.
+func TestInboundPathMatchesConnectionToServerPeer(t *testing.T) {
+	direct, relayed, stranger := key.NewNode().Public(), key.NewNode().Public(), key.NewNode().Public()
+	srv := &fakeTailcatServer{started: make(chan struct{}), status: &ipnstate.Status{
+		Peer: map[key.NodePublic]*ipnstate.PeerStatus{
+			direct:  {CurAddr: "192.0.2.7:41641", Relay: "nyc"},
+			relayed: {Relay: "fra"},
+		},
+	}}
+	tr := transportWithFakeServer(srv)
+	if err := tr.Start(context.Background(), func(net.Conn) {}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { tr.Close() })
+
+	connFrom := func(k key.NodePublic) net.Conn {
+		return remoteConn{remote: &net.TCPAddr{IP: tailcatAddrForKey(k).AsSlice(), Port: 51000}}
+	}
+
+	got, err := tr.PeerPath(context.Background(), connFrom(direct), "unused", false)
+	if err != nil {
+		t.Fatalf("PeerPath(direct client): %v", err)
+	}
+	// A direct path reports the endpoint and not the relay, even though
+	// magicsock always fills in the client's home region alongside it.
+	if want := (PeerPath{Direct: true, Endpoint: "192.0.2.7:41641"}); got != want {
+		t.Errorf("PeerPath(direct client) = %+v, want %+v", got, want)
+	}
+
+	got, err = tr.PeerPath(context.Background(), connFrom(relayed), "unused", false)
+	if err != nil {
+		t.Fatalf("PeerPath(relayed client): %v", err)
+	}
+	if want := (PeerPath{Relay: "fra"}); got != want {
+		t.Errorf("PeerPath(relayed client) = %+v, want %+v", got, want)
+	}
+
+	if _, err := tr.PeerPath(context.Background(), connFrom(stranger), "unused", false); err == nil {
+		t.Error("PeerPath reported a path for a connection no server peer carries")
+	}
+}
+
+// TestPeerPathRefusesClientsThatNeverDialed pins the guard in front of
+// DiscoPing, and pins that it is *fast*.
+//
+// DiscoPing calls Client.up, so handing it a client no dial has started
+// would begin a whole connection attempt and block on Client.Ping's hard
+// 10s internal timeout, which the caller's context cannot shorten. A sampler
+// on a 2s budget would then be stuck for 10s. The elapsed-time assertion is
+// the real one: an error alone would still pass after blocking for 10s.
+func TestPeerPathRefusesClientsThatNeverDialed(t *testing.T) {
+	tr := NewTailcatTransport(tailcat.NewPrivateKey(), nil)
+	t.Cleanup(func() { tr.Close() })
+
+	// Real, well-formed addresses that nothing is listening on. A bogus
+	// string would prove nothing: tailcat rejects an unparseable address
+	// immediately, so the test would pass with the guard removed.
+	addrOf := func() string {
+		k := tailcat.NewPrivateKey()
+		k.Public.RegionID = 1
+		return string(k.Public.Addr())
+	}
+	cached, unknown := addrOf(), addrOf()
+
+	// A cached-but-undialed client is the case the dialed flag catches; an
+	// unknown address is the case the nil check catches.
+	if _, err := tr.clientFor(cached); err != nil {
+		t.Fatalf("clientFor: %v", err)
+	}
+	for name, addr := range map[string]string{"cached, never dialed": cached, "never seen": unknown} {
+		t.Run(name, func(t *testing.T) {
+			start := time.Now()
+			_, err := tr.PeerPath(context.Background(), nil, addr, true)
+			elapsed := time.Since(start)
+			if err == nil {
+				t.Fatal("PeerPath reported a path for a client that never dialed")
+			}
+			if elapsed > 200*time.Millisecond {
+				t.Errorf("PeerPath took %v to refuse; it reached tailcat instead of short-circuiting", elapsed)
+			}
+		})
+	}
+}
+
+// TestPeerPathOverRealDERP checks that a live tunnel reports a coherent path
+// in both directions: the dialer through DiscoPing, the acceptor through
+// Server.Status.
+//
+// It deliberately does not assert *which* path. Whether two peers go direct
+// or fall back to a relay is a property of the network the test runs on.
+// What must hold either way is that each path describes itself completely:
+// a direct one names the endpoint, a relayed one names the relay.
+//
+// The acceptor half is also what guards tailcatAddrForKey: if tailcat ever
+// derives tunnel addresses differently, no server peer matches the
+// accepted connection and PeerPath fails here.
+func TestPeerPathOverRealDERP(t *testing.T) {
+	if testing.Short() {
+		t.Skip("uses real DERP relays; skipped under -short")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	server := NewTailcatTransport(tailcat.NewPrivateKey(), t.Logf)
+	client := NewTailcatTransport(tailcat.NewPrivateKey(), t.Logf)
+	t.Cleanup(func() { server.Close(); client.Close() })
+
+	accepted := make(chan net.Conn, 1)
+	if err := server.Start(ctx, func(c net.Conn) { accepted <- c }); err != nil {
+		t.Fatalf("server Start: %v", err)
+	}
+	if err := client.Start(ctx, func(net.Conn) {}); err != nil {
+		t.Fatalf("client Start: %v", err)
+	}
+	addr, err := server.LocalAddress()
+	if err != nil {
+		t.Fatalf("server LocalAddress: %v", err)
+	}
+	conn, err := client.Dial(ctx, addr)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer conn.Close()
+	var inbound net.Conn
+	select {
+	case inbound = <-accepted:
+		defer inbound.Close()
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for the server to accept the connection")
+	}
+
+	checkCoherent := func(side string, path PeerPath) {
+		t.Helper()
+		switch {
+		case path.Direct && path.Endpoint == "":
+			t.Errorf("%s: direct path names no endpoint", side)
+		case !path.Direct && path.Relay == "":
+			t.Errorf("%s: relayed path names no relay", side)
+		case path.Direct && path.Relay != "":
+			t.Errorf("%s: direct path also names relay %q", side, path.Relay)
+		}
+		t.Logf("%s path: direct=%v endpoint=%q relay=%q", side, path.Direct, path.Endpoint, path.Relay)
+	}
+
+	// The production sampler runs on a 2s budget; hold this to the same
+	// bound so a measurement slower than the sampler waits for shows up here.
+	pathCtx, pathCancel := context.WithTimeout(ctx, 2*time.Second)
+	defer pathCancel()
+	out, err := client.PeerPath(pathCtx, conn, addr, true)
+	if err != nil {
+		t.Fatalf("dialer PeerPath over a live tunnel: %v", err)
+	}
+	checkCoherent("dialer", out)
+
+	in, err := server.PeerPath(pathCtx, inbound, "", false)
+	if err != nil {
+		t.Fatalf("acceptor PeerPath over a live tunnel (tailcatAddrForKey out of step with tailcat?): %v", err)
+	}
+	checkCoherent("acceptor", in)
 }

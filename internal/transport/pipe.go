@@ -68,6 +68,16 @@ func (t *PipeTransport) Dial(ctx context.Context, addr string) (net.Conn, error)
 
 func (t *PipeTransport) DiscardPeer(string) {}
 
+// PeerPath implements Transport. A net.Pipe is as direct as a connection
+// gets: there is no relay and no network endpoint, so every connection
+// reports a direct path with no endpoint.
+func (t *PipeTransport) PeerPath(_ context.Context, conn net.Conn, _ string, _ bool) (PeerPath, error) {
+	if conn == nil {
+		return PeerPath{}, errors.New("transport: pipe: peer path: no connection")
+	}
+	return PeerPath{Direct: true}, nil
+}
+
 // ValidateAddr implements Transport. A pipe address is an opaque registry
 // key with no structure to check, so any non-empty one is acceptable;
 // whether anything is actually registered under it is Dial's business.

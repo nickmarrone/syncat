@@ -622,6 +622,40 @@ func cmdStatus(paths *config.Paths, args []string) error {
 	}
 }
 
+// formatPath renders a peer's network path for the status line, or "" when
+// it has not been sampled, which is normal for a disconnected peer, so the
+// line says nothing rather than "path=unknown". The round trip comes from
+// the keepalive's last ping, the one RTT syncat measures.
+func formatPath(p wire.Peer) string {
+	if p.Path == nil {
+		return ""
+	}
+	where := "relay:" + p.Path.Relay
+	if p.Path.Direct {
+		where = "direct"
+	}
+	out := "\tpath=" + where
+	if rtt, ok := p.Network["last_ping_rtt_seconds"].(float64); ok && rtt > 0 {
+		out += " " + formatRTT(rtt*1000)
+	}
+	return out
+}
+
+// formatRTT renders a round trip in milliseconds, keeping enough precision
+// to stay truthful at the short end: a direct path on a LAN answers in a
+// fraction of a millisecond, and rounding that to "0ms" reads as a failed
+// measurement rather than a fast one.
+func formatRTT(ms float64) string {
+	switch {
+	case ms >= 10:
+		return fmt.Sprintf("%.0fms", ms)
+	case ms >= 1:
+		return fmt.Sprintf("%.1fms", ms)
+	default:
+		return fmt.Sprintf("%.2fms", ms)
+	}
+}
+
 func printStatus(c *apiClient, asJSON bool) error {
 	var st wire.Status
 	if err := c.do(context.Background(), http.MethodGet, "/api/status", nil, &st); err != nil {
@@ -645,7 +679,7 @@ func printStatus(c *apiClient, asJSON bool) error {
 
 	fmt.Printf("peers (%d):\n", len(st.Peers))
 	for _, p := range st.Peers {
-		fmt.Printf("  %-20s %s\tstate=%s\n", p.Name, p.ID, p.State)
+		fmt.Printf("  %-20s %s\tstate=%s%s\n", p.Name, p.ID, p.State, formatPath(p))
 	}
 
 	fmt.Printf("shares (%d):\n", len(st.Shares))

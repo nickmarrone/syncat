@@ -182,6 +182,7 @@ type peerConn struct {
 	connDone      chan struct{}   // closed when the current connection ends
 	network       peerNetworkCounters
 	sessionTotals syncsvc.SessionStats
+	path          *NetworkPath // latest sample for the current connection; see runPathSampler
 }
 
 type peerNetworkCounters struct {
@@ -478,7 +479,7 @@ func (pc *peerConn) offer(ctx context.Context, conn net.Conn, result *protocol.H
 	node.sendShareList(sess, pc.peerKeyHex)
 	node.requestSubscriptions(sess, pc.peerKeyHex)
 
-	node.goTracked(func() { pc.runConnection(sessCtx, cancel, sess, conn, done) })
+	node.goTracked(func() { pc.runConnection(sessCtx, cancel, sess, conn, dialed, done) })
 	return offerAdopted, nil
 }
 
@@ -496,7 +497,13 @@ func (pc *peerConn) offer(ctx context.Context, conn net.Conn, result *protocol.H
 // notePeerRedialed); the transport's cached per-peer state must be
 // discarded before close(done) lets dialAttempt redial; and pc's fields are
 // reset under mu in the same critical section that closes done.
-func (pc *peerConn) runConnection(sessCtx context.Context, cancel context.CancelFunc, sess *syncsvc.Session, conn net.Conn, done chan struct{}) {
+func (pc *peerConn) runConnection(sessCtx context.Context, cancel context.CancelFunc, sess *syncsvc.Session, conn net.Conn, dialed bool, done chan struct{}) {
+	pathDone := make(chan struct{})
+	go func() {
+		defer close(pathDone)
+		pc.runPathSampler(sessCtx, conn, dialed)
+	}()
+
 	var why string
 	select {
 	case <-sess.Done():
@@ -511,6 +518,10 @@ func (pc *peerConn) runConnection(sessCtx context.Context, cancel context.Cancel
 	}
 
 	cancel()
+	// A sample in flight is bounded by a context derived from sessCtx, so
+	// cancel() has already unblocked it. Waiting costs nothing and keeps the
+	// sampler from calling into the transport while Node.Close closes it.
+	<-pathDone
 	sess.Close()
 	finishedStats := sess.Stats()
 	conn.Close()
@@ -540,6 +551,9 @@ func (pc *peerConn) runConnection(sessCtx context.Context, cancel context.Cancel
 	// that keeps growing for a peer that is gone. lastConnectedAt is the
 	// field that deliberately survives, and it still does.
 	pc.connectedSince = time.Time{}
+	// The path belongs to the dead connection for the same reason, and stale
+	// is worse than absent: a gone peer would go on claiming a direct path.
+	pc.path = nil
 	name := pc.name
 	close(done)
 	pc.mu.Unlock()
@@ -548,6 +562,60 @@ func (pc *peerConn) runConnection(sessCtx context.Context, cancel context.Cancel
 	// every few seconds and one that has been up for a week both log a
 	// single "disconnected", and only the duration tells them apart.
 	pc.node.logger.Printf("core: peer %s (%s): disconnected after %s (%s)", name, pc.peerShort, uptime.Truncate(time.Second), why)
+}
+
+// How runPathSampler paces Transport.PeerPath. The result is displayed, not
+// acted on (the keepalive owns liveness), so this samples rarely and gives
+// up quickly: an unreachable peer costs one short timeout a minute rather
+// than anything the user waits on.
+const (
+	pathSampleFirst    = 2 * time.Second // after connecting, so the UI fills in
+	pathSampleInterval = 60 * time.Second
+	pathSampleTimeout  = 2 * time.Second
+)
+
+// runPathSampler records how traffic on conn is travelling, direct or
+// relayed, until ctx is cancelled, so PeerStatus can report it.
+//
+// It samples on a timer rather than letting the status API ask the
+// transport directly. Transport.PeerPath may cost round trips and, against
+// a peer that has stopped answering, returns only when its context
+// expires, so a Status that measured inline would make GET /api/status as
+// slow as the worst peer. And the answer barely changes: a path flips when
+// NAT traversal succeeds or a relay changes, not between two polls.
+//
+// A failed sample keeps the previous answer rather than blanking it. A
+// peer that has really gone away is already reported by State, and a path
+// flickering to empty on one lost ping would say something State does not.
+func (pc *peerConn) runPathSampler(ctx context.Context, conn net.Conn, dialed bool) {
+	wait := pathSampleFirst
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-pc.node.clock.After(wait):
+		}
+		wait = pathSampleInterval
+
+		sampleCtx, cancel := context.WithTimeout(ctx, pathSampleTimeout)
+		path, err := pc.node.transport.PeerPath(sampleCtx, conn, pc.addr, dialed)
+		cancel()
+		if err != nil {
+			if ctx.Err() == nil {
+				pc.node.debugf("core: peer %s: sample network path: %v", pc.peerShort, err)
+			}
+			continue
+		}
+		sample := &NetworkPath{Direct: path.Direct, Endpoint: path.Endpoint, Relay: path.Relay, SampledAt: pc.node.clock.Now()}
+		pc.mu.Lock()
+		// The connection may have ended between the sample and this lock;
+		// runConnection clears the path once it has, and a late write here
+		// would resurrect it for a peer that is gone.
+		if ctx.Err() == nil {
+			pc.path = sample
+		}
+		pc.mu.Unlock()
+	}
 }
 
 // handleControl dispatches one frame Session's own read loop doesn't

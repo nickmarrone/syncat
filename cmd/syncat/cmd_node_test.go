@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/nickmarrone/syncat/internal/api/wire"
 	"github.com/nickmarrone/syncat/internal/config"
 )
 
@@ -47,6 +48,35 @@ func populate(t *testing.T, p *config.Paths) {
 		if err := os.WriteFile(f, []byte("x"), 0600); err != nil {
 			t.Fatalf("write %s: %v", f, err)
 		}
+	}
+}
+
+// TestFormatPath covers the status line's network-path fragment, including
+// the short end: a direct path on a LAN answers in a fraction of a
+// millisecond, and a whole-millisecond format prints that as "0ms", which
+// reads as a broken measurement rather than a fast link.
+func TestFormatPath(t *testing.T) {
+	withRTT := func(path *wire.PeerPath, seconds float64) wire.Peer {
+		return wire.Peer{Path: path, Network: map[string]any{"last_ping_rtt_seconds": seconds}}
+	}
+	for _, tc := range []struct {
+		name string
+		peer wire.Peer
+		want string
+	}{
+		{"unsampled", withRTT(nil, 0.05), ""},
+		{"direct, sub-millisecond", withRTT(&wire.PeerPath{Direct: true, Endpoint: "10.0.0.2:41641"}, 0.0002), "\tpath=direct 0.20ms"},
+		{"direct, single digits", withRTT(&wire.PeerPath{Direct: true}, 0.00342), "\tpath=direct 3.4ms"},
+		{"relayed", withRTT(&wire.PeerPath{Relay: "nyc"}, 0.0486), "\tpath=relay:nyc 49ms"},
+		// No keepalive round trip yet: the path alone, not "0.00ms".
+		{"no rtt yet", withRTT(&wire.PeerPath{Relay: "nyc"}, 0), "\tpath=relay:nyc"},
+		{"no network map", wire.Peer{Path: &wire.PeerPath{Direct: true}}, "\tpath=direct"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := formatPath(tc.peer); got != tc.want {
+				t.Errorf("formatPath() = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 

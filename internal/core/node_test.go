@@ -2115,3 +2115,128 @@ func fileHas(path, want string) bool {
 	data, err := os.ReadFile(path)
 	return err == nil && string(data) == want
 }
+
+// blockingPathTransport is a pipe whose PeerPath never returns, standing in
+// for a peer that has stopped answering: Transport.PeerPath may return only
+// when its context expires in that case.
+type blockingPathTransport struct {
+	transport.Transport
+}
+
+func (blockingPathTransport) PeerPath(ctx context.Context, _ net.Conn, _ string, _ bool) (transport.PeerPath, error) {
+	<-ctx.Done()
+	return transport.PeerPath{}, ctx.Err()
+}
+
+// TestStatusDoesNotSampleNetworkPath pins that Status reads the cached path
+// sample instead of asking the transport for a fresh one, which is the whole
+// reason runPathSampler exists. A Status that sampled inline would make GET
+// /api/status as slow as the worst peer, and the dashboard polls it every
+// few seconds.
+func TestStatusDoesNotSampleNetworkPath(t *testing.T) {
+	n := newTestNodeWithTransport(t, "watcher",
+		blockingPathTransport{transport.NewPipeTransport(newPipeAddr(t))})
+	other := newTestNode(t, "other")
+	if _, err := n.AddPeer("other", peerToken(t, other)); err != nil {
+		t.Fatalf("AddPeer: %v", err)
+	}
+	if _, err := other.AddPeer("watcher", peerToken(t, n)); err != nil {
+		t.Fatalf("other AddPeer: %v", err)
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		peers := n.Status().Peers
+		return len(peers) == 1 && peers[0].State == ConnStateConnected
+	})
+
+	// Past the first sample's start, so a sampler is now blocked inside
+	// PeerPath; Status must not be waiting on it.
+	time.Sleep(pathSampleFirst + 200*time.Millisecond)
+	done := make(chan []PeerStatus, 1)
+	go func() { done <- n.Status().Peers }()
+	select {
+	case peers := <-done:
+		// A sample that never completed reports no path rather than a
+		// zero one, so the API omits the field instead of inventing one.
+		if p := peers[0].Network.Path; p != nil {
+			t.Errorf("Network.Path = %+v for a peer whose sample never completed, want nil", p)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Status blocked; it is sampling the network path inline instead of reading the cached one")
+	}
+}
+
+// directionRecordingTransport is a pipe that records the dialed flag each
+// PeerPath call was given.
+type directionRecordingTransport struct {
+	transport.Transport
+	mu     sync.Mutex
+	dialed []bool
+}
+
+func (d *directionRecordingTransport) PeerPath(ctx context.Context, conn net.Conn, addr string, dialed bool) (transport.PeerPath, error) {
+	d.mu.Lock()
+	d.dialed = append(d.dialed, dialed)
+	d.mu.Unlock()
+	return d.Transport.PeerPath(ctx, conn, addr, dialed)
+}
+
+func (d *directionRecordingTransport) directions() []bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return append([]bool(nil), d.dialed...)
+}
+
+// TestNetworkPathSampledWhileConnectedThenCleared covers the path's whole
+// life on a real (pipe) connection: it appears shortly after connecting,
+// each side measures its adopted connection in the right direction, and it
+// is cleared once the connection ends.
+//
+// The direction matters because the two ends of one connection are
+// measured differently (the dialer asks its client, the acceptor asks its
+// server), and only one of the two dials survives dedup. Both nodes'
+// samplers must therefore be told opposite things.
+func TestNetworkPathSampledWhileConnectedThenCleared(t *testing.T) {
+	trA := &directionRecordingTransport{Transport: transport.NewPipeTransport(newPipeAddr(t))}
+	trB := &directionRecordingTransport{Transport: transport.NewPipeTransport(newPipeAddr(t))}
+	a := newTestNodeWithTransport(t, "nodeA", trA)
+	b := newTestNodeWithTransport(t, "nodeB", trB)
+	if _, err := a.AddPeer("nodeB", peerToken(t, b)); err != nil {
+		t.Fatalf("nodeA AddPeer: %v", err)
+	}
+	if _, err := b.AddPeer("nodeA", peerToken(t, a)); err != nil {
+		t.Fatalf("nodeB AddPeer: %v", err)
+	}
+
+	pathOf := func(n *Node) *NetworkPath {
+		peers := n.Status().Peers
+		if len(peers) != 1 {
+			return nil
+		}
+		return peers[0].Network.Path
+	}
+	waitFor(t, 10*time.Second, func() bool { return pathOf(a) != nil && pathOf(b) != nil })
+
+	for name, n := range map[string]*Node{"nodeA": a, "nodeB": b} {
+		p := pathOf(n)
+		if !p.Direct || p.Relay != "" || p.SampledAt.IsZero() {
+			t.Errorf("%s path = %+v, want a sampled direct path with no relay", name, p)
+		}
+	}
+	dirA, dirB := trA.directions(), trB.directions()
+	if len(dirA) == 0 || len(dirB) == 0 {
+		t.Fatalf("PeerPath calls: nodeA %v, nodeB %v; want at least one each", dirA, dirB)
+	}
+	// Dedup keeps the connection KeepConnection picks from the two keys, so
+	// which node's dial survived is known in advance. Checking the exact
+	// flag, not just that the two differ, catches an inversion on both ends.
+	wantA := transport.KeepConnection(a.identity.Public(), b.identity.Public(), true)
+	if dirA[0] != wantA || dirB[0] != !wantA {
+		t.Errorf("sampled with dialed: nodeA %v, nodeB %v; want nodeA %v, nodeB %v", dirA[0], dirB[0], wantA, !wantA)
+	}
+
+	b.Close()
+	waitFor(t, 10*time.Second, func() bool {
+		peers := a.Status().Peers
+		return len(peers) == 1 && peers[0].State != ConnStateConnected && peers[0].Network.Path == nil
+	})
+}

@@ -199,11 +199,18 @@ pipes instead.
 
 **Details.**
 
-- `Transport` has six methods: `Start` (accept inbound connections), `Dial`,
+- `Transport` has seven methods: `Start` (accept inbound connections), `Dial`,
   `ValidateAddr` (offline check that a pasted token's address can be dialed
   at all; `AddPeer` calls it), `DiscardPeer` (drop cached per-peer state
-  after a disconnect), `LocalAddress` (for the node's own token), and
-  `Close`.
+  after a disconnect), `PeerPath` (whether a connection runs direct or
+  through a relay, for display), `LocalAddress` (for the node's own token),
+  and `Close`.
+- `TailcatTransport.PeerPath` measures the two directions differently. For
+  a connection we dialed it disco-pings the peer through the cached client.
+  For one the peer dialed it reads our server's own status, matching the
+  connection's source address to the client's key, with no round trip.
+  Core samples it on a timer per connection (`runPathSampler`), so the
+  status API never waits on the network.
 - `TailcatTransport` serves only TCP port 4197 (`SyncatPort`). It carries the
   connection through a WireGuard tunnel relayed through DERP.
 - tailcat's TCP stacks run in-process, so `TailcatTransport.Close` drains

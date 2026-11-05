@@ -60,6 +60,20 @@ type Transport interface {
 	// for, and safe to call concurrently with Dial.
 	DiscardPeer(addr string)
 
+	// PeerPath reports how traffic on conn is currently travelling, for
+	// display. Nothing in the sync path behaves differently because of it.
+	//
+	// conn must be a connection this transport produced: returned by
+	// Dial(ctx, addr) when dialed is true, or handed to Start's onConn when
+	// it is false. The two directions are measured differently, so the
+	// caller says which it has rather than the transport guessing.
+	//
+	// It may cost network round trips, and for an unreachable peer it may
+	// return only when ctx expires, so callers must bound ctx and must never
+	// call it while serving a request. See internal/core's runPathSampler,
+	// which samples on a timer so the status API reads a cached answer.
+	PeerPath(ctx context.Context, conn net.Conn, addr string, dialed bool) (PeerPath, error)
+
 	// LocalAddress returns this node's own address, suitable for
 	// embedding as the "tc" field of our own sc1 token. It is only valid
 	// after Start has returned successfully.
@@ -71,6 +85,22 @@ type Transport interface {
 	// own those and must close them separately. Close is safe to call more
 	// than once, and safe to call without a prior Start.
 	Close() error
+}
+
+// PeerPath describes how traffic to a peer is currently travelling: over a
+// direct path between the two hosts, or through a relay. It is deliberately
+// carrier-neutral, so core and everything above it display it without
+// learning what a DERP region is (SPEC.md §10). Exactly one of Endpoint and
+// Relay is set for a carrier that knows either.
+type PeerPath struct {
+	// Direct reports whether packets are flowing over a direct path rather
+	// than through a relay.
+	Direct bool
+	// Endpoint is the peer's host:port when Direct, empty otherwise.
+	Endpoint string
+	// Relay names the relay carrying the traffic when not Direct: for
+	// [TailcatTransport], the DERP region ("nyc"). Empty when Direct.
+	Relay string
 }
 
 // --- reconnect scheduling (SPEC.md §2.2) -------------------------------
