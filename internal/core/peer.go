@@ -635,6 +635,7 @@ func (pc *peerConn) handleControl(ctx context.Context, sess *syncsvc.Session, ty
 			return syncsvc.ControlProtocolViolation
 		}
 		pc.setRemoteShares(msg.Shares)
+		node.refreshSubscriptionDirections(ctx, pc, sess)
 
 	case protocol.MsgSubscribeRequest:
 		var msg protocol.SubscribeRequest
@@ -934,6 +935,19 @@ func (pc *peerConn) offeredShares() []protocol.ShareListEntry {
 		return nil
 	}
 	return append([]protocol.ShareListEntry(nil), pc.remoteShares...)
+}
+
+// offeredPermission is the permission the peer's most recent ShareList gave
+// shareID, or "" if it has not listed it.
+func (pc *peerConn) offeredPermission(shareID string) string {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+	for _, e := range pc.remoteShares {
+		if e.ShareID == shareID {
+			return e.Permission
+		}
+	}
+	return ""
 }
 
 func (pc *peerConn) setSubscriptionAccess(shareID, access string) {

@@ -2240,3 +2240,48 @@ func TestNetworkPathSampledWhileConnectedThenCleared(t *testing.T) {
 		return len(peers) == 1 && peers[0].State != ConnStateConnected && peers[0].Network.Path == nil
 	})
 }
+
+// TestReadOnlyShareForcesReceiveOnly is SPEC.md §5/§6: a subscriber to a
+// read-only share is receive-only whatever mode it subscribed with, and
+// the direction follows the offerer's permission when it changes live.
+func TestReadOnlyShareForcesReceiveOnly(t *testing.T) {
+	nodeA, nodeB, shareID := connectedPairWithShare(t, "docs") // read-only
+	if err := nodeB.AddSubscription("nodeA", "docs", t.TempDir(), config.ModeMirror); err != nil {
+		t.Fatalf("AddSubscription: %v", err)
+	}
+
+	outboundBlocked := func() (blocked, known bool) {
+		pc := nodeB.lookupPeer(nodeA.PeerKey())
+		if pc == nil {
+			return false, false
+		}
+		sess := pc.currentSession()
+		if sess == nil {
+			return false, false
+		}
+		d, ok := sess.ShareDirection(shareID)
+		return d.OutboundBlocked, ok
+	}
+	waitDirection := func(what string, want bool) {
+		t.Helper()
+		waitFor(t, 5*time.Second, func() bool {
+			b, ok := outboundBlocked()
+			return ok && b == want
+		})
+		if b, _ := outboundBlocked(); b != want {
+			t.Fatalf("%s: OutboundBlocked = %v, want %v", what, b, want)
+		}
+	}
+
+	waitDirection("mirror subscription to a read-only share", true)
+
+	if err := nodeA.SetSharePermission(shareID, config.PermissionReadWrite); err != nil {
+		t.Fatalf("promote to read-write: %v", err)
+	}
+	waitDirection("after promotion to read-write", false)
+
+	if err := nodeA.SetSharePermission(shareID, config.PermissionReadOnly); err != nil {
+		t.Fatalf("demote to read-only: %v", err)
+	}
+	waitDirection("after demotion to read-only", true)
+}
