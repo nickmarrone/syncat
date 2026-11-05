@@ -124,42 +124,6 @@ func TestTailcatDiagnosticsDoNotExposeCredentialsOrControls(t *testing.T) {
 	}
 }
 
-// dialWithRetry dials addr, retrying until it succeeds or ctx expires.
-//
-// Transport.Start returns as soon as tailcat's Server.Start does, which is
-// before that server has picked a home DERP region and connected to it,
-// measured here at roughly 2.5 to 3s after Start returns. Until then the server
-// is registered on no relay at all, and a dial's meow ping is a single DERP
-// packet with no retry of its own: tailcat's Client.ping sends one and then
-// waits on a hard internal 10s timeout, documented as applying "regardless
-// of ctx". Dialing straight after Start therefore fires that one packet into
-// the void and fails, deterministically and with a context-deadline error
-// that says nothing about the real cause.
-//
-// Production never sees this, which is why it went unnoticed: syncat dials
-// peers through transport.Supervisor (internal/core's runSupervisor), which
-// retries with backoff, so a meow lost in the startup window costs one
-// retry. These tests dial the transport directly, so they have to do the
-// same thing themselves rather than assert on a window production never
-// depends on.
-func dialWithRetry(ctx context.Context, t *testing.T, tr *TailcatTransport, addr string) (net.Conn, error) {
-	t.Helper()
-	var lastErr error
-	for attempt := 1; ctx.Err() == nil; attempt++ {
-		conn, err := tr.Dial(ctx, addr)
-		if err == nil {
-			return conn, nil
-		}
-		lastErr = err
-		t.Logf("dial attempt %d failed (retrying): %v", attempt, err)
-		select {
-		case <-time.After(time.Second):
-		case <-ctx.Done():
-		}
-	}
-	return nil, fmt.Errorf("no dial succeeded before the deadline: %w", lastErr)
-}
-
 // TestTailcatTransportEndToEnd exercises the production transport against
 // the real Tailscale DERP relays. Reachability was confirmed from this
 // sandbox by hand: all four *.ipn.dev relays respond, and Server.Start
@@ -191,7 +155,7 @@ func TestTailcatTransportEndToEnd(t *testing.T) {
 		t.Fatalf("server LocalAddress: %v", err)
 	}
 
-	dialConn, err := dialWithRetry(ctx, t, client, addr)
+	dialConn, err := client.Dial(ctx, addr)
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -320,14 +284,14 @@ func TestTailcatTransportStaysReachableAfterDialing(t *testing.T) {
 
 	// Give the subject a Client of its own. Before the fix, this is the step
 	// that cost the subject its inbound reachability.
-	outConn, err := dialWithRetry(ctx, t, subject, targetAddr)
+	outConn, err := subject.Dial(ctx, targetAddr)
 	if err != nil {
 		t.Fatalf("subject dial target: %v", err)
 	}
 	defer outConn.Close()
 
 	// The subject must still be reachable from outside.
-	conn, err := dialWithRetry(ctx, t, inbound, subjectAddr)
+	conn, err := inbound.Dial(ctx, subjectAddr)
 	if err != nil {
 		t.Fatalf("inbound dial subject after subject had dialled out (the regression): %v", err)
 	}
@@ -397,6 +361,86 @@ func TestClientCacheDiscardsFailedDials(t *testing.T) {
 	}
 	if still != replacement {
 		t.Fatal("a stale discard evicted the replacement Client")
+	}
+}
+
+// TestCloseDrainsOnlyDialedClients pins the guard behind peerClient.dialed.
+//
+// Close drains each cached client before closing it, but tailcat's
+// Client.DrainTCP dereferences a netstack that only exists once a dial has
+// started the client, unlike Client.Close, which tolerates a client that
+// was never used. Dial caches a Client before the dial that starts it, so
+// without the flag a Close landing in that window panics on a nil backend.
+// No DERP is needed to hit it: an undialed client is undialed whether or
+// not a relay exists.
+func TestCloseDrainsOnlyDialedClients(t *testing.T) {
+	tr := NewTailcatTransport(tailcat.NewPrivateKey(), nil)
+	if _, err := tr.clientFor("tc-never-dialed"); err != nil {
+		t.Fatalf("clientFor: %v", err)
+	}
+	if err := tr.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+// TestValidateAddr covers what a pasted token is refused for, and, just as
+// importantly, what it is not. The rejected case is the one that used to be
+// invisible: a pre-0.3.0 address is added without complaint and then never
+// connects, because tailcat only refuses it inside Client.up where nothing
+// surfaces the reason.
+func TestValidateAddr(t *testing.T) {
+	tr := NewTailcatTransport(tailcat.NewPrivateKey(), nil)
+
+	current := tailcat.NewPrivateKey()
+	current.Public.RegionID = 1
+
+	// A pre-0.3.0 address: node key only, no disco key.
+	legacy := *current
+	legacy.Public.ServerDiscoPublic = tailcat.DiscoPublic{}
+
+	// A current address that simply opted out of the pre-shared key, which
+	// tailcat supports (`--psk=false`) and clients accept.
+	noPSK := *current
+	noPSK.Public.PresharedKey = tailcat.PresharedKey{}
+
+	for _, tc := range []struct {
+		name    string
+		addr    string
+		wantErr bool
+	}{
+		{"current", string(current.Public.Addr()), false},
+		{"no preshared key", string(noPSK.Public.Addr()), false},
+		{"legacy, no disco key", string(legacy.Public.Addr()), true},
+		{"empty", "", true},
+		{"not a tailcat address", "sc1AAAA", true},
+		{"corrupt payload", "tc!!!not-base64!!!", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tr.ValidateAddr(tc.addr)
+			if tc.wantErr && err == nil {
+				t.Fatal("ValidateAddr accepted an address that cannot be dialed")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("ValidateAddr rejected a dialable address: %v", err)
+			}
+			// The error reaches the CLI and the API; like OpError, it must
+			// not copy the credential-bearing address into either.
+			if err != nil && tc.addr != "" && strings.Contains(err.Error(), tc.addr) {
+				t.Errorf("ValidateAddr error %q leaks the address", err)
+			}
+		})
+	}
+
+	// The legacy rejection has to tell the operator what to do about it;
+	// that is the whole reason for checking here rather than at dial time.
+	err := tr.ValidateAddr(string(legacy.Public.Addr()))
+	if err == nil {
+		t.Fatal("legacy address accepted")
+	}
+	for _, want := range []string{"disco key", "syncat token"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("legacy address error %q does not mention %q", err, want)
+		}
 	}
 }
 

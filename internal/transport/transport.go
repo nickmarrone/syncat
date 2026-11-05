@@ -39,6 +39,16 @@ type Transport interface {
 	// or a registry key for [PipeTransport].
 	Dial(ctx context.Context, addr string) (net.Conn, error)
 
+	// ValidateAddr reports whether addr is one this transport could dial. It
+	// is a cheap, offline check of the address itself, not a reachability
+	// test: a nil return promises nothing about the peer being up.
+	//
+	// It is called where a peer's address first arrives from a human
+	// (core's AddPeer), so that an address this build can never use is
+	// refused there rather than failing silently on every dial forever
+	// after. Carriers whose addresses are opaque may accept anything.
+	ValidateAddr(addr string) error
+
 	// DiscardPeer drops whatever per-peer state the transport has cached
 	// for addr, so the next Dial to it starts from scratch. Called when a
 	// connection to that peer has ended and anything cached for it should

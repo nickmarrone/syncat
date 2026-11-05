@@ -123,6 +123,16 @@ func (n *Node) AddPeer(name, token string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("core: add peer: %w", err)
 	}
+	// Refuse an address this carrier could never dial, at the one point a
+	// token arrives from a human, rather than letting the peer sit
+	// disconnected while runSupervisor redials it forever. It asks the
+	// Transport because what makes an address valid is the carrier's
+	// business, not core's. Deliberately not folded into config.ParseToken:
+	// that also runs on the handshake path and on every config load, where
+	// tightening it would reject peers already stored.
+	if err := n.transport.ValidateAddr(tok.TailcatAddr); err != nil {
+		return "", fmt.Errorf("core: add peer: %w", err)
+	}
 	peerKeyHex := hex.EncodeToString(tok.ID)
 	if peerKeyHex == n.PeerKey() {
 		return "", fmt.Errorf("core: add peer: this is this node's own token — paste the token printed by `syncat token` on the *other* node")

@@ -199,11 +199,19 @@ pipes instead.
 
 **Details.**
 
-- `Transport` has five methods: `Start` (accept inbound connections), `Dial`,
-  `DiscardPeer` (drop cached per-peer state after a disconnect), `LocalAddress`
-  (for the node's own token), and `Close`.
+- `Transport` has six methods: `Start` (accept inbound connections), `Dial`,
+  `ValidateAddr` (offline check that a pasted token's address can be dialed
+  at all; `AddPeer` calls it), `DiscardPeer` (drop cached per-peer state
+  after a disconnect), `LocalAddress` (for the node's own token), and
+  `Close`.
 - `TailcatTransport` serves only TCP port 4197 (`SyncatPort`). It carries the
   connection through a WireGuard tunnel relayed through DERP.
+- tailcat's TCP stacks run in-process, so `TailcatTransport.Close` drains
+  each dialed peer client and then the server before closing them. Otherwise
+  the last queued bytes and FINs could be lost at exit.
+- `TailcatTransport.ValidateAddr` refuses addresses from before tailcat
+  0.3.0, which carry no disco key. tailcat would reject them only inside a
+  dial, where nothing reports the reason.
 - `Supervisor.Run` calls a dial function in a loop. After a failure it waits
   with exponential backoff: 1 s initial, factor 2, 5 min maximum, 50% jitter.
 - Two peers can dial each other at the same time. `KeepConnection` uses both

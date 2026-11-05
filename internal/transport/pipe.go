@@ -68,6 +68,16 @@ func (t *PipeTransport) Dial(ctx context.Context, addr string) (net.Conn, error)
 
 func (t *PipeTransport) DiscardPeer(string) {}
 
+// ValidateAddr implements Transport. A pipe address is an opaque registry
+// key with no structure to check, so any non-empty one is acceptable;
+// whether anything is actually registered under it is Dial's business.
+func (t *PipeTransport) ValidateAddr(addr string) error {
+	if addr == "" {
+		return errors.New("transport: pipe: address must not be empty")
+	}
+	return nil
+}
+
 func (t *PipeTransport) LocalAddress() (string, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
