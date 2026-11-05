@@ -38,6 +38,7 @@ import (
 	"time"
 
 	"github.com/nickmarrone/syncat/internal/config"
+	"github.com/nickmarrone/syncat/internal/hold"
 	"github.com/nickmarrone/syncat/internal/index"
 	"github.com/nickmarrone/syncat/internal/protocol"
 	syncsvc "github.com/nickmarrone/syncat/internal/sync"
@@ -128,11 +129,9 @@ type Node struct {
 	sharesMu     sync.Mutex
 	shareWatches map[string]*shareWatch // key: share id
 
-	// holdsMu/holds mirror the store's holds table (see holds.go), so the
-	// guard every reconcile pass consults never has to query the database.
-	// Writes go to the store first and to the map only once that succeeded.
-	holdsMu sync.Mutex
-	holds   map[holdKey]index.Hold
+	// holds decides which scans and peers' passes may apply (see holds.go
+	// and internal/hold).
+	holds *hold.Guard
 
 	rejectedMu sync.Mutex
 	rejected   []RejectedConnection
@@ -184,12 +183,6 @@ func Open(ctx context.Context, opts Options) (*Node, error) {
 	if err != nil {
 		return nil, fmt.Errorf("core: open: %w", err)
 	}
-	holds, err := loadHolds(ctx, store)
-	if err != nil {
-		store.Close()
-		return nil, fmt.Errorf("core: open: %w", err)
-	}
-
 	nodeCtx, cancel := context.WithCancel(context.Background())
 
 	n := &Node{
@@ -203,7 +196,6 @@ func Open(ctx context.Context, opts Options) (*Node, error) {
 		cfg:               in.cfg,
 		peers:             map[string]*peerConn{},
 		shareWatches:      map[string]*shareWatch{},
-		holds:             holds,
 		ctx:               nodeCtx,
 		cancel:            cancel,
 		startTime:         in.clock.Now(),
@@ -229,6 +221,11 @@ func Open(ctx context.Context, opts Options) (*Node, error) {
 			cleanup()
 		}
 	}()
+
+	// Holds load before anything can scan or sync.
+	if n.holds, err = hold.Load(nodeCtx, store, n.holdOptions()); err != nil {
+		return nil, fmt.Errorf("core: open: %w", err)
+	}
 
 	transportAttempted = true
 	if err := opts.Transport.Start(nodeCtx, n.onAccept); err != nil {

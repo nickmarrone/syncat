@@ -76,6 +76,7 @@ flowchart TD
     webui["internal/webui<br/><i>embedded static UI</i>"]
     core["internal/core<br/><i>node, peers, shares, config changes</i>"]
     sync["internal/sync (syncsvc)<br/><i>sessions, reconcile, transfer, trash</i>"]
+    hold["internal/hold<br/><i>holds: which changes may apply</i>"]
     index["internal/index<br/><i>SQLite, scanner, ignore, watcher</i>"]
     protocol["internal/protocol<br/><i>frames, messages, handshake</i>"]
     transport["internal/transport<br/><i>tailcat and test connections</i>"]
@@ -92,11 +93,15 @@ flowchart TD
     api --> sync
     api --> config
     api --> version
+    core --> hold
     core --> sync
     core --> index
     core --> protocol
     core --> transport
     core --> config
+    hold --> sync
+    hold --> index
+    hold --> config
     sync --> index
     sync --> protocol
     sync --> config
@@ -117,6 +122,9 @@ Dependency rules:
 - `internal/transport` returns a plain `net.Conn`. It knows nothing about the
   protocol that runs on that connection.
 - `internal/api` imports `internal/sync` only to classify `ErrRestoreDestExists`.
+- `internal/hold` imports `internal/sync` only to recognize
+  `ErrReservedDirTaken`. `internal/sync` knows nothing about holds; it only
+  calls the `ShareConfig.Guard` it is given.
 
 ### Package summary
 
@@ -127,6 +135,7 @@ Dependency rules:
 | `internal/webui` | Serve the embedded single-page UI. | `Handler`, `Assets` |
 | `internal/core` | Own the running node and connect every other part. | `Node`, `peerConn`, `shareWatch`, `Status` |
 | `internal/sync` | Keep shares in agreement with one peer over one connection. | `Session`, `Action`, `Direction`, `Trash`, `TrashEvent` |
+| `internal/hold` | Decide whether a scan or a peer's pass may apply, and keep the holds. | `Guard`, `Hold`, `Link` |
 | `internal/index` | Record what is on disk and what peers report. | `Store`, `Scanner`, `Watcher`, `Matcher` |
 | `internal/protocol` | Define and encode the peer wire protocol. | `MsgType`, `Reader`, `StreamWriter`, `Keepalive` |
 | `internal/transport` | Create connections to peers. | `Transport`, `TailcatTransport`, `PipeTransport`, `Supervisor` |
@@ -498,10 +507,40 @@ or, oldest first, over the size limit, never the newest. `ValidateRelPath`
 rejects any peer path into `.syncat/`, and the scanner never indexes it.
 
 **Hold guard.** `ShareConfig.Guard` is asked before a reconcile pass applies
-anything, with how many live files the pass would delete. Core supplies it (see
-`core/holds.go`). When it says no, the pass is skipped; the peer's rows are
-already in `peer_files`, so a later `ReconcileShare` applies exactly what was
-held.
+anything, with the share's local rows and the paths the pass would delete. Core
+wires it to `internal/hold` (see `core/holds.go`). When it says no, the pass is
+skipped; the peer's rows are already in `peer_files`, so a later
+`ReconcileShare` applies exactly what was held.
+
+### `internal/hold`
+
+**What it does.** This package is the hold (see GLOSSARY.md). It owns every
+rule about when a change is held and when a hold ends. It does not scan, sync,
+or know about sessions; core asks it questions and acts on the answers.
+
+| File | Purpose |
+|---|---|
+| `hold.go` | `Guard`: the checks, the reasons and their explanations, and confirm |
+
+**Details.**
+
+- A hold is per **link**: a share, and either a peer whose changes are held or
+  `""` for this node's own scans. A hold on this node's own copy refuses every
+  peer's pass too.
+- `Guard.Scan` checks a local scan result before it is applied. `Guard.Pass`
+  checks a peer's reconcile pass. Both count deletes against the same
+  definition of a live file (not a tombstone, not parked, not a directory) and
+  share one decision.
+- `Guard.ScanFailed` turns a failed scan into a hold when the root is missing
+  or unreadable, or when `.syncat/` belongs to someone else.
+- A hold over deletes clears only when nothing would be deleted. Getting back
+  under the thresholds is not enough.
+- `Guard.Confirm` marks a hold so the next change it would have held applies.
+  The caller runs that scan or pass.
+- Every held link is kept in memory and in the index's `holds` table, so the
+  checks never query the database and a restart keeps them.
+- `Hold.Problem` and `Hold.Remedy` are the words the CLI and web UI show, so
+  neither interprets reasons itself.
 
 ### `internal/core`
 
@@ -513,6 +552,7 @@ each other and gives the API a typed Go interface. It never encodes JSON.
 | File | Purpose |
 |---|---|
 | `node.go` | `Node`, `Open` and `Close`, inbound connection admission, and test clocks |
+| `holds.go` | Connect the hold guard to scans, sessions, config changes, and the API |
 | `peer.go` | `peerConn`: dial, handshake, deduplication, session start, and teardown for one peer |
 | `access.go` | Share list, subscription requests, access decisions, and access updates |
 | `approvals.go` | Persisted queues of pending peers and pending share requests |
@@ -534,7 +574,7 @@ flowchart LR
         watches["shareWatches<br/>map share ID → *shareWatch"]
         store[("store")]
         trash["trash + sweeper"]
-        holds["holds<br/>(holdsMu)"]
+        holds["holds<br/>(*hold.Guard)"]
         tr["transport"]
     end
     subgraph peerConn
@@ -679,7 +719,8 @@ sequenceDiagram
     CLI->>Tr: NewTailcatTransport
     CLI->>Core: Open(paths, config, transport)
     Core->>Cfg: load or create identity key
-    Core->>Idx: Open index.db, run migrations, load holds
+    Core->>Idx: Open index.db, run migrations
+    Core->>Core: load holds
     Core->>Sync: NewTrash
     Core->>Tr: Start(onAccept)
     Core->>Tr: LocalAddress
@@ -934,7 +975,7 @@ identity as hostile.
 - A local delete does not use the trash.
 - A scan or a peer's pass that would delete a bulk of a share, or all of it,
   or that finds the share root missing, is held instead of applied
-  (`core/holds.go`). An unreadable path is never a delete.
+  (`internal/hold`). An unreadable path is never a delete.
 - No peer path may point into `.syncat/`.
 - A pulled file is written to a temporary file and checked against its
   SHA-256 before it replaces anything.
@@ -1013,6 +1054,6 @@ Some environments need `TS_PERMIT_TOOLCHAIN_MISMATCH=1` for tailcat tests.
 | Share access or approval | `core/access.go`, `core/approvals.go`, `core/mutations.go` |
 | Peer path check | `sync/path.go` |
 | Trash events and retention | `sync/trash.go`, `core/trash.go` |
-| Holds | `core/holds.go`, `sync/session.go` `ShareConfig.Guard`, `index/holds.go` |
+| Holds | `hold/hold.go`, then `core/holds.go`, `sync/session.go` `ShareConfig.Guard`, `index/holds.go` |
 | Wire format | `protocol/message.go` |
 | Web UI token check | `api/server.go`, `webui/static/app.js` |

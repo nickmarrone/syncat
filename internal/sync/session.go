@@ -63,18 +63,18 @@ type ShareConfig struct {
 	// on every call.
 	Ignore func(relpath string, isDir bool) bool
 
-	// Guard is asked before a reconcile pass applies anything. deletes is how
-	// many files the pass would delete and live how many live files the share
-	// holds locally. Returning false skips the whole pass: nothing is applied
-	// and nothing is reported back. internal/core uses it to put a peer's
-	// bulk delete on hold, and to stop every peer's changes while this
+	// Guard is asked before a reconcile pass applies anything, with the
+	// share's local index rows and the paths the pass would delete.
+	// Returning false skips the whole pass: nothing is applied and nothing
+	// is reported back. internal/core wires it to internal/hold, which puts
+	// a peer's bulk delete on hold and stops every peer's changes while this
 	// node's own copy of the share is on hold (see GLOSSARY.md). nil allows
 	// every pass.
 	//
 	// The peer's rows are already recorded in peer_files when Guard says no,
 	// so a later ReconcileShare (after the user confirms) applies exactly
 	// what was held, without waiting for the peer to resend it.
-	Guard func(deletes, live int) bool
+	Guard func(local []index.FileRow, deleting []string) bool
 }
 
 // ignored calls Ignore after checking it for nil.
@@ -1325,12 +1325,9 @@ func (s *Session) reconcileLocked(ctx context.Context, cfg ShareConfig, why stri
 	}
 
 	actions := Reconcile(rowsToInfos(localRows), rowsToInfos(remoteRows), s.nodeID, cfg.Direction, s.clock, cfg.Ignore)
-	if cfg.Guard != nil {
-		deletes, live := countLiveFileDeletes(actions, localRows)
-		if !cfg.Guard(deletes, live) {
-			s.debugf("reconcile %s (%s) skipped: share is on hold (%d of %d file(s) would be deleted)", shareID, why, deletes, live)
-			return
-		}
+	if cfg.Guard != nil && !cfg.Guard(localRows, deletePaths(actions)) {
+		s.debugf("reconcile %s (%s) skipped: share is on hold", shareID, why)
+		return
 	}
 
 	if s.trash != nil {
@@ -1386,25 +1383,15 @@ func (s *Session) reconcileLocked(ctx context.Context, cfg ShareConfig, why stri
 	}
 }
 
-// countLiveFileDeletes returns how many of the share's live local files
-// (live) the actions would delete (deletes). Directories are left out of
-// both counts: a directory only goes once it is empty, so its files have
-// already been counted. So are deletes of paths that are not live here (a
-// tombstone for a file this node never had, or two tombstones merging),
-// because they remove nothing.
-func countLiveFileDeletes(actions []Action, localRows []index.FileRow) (deletes, live int) {
-	liveFiles := make(map[string]bool, len(localRows))
-	for _, r := range localRows {
-		if !r.Deleted && r.Type != protocol.FileTypeDir {
-			liveFiles[r.RelPath] = true
-		}
-	}
+// deletePaths returns the paths actions would delete, for ShareConfig.Guard.
+func deletePaths(actions []Action) []string {
+	var out []string
 	for _, a := range actions {
-		if a.Kind == ActionDelete && liveFiles[a.RelPath] {
-			deletes++
+		if a.Kind == ActionDelete {
+			out = append(out, a.RelPath)
 		}
 	}
-	return deletes, len(liveFiles)
+	return out
 }
 
 // runActionWorkers applies an arbitrarily large reconciliation plan with a

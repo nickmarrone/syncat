@@ -117,13 +117,17 @@ type safetyDTO struct {
 
 func toSafetyDTO(s config.Safety) safetyDTO { return safetyDTO(s) }
 
-// holdDTO is one share, or one peer's link to it, on hold.
+// holdDTO is one share, or one peer's link to it, on hold. Problem and
+// Remedy are the words to show the user, so clients never interpret Reason
+// themselves.
 type holdDTO struct {
 	ShareID     string    `json:"share_id"`
 	ShareName   string    `json:"share_name,omitempty"`
 	PeerKey     string    `json:"peer_key,omitempty"` // empty for this node's own copy
 	PeerName    string    `json:"peer_name,omitempty"`
 	Reason      string    `json:"reason"`
+	Problem     string    `json:"problem"` // a clause: "the folder is missing or unreadable"
+	Remedy      string    `json:"remedy"`  // a clause: "restore it, or remove the share"
 	Deletes     int       `json:"deletes"`
 	Live        int       `json:"live"`
 	Since       time.Time `json:"since"`
@@ -134,8 +138,9 @@ type holdDTO struct {
 func toHoldDTO(h core.HoldStatus) holdDTO {
 	return holdDTO{
 		ShareID: h.ShareID, ShareName: h.ShareName, PeerKey: h.PeerKey, PeerName: h.PeerName,
-		Reason: h.Reason, Deletes: h.Deletes, Live: h.Live, Since: h.Since,
-		Confirmed: h.Confirmed, Confirmable: h.Confirmable,
+		Reason: h.Reason, Problem: h.Problem(), Remedy: h.Remedy(),
+		Deletes: h.Deletes, Live: h.Live, Since: h.Since,
+		Confirmed: h.Confirmed, Confirmable: h.Confirmable(),
 	}
 }
 

@@ -76,6 +76,9 @@ func TestHoldConfirmEndpoint(t *testing.T) {
 	if len(st.Holds) != 1 || st.Holds[0].Deletes != 25 || !st.Holds[0].Confirmable {
 		t.Fatalf("status holds = %+v, want one confirmable hold of 25", st.Holds)
 	}
+	if h := st.Holds[0]; h.Problem != "25 of 30 files would be deleted" || h.Remedy == "" {
+		t.Errorf("hold problem/remedy = %q / %q, want the daemon's own words", h.Problem, h.Remedy)
+	}
 
 	w = doRequest(t, srv, http.MethodPost, "/api/shares/docs/holds/confirm", testToken, map[string]string{})
 	if w.Code != http.StatusOK {
