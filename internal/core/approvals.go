@@ -193,9 +193,6 @@ func (n *Node) ApprovePendingPeer(ref string) error {
 	}); err != nil {
 		return fmt.Errorf("core: approve pending peer: %w", err)
 	}
-	if err := n.activatePeer(approved, peerKey); err != nil {
-		return fmt.Errorf("core: approve pending peer: %w", err)
-	}
 	return nil
 }
 

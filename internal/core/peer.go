@@ -582,7 +582,7 @@ func (pc *peerConn) handleControl(ctx context.Context, sess *syncsvc.Session, ty
 		if !ok {
 			return syncsvc.ControlRejected
 		}
-		node.goTracked(func() { node.finishSubscribeRequest(pc, share, access) })
+		node.goTracked(func() { node.finishSubscribeRequest(pc, sess, share, access) })
 
 	case protocol.MsgAccessUpdate:
 		var msg protocol.AccessUpdate

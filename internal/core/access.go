@@ -25,7 +25,7 @@ import (
 // share config, via sess.AddShare, before the read loop advances to
 // read whatever frame the peer sends next. Once granted, this node itself
 // sends an IndexUpdate for this share moments later (finishSubscribeRequest,
-// via SetShareAccess -> Session.SyncShare) on the SAME connection, and if
+// via startSyncing -> Session.SyncShare) on the SAME connection, and if
 // the peer's own inbound traffic interleaves with that, Session's read
 // loop must already know about this share by the time it dispatches
 // anything referencing it, a race that showed up in practice as
@@ -54,24 +54,43 @@ func (n *Node) provisionShareForRequest(pc *peerConn, sess *syncsvc.Session, sha
 	}
 
 	// A pending, denied, or revoked request must not make the share known to
-	// the session. SetShareAccess can provision it later, on this same open
+	// the session. A later grant can provision it, on this same open
 	// connection, when an operator grants the request.
 	if access != protocol.AccessGranted {
 		return share, access, true
 	}
-	pc.grantShare(sess, shareID, share.Path, syncsvc.DirectionFor(share.Permission, ""))
+	pc.grantShare(sess, shareID, share.Path, offeredDirection(share))
 	return share, access, true
 }
 
 // finishSubscribeRequest is the asynchronous remainder of handling a
-// SubscribeRequest: persisting the grant and notifying the peer
-// (SetShareAccess also re-applies the same sess.AddShare provisionShareForRequest
-// already did, a harmless idempotent overwrite, since SetShareAccess is
-// also the REST API's direct entry point and shouldn't have a
-// provision-already-done special case).
-func (n *Node) finishSubscribeRequest(pc *peerConn, share config.Share, access string) {
-	if err := n.SetShareAccess(share.ID, pc.peerKeyHex, access); err != nil {
+// SubscribeRequest: recording the decision and answering the peer. A
+// decision that changes the config is answered by that change's effects
+// (applyAccess). One already on record, such as a grant renewed on every
+// reconnect, changes nothing, so it is answered here, on the session that
+// asked; provisionShareForRequest has already granted the share on it.
+func (n *Node) finishSubscribeRequest(pc *peerConn, sess *syncsvc.Session, share config.Share, access string) {
+	changed := false
+	if _, err := n.mutateConfig(func(cfg *config.Config) error {
+		i := findShareIndex(cfg, share.ID)
+		if i < 0 {
+			return mutationErrorf(MutationNotFound, "share %s is not configured", share.ID)
+		}
+		if cfg.Shares[i].Access[pc.peerKeyHex] != access {
+			cfg.Shares[i].Access[pc.peerKeyHex] = access
+			changed = true
+		}
+		return nil
+	}); err != nil {
 		n.logger.Printf("core: set %s access to %s for %s: %v", share.ID, access, pc.peerKeyHex, err)
+		return
+	}
+	if changed {
+		return
+	}
+	n.sendAccessUpdate(sess, pc.peerKeyHex, share.ID, access)
+	if access == protocol.AccessGranted {
+		n.startSyncing(n.ctx, sess, share.ID)
 	}
 }
 
@@ -118,27 +137,14 @@ func (n *Node) provisionAccessUpdate(pc *peerConn, sess *syncsvc.Session, msg pr
 }
 
 // finishAccessUpdate is AccessUpdate's asynchronous half: the initial
-// full sync in both directions (SyncShare pushes our current state;
-// rescanShare picks up any pre-existing local content in the subscription
-// directory and pushes that too).
+// full sync in both directions. rescanShare picks up any pre-existing local
+// content in the subscription directory, and startSyncing pushes our index
+// and pulls whatever we already owe ourselves from the offerer's.
 func (n *Node) finishAccessUpdate(ctx context.Context, sess *syncsvc.Session, shareID string) {
-	if err := sess.SyncShare(ctx, shareID); err != nil {
-		n.logger.Printf("core: initial sync for subscription %s: %v", shareID, err)
-	}
 	if err := n.rescanShare(n.ctx, shareID); err != nil {
 		n.logger.Printf("core: initial local scan for subscription %s: %v", shareID, err)
 	}
-	// Neither of the two above notices work we already owed this peer. They
-	// push our state outwards -- our index to the peer, our directory into
-	// our index -- and the reconciler that decides what to *pull* only runs
-	// when the peer sends rows. After a reconnect the peer usually sends
-	// none: its index sync is incremental, and its cursor says we already
-	// have everything it has. Anything a previous session left unfinished --
-	// a pull interrupted by the disconnect, most obviously -- is then
-	// invisible to both sides. See Session.ReconcileShare.
-	if err := sess.ReconcileShare(ctx, shareID); err != nil {
-		n.logger.Printf("core: reconcile subscription %s on connect: %v", shareID, err)
-	}
+	n.startSyncing(ctx, sess, shareID)
 }
 
 // --- share list / subscribe-request announcements --------------------------
@@ -177,9 +183,19 @@ func (n *Node) requestSubscriptions(sess *syncsvc.Session, peerKeyHex string) {
 	}
 	n.cfgMu.RUnlock()
 	for _, shareID := range toRequest {
-		if err := sess.Writer().WriteMessage(protocol.MsgSubscribeRequest, protocol.SubscribeRequest{ShareID: shareID}); err != nil {
-			n.logger.Printf("core: send subscribe request %s to %s: %v", shareID, peerKeyHex, err)
-		}
+		n.sendSubscribeRequest(sess, peerKeyHex, shareID)
+	}
+}
+
+func (n *Node) sendSubscribeRequest(sess *syncsvc.Session, peerKeyHex, shareID string) {
+	if err := sess.Writer().WriteMessage(protocol.MsgSubscribeRequest, protocol.SubscribeRequest{ShareID: shareID}); err != nil {
+		n.logger.Printf("core: send subscribe request %s to %s: %v", shareID, peerKeyHex, err)
+	}
+}
+
+func (n *Node) sendAccessUpdate(sess *syncsvc.Session, peerKeyHex, shareID, access string) {
+	if err := sess.Writer().WriteLatestMessage("access-update\x00"+shareID, protocol.MsgAccessUpdate, protocol.AccessUpdate{ShareID: shareID, Access: access}); err != nil {
+		n.logger.Printf("core: send access update for %s to %s: %v", shareID, peerKeyHex, err)
 	}
 }
 

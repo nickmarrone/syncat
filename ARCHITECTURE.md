@@ -561,7 +561,8 @@ each other and gives the API a typed Go interface. It never encodes JSON.
 | `approvals.go` | Persisted queues of pending peers and pending share requests |
 | `shares.go` | `shareWatch`, rescans, version bumps, and propagation to peers |
 | `journal.go` | Daily change-journal pruning (7-day retention) |
-| `mutations.go` | Config changes called by the API |
+| `mutations.go` | Config changes called by the API; they only edit the config |
+| `effects.go` | Derive a config change's live effects from the old and new config, and apply them |
 | `mutation_error.go` | Typed errors for mutations |
 | `resolve.go` | Resolve names and ID prefixes to peers and shares |
 | `network_status.go` | Low-cardinality network and session counters |
@@ -656,7 +657,7 @@ hand-written single-page UI (`index.html`, `app.js`, `style.css`) with
 | `GET, POST /api/peers`, `DELETE /api/peers/{id}` | `Status`, `AddPeer`, `RemovePeer` |
 | `POST /api/peers/{id}/approve` | `ApprovePendingPeer` |
 | `GET /api/approvals`, `POST /api/approvals/{id}` | `Approvals`, `DecideApproval` |
-| `GET, POST /api/shares`, `PATCH, DELETE /api/shares/{id}` | `AddShare`, `RenameShare`, `SetSharePermission`, `SetShareApprovalRequired`, `SetShareAccess`, `RemoveShare` |
+| `GET, POST /api/shares`, `PATCH, DELETE /api/shares/{id}` | `AddShare`, `UpdateShare`, `RemoveShare` |
 | `GET /api/remote-shares` | `Status` |
 | `GET, POST /api/subscriptions`, `PATCH, DELETE /api/subscriptions/{id}` | `AddSubscription`, `PauseSubscription`, `RemoveSubscription` |
 | `GET /api/shares/{id}/trash`, `POST /api/shares/{id}/trash/undo` | `ListTrash`, `UndoTrash` |
@@ -871,16 +872,27 @@ sequenceDiagram
     U->>H: POST /api/shares {path, name, perm}
     H->>H: check token, decode, normalize
     H->>N: AddShare(path, name, permission, approval)
-    N->>N: lock cfgMu, clone config
+    N->>N: lock mutateMu, then cfgMu, clone config
     N->>C: change clone, Validate, Save (atomic)
     N->>N: swap config, unlock cfgMu
-    N->>L: start watcher, first scan, send ShareList to peers
+    N->>L: applyConfigChange(old, new)
+    L->>L: diffConfig: share added, announce
+    L->>L: start watcher, first scan, send ShareList to peers
+    N->>N: unlock mutateMu
     N-->>H: share ID or MutationError
     H-->>U: JSON or mapped HTTP error
 ```
 
+A mutation only edits the config. `applyConfigChange` compares the config
+before and after and applies every live effect: watchers started or stopped,
+peers dialed or dropped, shares granted, neutered, or redirected on sessions,
+access updates and share lists sent, and holds forgotten. So no mutation can
+forget one, and `diffConfig`'s tests cover them without a node. One
+`PATCH /api/shares/{id}` is one `UpdateShare`, saved and announced once.
+
 Live effects start only after `cfgMu` is released. This keeps the config lock
-out of peer and session locks.
+out of peer and session locks. `mutateMu` stays held, so changes take effect
+in the order they were made.
 
 ## Concurrency rules
 
@@ -895,6 +907,8 @@ out of peer and session locks.
   chunks.
 - One reconcile pass runs at a time for each session (`reconcileMu`).
 - `cfgMu` is not held when code takes a `peerConn` lock.
+- `mutateMu` is held across a config change and its effects. No effect may
+  change the config itself; work that must is handed to a tracked goroutine.
 - The stream writer is the only writer of a session connection.
 - Every timer goes through an injectable clock. Tests control time without
   waiting.
@@ -1054,7 +1068,8 @@ Some environments need `TS_PERMIT_TOOLCHAIN_MISMATCH=1` for tailcat tests.
 | CLI API request | `cmd/syncat/cmd_*.go`, then `api/handlers.go` |
 | API response | `api/dto.go` |
 | Name or ID resolution | `core/resolve.go` |
-| Share access or approval | `core/access.go`, `core/approvals.go`, `core/mutations.go` |
+| Share access or approval | `core/access.go`, `core/approvals.go`, `core/mutations.go`, `core/effects.go` `applyAccess` |
+| A config change's live effects | `core/effects.go` `diffConfig`, `applyConfigChange` |
 | Peer path check | `sync/path.go` |
 | Trash events and retention | `sync/trash.go`, `core/trash.go` |
 | Holds | `hold/hold.go`, then `core/holds.go`, `sync/session.go` `ShareConfig.Guard`, `index/holds.go` |

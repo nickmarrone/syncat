@@ -3,8 +3,9 @@
 // packages (SPEC.md §12).
 //
 // [Node] (node.go) owns startup/shutdown ordering and the accept path.
-// mutations.go is the config-mutation API the REST layer and CLI call;
-// resolve.go is the reference resolution that lets those callers pass
+// mutations.go is the config-mutation API the REST layer and CLI call,
+// and effects.go derives every change's live effects from the config
+// before and after it; resolve.go is the reference resolution that lets those callers pass
 // names and id prefixes instead of raw hex. peer.go implements the
 // per-peer dial/accept/dedup state machine (SPEC.md §2, §4), and
 // access.go the ShareList/SubscribeRequest/AccessUpdate negotiation that
@@ -17,7 +18,7 @@
 // Known MVP gap, called out where it bites rather than left implicit:
 //   - Once granted, a share/subscription can only be "neutered" on an
 //     already-open connection (both Direction flags set, see
-//     peerConn.neuterShare in peer.go and its callers in mutations.go and
+//     peerConn.neuterShare in peer.go and its callers in effects.go and
 //     access.go) rather than fully removed, since internal/sync.Session
 //     exposes no share-removal call. A fresh connection never re-adds a
 //     removed/revoked share, so this converges on reconnect either way.
@@ -94,7 +95,8 @@ type Options struct {
 // Every exported method is safe for concurrent use, including concurrently
 // with the peer manager's own background activity. See mutations.go's
 // file comment on lock ordering (config mutations always clone-mutate-
-// swap under cfgMu; live effects are applied after cfgMu is released).
+// swap under cfgMu; live effects, effects.go, are applied after cfgMu is
+// released).
 type Node struct {
 	paths     *config.Paths
 	identity  *config.IdentityKey
@@ -117,8 +119,11 @@ type Node struct {
 	closeMu sync.RWMutex
 	closing bool
 
-	cfgMu sync.RWMutex
-	cfg   *config.Config
+	// mutateMu serializes config changes with their live effects (see
+	// mutateConfig); cfgMu guards cfg itself.
+	mutateMu sync.Mutex
+	cfgMu    sync.RWMutex
+	cfg      *config.Config
 
 	tokenMu sync.RWMutex
 	token   string
