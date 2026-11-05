@@ -642,6 +642,13 @@ func (s *Session) retainWarnings(shareID string, stillFlagged map[string]bool) i
 	return dropped
 }
 
+// ShareDirection reports the Direction shareID currently syncs in on this
+// session, and whether the session knows the share at all.
+func (s *Session) ShareDirection(shareID string) (Direction, bool) {
+	cfg, ok := s.getShare(shareID)
+	return cfg.Direction, ok
+}
+
 func (s *Session) getShare(shareID string) (ShareConfig, bool) {
 	s.sharesMu.RLock()
 	defer s.sharesMu.RUnlock()

@@ -127,13 +127,53 @@ func (n *Node) provisionAccessUpdate(pc *peerConn, sess *syncsvc.Session, msg pr
 		if subCopy.Paused {
 			return false
 		}
-		pc.grantShare(sess, msg.ShareID, subCopy.LocalPath, syncsvc.DirectionFor("", subCopy.Mode))
+		pc.grantShare(sess, msg.ShareID, subCopy.LocalPath, subscriberDirection(pc.offeredPermission(msg.ShareID), subCopy.Mode))
 		return true
 
 	case protocol.AccessDenied, protocol.AccessRevoked:
 		pc.neuterShare(msg.ShareID)
 	}
 	return false
+}
+
+// subscriberDirection is the Direction a subscription syncs in: receive-only
+// when the subscriber chose that mode, and also whenever the offerer's share
+// is read-only, whatever mode was asked for (SPEC.md §5, §6). permission is
+// the offerer's permission for the share, "" if not (yet) known.
+func subscriberDirection(permission, mode string) syncsvc.Direction {
+	dir := syncsvc.DirectionFor("", mode)
+	if permission == config.PermissionReadOnly {
+		dir.OutboundBlocked = true
+	}
+	return dir
+}
+
+// refreshSubscriptionDirections re-derives the direction of every active
+// subscription to pc's shares after a ShareList, which is how the offerer
+// announces a permission change on a live connection. A subscription that
+// stops being receive-only starts sending its index again.
+func (n *Node) refreshSubscriptionDirections(ctx context.Context, pc *peerConn, sess *syncsvc.Session) {
+	n.cfgMu.RLock()
+	var subs []config.Subscription
+	for _, s := range n.cfg.Subscriptions {
+		if s.Peer == pc.peerKeyHex && !s.Paused {
+			subs = append(subs, s)
+		}
+	}
+	n.cfgMu.RUnlock()
+
+	for _, s := range subs {
+		old, known := sess.ShareDirection(s.ShareID)
+		dir := subscriberDirection(pc.offeredPermission(s.ShareID), s.Mode)
+		if !known || old == dir || pc.activeSession(s.ShareID) != sess {
+			continue
+		}
+		pc.reconfigureShare(s.ShareID, s.LocalPath, dir)
+		if old.OutboundBlocked && !dir.OutboundBlocked {
+			shareID := s.ShareID
+			n.goTracked(func() { n.startSyncing(ctx, sess, shareID) })
+		}
+	}
 }
 
 // finishAccessUpdate is AccessUpdate's asynchronous half: the initial
