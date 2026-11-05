@@ -4,13 +4,15 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/nickmarrone/syncat/internal/api/wire"
 )
 
 // describeHold shows the daemon's own words for a hold, and offers the
 // confirm command only when there is something to confirm.
 func TestDescribeHold(t *testing.T) {
 	since := time.Date(2026, 11, 5, 10, 0, 0, 0, time.UTC)
-	missing := describeHold(holdView{
+	missing := describeHold(wire.Hold{
 		ShareName: "docs", Reason: "root-unavailable", Since: since,
 		Problem: "the folder is missing or unreadable", Remedy: "restore it, or remove the share",
 	})
@@ -21,7 +23,7 @@ func TestDescribeHold(t *testing.T) {
 		t.Errorf("unconfirmable hold offers confirm-deletes: %q", missing)
 	}
 
-	bulk := describeHold(holdView{
+	bulk := describeHold(wire.Hold{
 		ShareName: "docs", PeerKey: "aaaa", PeerName: "laptop", Reason: "bulk-delete", Since: since, Confirmable: true,
 		Problem: "22 of 25 files would be deleted", Remedy: "fix the folder, or let the deletes through",
 	})

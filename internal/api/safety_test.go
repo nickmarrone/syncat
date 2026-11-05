@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nickmarrone/syncat/internal/api/wire"
 	"github.com/nickmarrone/syncat/internal/config"
 )
 
@@ -21,9 +22,9 @@ func TestSafetyPatchChangesOnlyGivenFields(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("PATCH safety: %d %s", w.Code, w.Body)
 	}
-	var got safetyDTO
+	var got wire.Safety
 	decodeJSONBody(t, w, &got)
-	want := safetyDTO{30, config.DefaultHoldDeleteMin, config.DefaultTrashRetentionDays, config.DefaultTrashMaxSize}
+	want := wire.Safety{HoldDeletePercent: 30, HoldDeleteMin: config.DefaultHoldDeleteMin, TrashRetentionDays: config.DefaultTrashRetentionDays, TrashMaxSize: config.DefaultTrashMaxSize}
 	if got != want {
 		t.Errorf("after first PATCH = %+v, want %+v", got, want)
 	}
@@ -71,7 +72,7 @@ func TestHoldConfirmEndpoint(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 
-	var st statusResponse
+	var st wire.Status
 	decodeJSONBody(t, doRequest(t, srv, http.MethodGet, "/api/status", testToken, nil), &st)
 	if len(st.Holds) != 1 || st.Holds[0].Deletes != 25 || !st.Holds[0].Confirmable {
 		t.Fatalf("status holds = %+v, want one confirmable hold of 25", st.Holds)

@@ -1,25 +1,19 @@
-// dto.go holds the JSON shapes of the REST API and the converters that
-// build them from internal/core's plain status structs. core deliberately
-// imports no encoding/json (see internal/core/status.go and SPEC.md §12),
-// so this file is where that marshaling lives.
+// dto.go holds the converters that build the REST API's JSON shapes
+// (package wire) from internal/core's plain status structs. core
+// deliberately imports no encoding/json (see internal/core/status.go and
+// SPEC.md §12), so this file is where that translation lives. Handlers
+// never marshal core types directly: every response is a wire type.
 package api
 
 import (
 	"strings"
-	"time"
 
+	"github.com/nickmarrone/syncat/internal/api/wire"
 	"github.com/nickmarrone/syncat/internal/config"
 	"github.com/nickmarrone/syncat/internal/core"
 	"github.com/nickmarrone/syncat/internal/version"
 )
 
-// Below is the JSON marshaling internal/core deliberately doesn't do
-// itself (SPEC.md §12): one DTO type per core.Status subtype, snake_case
-// tags matching the wire-protocol field naming SPEC.md §4 already uses
-// (share_id, approval_required, ...), plus the conversion functions that
-// build them from a core.Status. Handlers never marshal core types
-// directly, every response goes through one of these.
-//
 // Composite ids: config.Share/config.Peer are keyed by a single string
 // (share id / peer key hex) that maps directly to a REST {id}. A
 // subscription has no such field (SPEC.md §3 keys it by the pair
@@ -28,115 +22,14 @@ import (
 // halves are always plain hex, so splitting on the first ':' is
 // unambiguous.
 
-// --- DTOs: the JSON shapes every response goes through -----------------
-
-type statusResponse struct {
-	// Version is this daemon's build, as version.String() renders it. It
-	// is read straight from the binary rather than from core.Status
-	// because it describes the build, not the node's state, nothing in
-	// core has, or should have, an opinion about it.
-	Version string `json:"version"`
-
-	NodeName  string `json:"node_name"`
-	NodeToken string `json:"node_token"`
-	ShortID   string `json:"short_id"`
-	PeerKey   string `json:"peer_key"`
-
-	StartedAt     time.Time `json:"started_at"`
-	UptimeSeconds float64   `json:"uptime_seconds"`
-
-	Peers         []peerDTO         `json:"peers"`
-	Shares        []shareDTO        `json:"shares"`
-	RemoteShares  []remoteShareDTO  `json:"remote_shares"`
-	Subscriptions []subscriptionDTO `json:"subscriptions"`
-	Holds         []holdDTO         `json:"holds"`
-	Rejected      []rejectedConnDTO `json:"rejected_connections"`
-	Network       map[string]any    `json:"network"`
+func toApprovalDTO(a core.Approval) wire.Approval {
+	return wire.Approval{ID: a.ID, Kind: a.Kind, PeerKey: a.PeerKey, PeerName: a.PeerName, ShareID: a.ShareID, ShareName: a.ShareName, CreatedAt: a.CreatedAt}
 }
 
-type peerDTO struct {
-	ID              string         `json:"id"` // full Ed25519 public key, hex, same as PeerKey
-	PeerKey         string         `json:"peer_key"`
-	ShortID         string         `json:"short_id"`
-	Name            string         `json:"name"`
-	RemoteName      string         `json:"remote_name"`
-	Enabled         bool           `json:"enabled"`
-	State           string         `json:"state"`
-	LastError       string         `json:"last_error,omitempty"`
-	LastConnectedAt time.Time      `json:"last_connected_at,omitempty"`
-	ConnectedSince  time.Time      `json:"connected_since,omitempty"`
-	Network         map[string]any `json:"network"`
-}
+func toSafetyDTO(s config.Safety) wire.Safety { return wire.Safety(s) }
 
-type pendingPeerDTO struct {
-	ID        string    `json:"id"`
-	PeerKey   string    `json:"peer_key"`
-	ShortID   string    `json:"short_id"`
-	Name      string    `json:"name"`
-	FirstSeen time.Time `json:"first_seen"`
-}
-
-type approvalDTO struct {
-	ID        string    `json:"id"`
-	Kind      string    `json:"kind"`
-	PeerKey   string    `json:"peer_key"`
-	PeerName  string    `json:"peer_name,omitempty"`
-	ShareID   string    `json:"share_id,omitempty"`
-	ShareName string    `json:"share_name,omitempty"`
-	CreatedAt time.Time `json:"created_at,omitempty"`
-}
-
-func toApprovalDTO(a core.Approval) approvalDTO {
-	return approvalDTO{ID: a.ID, Kind: a.Kind, PeerKey: a.PeerKey, PeerName: a.PeerName, ShareID: a.ShareID, ShareName: a.ShareName, CreatedAt: a.CreatedAt}
-}
-
-type shareAccessDTO struct {
-	PeerKey  string `json:"peer_key"`
-	PeerName string `json:"peer_name,omitempty"`
-	Access   string `json:"access"`
-}
-
-type shareDTO struct {
-	ID               string           `json:"id"`
-	Name             string           `json:"name"`
-	Path             string           `json:"path"`
-	Permission       string           `json:"permission"`
-	ApprovalRequired bool             `json:"approval_required"`
-	Access           []shareAccessDTO `json:"access"`
-	Safety           safetyDTO        `json:"safety"`
-}
-
-// safetyDTO is a share's or subscription's hold and trash settings, with
-// defaults filled in.
-type safetyDTO struct {
-	HoldDeletePercent  int    `json:"hold_delete_percent"`
-	HoldDeleteMin      int    `json:"hold_delete_min"`
-	TrashRetentionDays int    `json:"trash_retention_days"`
-	TrashMaxSize       string `json:"trash_max_size"`
-}
-
-func toSafetyDTO(s config.Safety) safetyDTO { return safetyDTO(s) }
-
-// holdDTO is one share, or one peer's link to it, on hold. Problem and
-// Remedy are the words to show the user, so clients never interpret Reason
-// themselves.
-type holdDTO struct {
-	ShareID     string    `json:"share_id"`
-	ShareName   string    `json:"share_name,omitempty"`
-	PeerKey     string    `json:"peer_key,omitempty"` // empty for this node's own copy
-	PeerName    string    `json:"peer_name,omitempty"`
-	Reason      string    `json:"reason"`
-	Problem     string    `json:"problem"` // a clause: "the folder is missing or unreadable"
-	Remedy      string    `json:"remedy"`  // a clause: "restore it, or remove the share"
-	Deletes     int       `json:"deletes"`
-	Live        int       `json:"live"`
-	Since       time.Time `json:"since"`
-	Confirmed   bool      `json:"confirmed"`
-	Confirmable bool      `json:"confirmable"`
-}
-
-func toHoldDTO(h core.HoldStatus) holdDTO {
-	return holdDTO{
+func toHoldDTO(h core.HoldStatus) wire.Hold {
+	return wire.Hold{
 		ShareID: h.ShareID, ShareName: h.ShareName, PeerKey: h.PeerKey, PeerName: h.PeerName,
 		Reason: h.Reason, Problem: h.Problem(), Remedy: h.Remedy(),
 		Deletes: h.Deletes, Live: h.Live, Since: h.Since,
@@ -144,73 +37,8 @@ func toHoldDTO(h core.HoldStatus) holdDTO {
 	}
 }
 
-type remoteShareDTO struct {
-	PeerKey          string `json:"peer_key"`
-	PeerName         string `json:"peer_name,omitempty"`
-	ShareID          string `json:"share_id"`
-	Name             string `json:"name"`
-	Permission       string `json:"permission"`
-	ApprovalRequired bool   `json:"approval_required"`
-	Access           string `json:"access"`
-}
-
-type warningDTO struct {
-	ShareID  string    `json:"share_id"`
-	RelPath  string    `json:"rel_path"`
-	At       time.Time `json:"at"`
-	Reverted bool      `json:"reverted"`
-	Reason   string    `json:"reason"`
-}
-
-type subscriptionDTO struct {
-	ID        string       `json:"id"`
-	PeerKey   string       `json:"peer_key"`
-	PeerName  string       `json:"peer_name,omitempty"`
-	ShareID   string       `json:"share_id"`
-	ShareName string       `json:"share_name,omitempty"`
-	LocalPath string       `json:"local_path"`
-	Mode      string       `json:"mode"`
-	Paused    bool         `json:"paused"`
-	Access    string       `json:"access"`
-	Connected bool         `json:"connected"`
-	Warnings  []warningDTO `json:"warnings,omitempty"`
-	Safety    safetyDTO    `json:"safety"`
-}
-
-type rejectedConnDTO struct {
-	PeerKey  string    `json:"peer_key,omitempty"`
-	PeerName string    `json:"peer_name,omitempty"`
-	At       time.Time `json:"at"`
-	Reason   string    `json:"reason"`
-}
-
-// trashDTO is one share's trash: its events, newest first, and its size
-// against its limit.
-type trashDTO struct {
-	ShareID       string          `json:"share_id"`
-	Events        []trashEventDTO `json:"events"`
-	Size          int64           `json:"size"`
-	Limit         int64           `json:"limit"`
-	RetentionDays int             `json:"retention_days"`
-}
-
-type trashEventDTO struct {
-	ID     string         `json:"id"`
-	At     time.Time      `json:"at"`
-	Label  string         `json:"label"`
-	Source string         `json:"source,omitempty"`
-	Size   int64          `json:"size"`
-	Items  []trashItemDTO `json:"items"`
-}
-
-type trashItemDTO struct {
-	RelPath string `json:"rel_path"`
-	Kind    string `json:"kind,omitempty"`
-	Size    int64  `json:"size"`
-}
-
-func toPeerDTO(p core.PeerStatus) peerDTO {
-	return peerDTO{
+func toPeerDTO(p core.PeerStatus) wire.Peer {
+	return wire.Peer{
 		ID: p.PeerKey, PeerKey: p.PeerKey, ShortID: p.ShortID, Name: p.Name, RemoteName: p.RemoteName,
 		Enabled: p.Enabled, State: string(p.State), LastError: p.LastError,
 		LastConnectedAt: p.LastConnectedAt, ConnectedSince: p.ConnectedSince,
@@ -266,82 +94,82 @@ func toNetworkDTO(n core.NetworkStatus) map[string]any {
 	}
 }
 
-func toShareDTO(s core.ShareStatus) shareDTO {
-	access := make([]shareAccessDTO, 0, len(s.Access))
+func toShareDTO(s core.ShareStatus) wire.Share {
+	access := make([]wire.ShareAccess, 0, len(s.Access))
 	for _, a := range s.Access {
-		access = append(access, shareAccessDTO{PeerKey: a.PeerKey, PeerName: a.PeerName, Access: a.Access})
+		access = append(access, wire.ShareAccess{PeerKey: a.PeerKey, PeerName: a.PeerName, Access: a.Access})
 	}
-	return shareDTO{
+	return wire.Share{
 		ID: s.ShareID, Name: s.Name, Path: s.Path, Permission: s.Permission,
 		ApprovalRequired: s.ApprovalRequired, Access: access, Safety: toSafetyDTO(s.Safety),
 	}
 }
 
-func toRemoteShareDTO(r core.RemoteShareStatus) remoteShareDTO {
-	return remoteShareDTO{
+func toRemoteShareDTO(r core.RemoteShareStatus) wire.RemoteShare {
+	return wire.RemoteShare{
 		PeerKey: r.PeerKey, PeerName: r.PeerName, ShareID: r.ShareID, Name: r.Name,
 		Permission: r.Permission, ApprovalRequired: r.ApprovalRequired, Access: r.Access,
 	}
 }
 
-func toWarningDTO(w core.WarningStatus) warningDTO {
-	return warningDTO{ShareID: w.ShareID, RelPath: w.RelPath, At: w.At, Reverted: w.Reverted, Reason: w.Reason}
+func toWarningDTO(w core.WarningStatus) wire.Warning {
+	return wire.Warning{ShareID: w.ShareID, RelPath: w.RelPath, At: w.At, Reverted: w.Reverted, Reason: w.Reason}
 }
 
-func toSubscriptionDTO(s core.SubscriptionStatus) subscriptionDTO {
-	warnings := make([]warningDTO, 0, len(s.Warnings))
+func toSubscriptionDTO(s core.SubscriptionStatus) wire.Subscription {
+	warnings := make([]wire.Warning, 0, len(s.Warnings))
 	for _, w := range s.Warnings {
 		warnings = append(warnings, toWarningDTO(w))
 	}
-	return subscriptionDTO{
+	return wire.Subscription{
 		ID: subscriptionID(s.PeerKey, s.ShareID), PeerKey: s.PeerKey, PeerName: s.PeerName,
 		ShareID: s.ShareID, ShareName: s.ShareName, LocalPath: s.LocalPath, Mode: s.Mode, Paused: s.Paused,
 		Access: s.Access, Connected: s.Connected, Warnings: warnings, Safety: toSafetyDTO(s.Safety),
 	}
 }
 
-func toRejectedConnDTO(r core.RejectedConnection) rejectedConnDTO {
-	return rejectedConnDTO{PeerKey: r.PeerKey, PeerName: r.PeerName, At: r.At, Reason: r.Reason}
+func toRejectedConnDTO(r core.RejectedConnection) wire.RejectedConnection {
+	return wire.RejectedConnection{PeerKey: r.PeerKey, PeerName: r.PeerName, At: r.At, Reason: r.Reason}
 }
 
-func toTrashDTO(st core.TrashStatus) trashDTO {
-	out := trashDTO{ShareID: st.ShareID, Size: st.Size, Limit: st.Limit, RetentionDays: st.RetentionDays, Events: make([]trashEventDTO, 0, len(st.Events))}
+func toTrashDTO(st core.TrashStatus) wire.Trash {
+	out := wire.Trash{ShareID: st.ShareID, Size: st.Size, Limit: st.Limit, RetentionDays: st.RetentionDays, Events: make([]wire.TrashEvent, 0, len(st.Events))}
 	for _, ev := range st.Events {
-		items := make([]trashItemDTO, 0, len(ev.Items))
+		items := make([]wire.TrashItem, 0, len(ev.Items))
 		for _, it := range ev.Items {
-			items = append(items, trashItemDTO{RelPath: it.RelPath, Kind: it.Kind, Size: it.Size})
+			items = append(items, wire.TrashItem{RelPath: it.RelPath, Kind: it.Kind, Size: it.Size})
 		}
-		out.Events = append(out.Events, trashEventDTO{ID: ev.ID, At: ev.At, Label: ev.Label, Source: ev.Source, Size: ev.Size, Items: items})
+		out.Events = append(out.Events, wire.TrashEvent{ID: ev.ID, At: ev.At, Label: ev.Label, Source: ev.Source, Size: ev.Size, Items: items})
 	}
 	return out
 }
 
-func toStatusResponse(st core.Status) statusResponse {
-	peers := make([]peerDTO, 0, len(st.Peers))
+func toStatusResponse(st core.Status) wire.Status {
+	peers := make([]wire.Peer, 0, len(st.Peers))
 	for _, p := range st.Peers {
 		peers = append(peers, toPeerDTO(p))
 	}
-	shares := make([]shareDTO, 0, len(st.Shares))
+	shares := make([]wire.Share, 0, len(st.Shares))
 	for _, s := range st.Shares {
 		shares = append(shares, toShareDTO(s))
 	}
-	remoteShares := make([]remoteShareDTO, 0, len(st.RemoteShares))
+	remoteShares := make([]wire.RemoteShare, 0, len(st.RemoteShares))
 	for _, r := range st.RemoteShares {
 		remoteShares = append(remoteShares, toRemoteShareDTO(r))
 	}
-	subs := make([]subscriptionDTO, 0, len(st.Subscriptions))
+	subs := make([]wire.Subscription, 0, len(st.Subscriptions))
 	for _, s := range st.Subscriptions {
 		subs = append(subs, toSubscriptionDTO(s))
 	}
-	holds := make([]holdDTO, 0, len(st.Holds))
+	holds := make([]wire.Hold, 0, len(st.Holds))
 	for _, h := range st.Holds {
 		holds = append(holds, toHoldDTO(h))
 	}
-	rejected := make([]rejectedConnDTO, 0, len(st.RejectedConnections))
+	rejected := make([]wire.RejectedConnection, 0, len(st.RejectedConnections))
 	for _, r := range st.RejectedConnections {
 		rejected = append(rejected, toRejectedConnDTO(r))
 	}
-	return statusResponse{
+	return wire.Status{
 		Version:  version.String(),
 		NodeName: st.NodeName, NodeToken: st.NodeToken, ShortID: st.ShortID, PeerKey: st.PeerKey,
 		StartedAt: st.StartedAt, UptimeSeconds: st.UptimeSeconds,
@@ -351,7 +179,7 @@ func toStatusResponse(st core.Status) statusResponse {
 }
 
 // findPeerDTO returns the peer identified by id from st, or nil.
-func findPeerDTO(st core.Status, id string) *peerDTO {
+func findPeerDTO(st core.Status, id string) *wire.Peer {
 	for _, p := range st.Peers {
 		if p.PeerKey == id {
 			dto := toPeerDTO(p)
@@ -362,7 +190,7 @@ func findPeerDTO(st core.Status, id string) *peerDTO {
 }
 
 // findShareDTO returns the share identified by id from st, or nil.
-func findShareDTO(st core.Status, id string) *shareDTO {
+func findShareDTO(st core.Status, id string) *wire.Share {
 	for _, s := range st.Shares {
 		if s.ShareID == id {
 			dto := toShareDTO(s)
@@ -374,7 +202,7 @@ func findShareDTO(st core.Status, id string) *shareDTO {
 
 // findSubscriptionDTO returns the subscription identified by (peerKey,
 // shareID) from st, or nil.
-func findSubscriptionDTO(st core.Status, peerKey, shareID string) *subscriptionDTO {
+func findSubscriptionDTO(st core.Status, peerKey, shareID string) *wire.Subscription {
 	for _, s := range st.Subscriptions {
 		if s.PeerKey == peerKey && s.ShareID == shareID {
 			dto := toSubscriptionDTO(s)

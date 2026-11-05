@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"time"
 
+	"github.com/nickmarrone/syncat/internal/api/wire"
 	"github.com/nickmarrone/syncat/internal/config"
 )
 
@@ -46,7 +47,7 @@ func cmdPeerAdd(paths *config.Paths, args []string) error {
 	if err != nil {
 		return err
 	}
-	var peer peerView
+	var peer wire.Peer
 	body := map[string]string{"token": positional[0], "name": *name}
 	if err := c.do(context.Background(), http.MethodPost, "/api/peers", body, &peer); err != nil {
 		return err
@@ -66,10 +67,7 @@ func cmdPeerLs(paths *config.Paths, args []string) error {
 	if err != nil {
 		return err
 	}
-	var resp struct {
-		Peers        []peerView        `json:"peers"`
-		PendingPeers []pendingPeerView `json:"pending_peers"`
-	}
+	var resp wire.PeerList
 	if err := c.do(context.Background(), http.MethodGet, "/api/peers", nil, &resp); err != nil {
 		return err
 	}
@@ -149,9 +147,7 @@ func cmdRemote(paths *config.Paths, args []string) error {
 	if err != nil {
 		return err
 	}
-	var resp struct {
-		RemoteShares []remoteShareView `json:"remote_shares"`
-	}
+	var resp wire.RemoteShareList
 	if err := c.do(context.Background(), http.MethodGet, "/api/remote-shares", nil, &resp); err != nil {
 		return err
 	}
@@ -176,9 +172,7 @@ func cmdApprovals(paths *config.Paths, args []string) error {
 		return err
 	}
 	if len(args) == 0 {
-		var resp struct {
-			Approvals []approvalView `json:"approvals"`
-		}
+		var resp wire.ApprovalList
 		if err := c.do(context.Background(), http.MethodGet, "/api/approvals", nil, &resp); err != nil {
 			return err
 		}

@@ -35,6 +35,12 @@ holds that 0.5.0 left behind for removed shares are dropped (see below).
   rename in it had already been saved.
 - A config change's effects on the running node are worked out in one place,
   from the config before and after, rather than by each kind of change.
+- The CLI decodes the API's responses into the same Go types the daemon
+  encodes, in the new `internal/api/wire` package, instead of its own copies.
+  So `--json` output now shows each response in full: `syncat status --json`
+  gains `version`, each peer's `peer_key` and `network` counters, and each
+  share's and subscription's `safety` settings. Fields the API leaves out
+  when empty are now left out here too.
 
 ## Version
 

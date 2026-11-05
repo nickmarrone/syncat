@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/nickmarrone/syncat/internal/api"
+	"github.com/nickmarrone/syncat/internal/api/wire"
 	"github.com/nickmarrone/syncat/internal/config"
 )
 
@@ -61,17 +62,10 @@ func newAPIClient(paths *config.Paths) (*apiClient, error) {
 	}, nil
 }
 
-// apiErrorBody mirrors internal/api's stable error response shape.
-type apiErrorBody struct {
-	Error struct {
-		Code    string `json:"code"`
-		Message string `json:"message"`
-	} `json:"error"`
-}
-
 // do issues one API request. body, if non-nil, is JSON-encoded as the
 // request body; out, if non-nil, receives the JSON-decoded response body
-// on success. A transport-level failure (most commonly: nothing is
+// on success; responses decode into internal/api/wire's types, the same
+// ones the daemon encodes. A transport-level failure (most commonly: nothing is
 // listening on baseURL) is turned into a hint that the daemon may not be
 // running, rather than a raw "connection refused".
 func (c *apiClient) do(ctx context.Context, method, path string, body, out any) error {
@@ -105,7 +99,7 @@ func (c *apiClient) do(ctx context.Context, method, path string, body, out any) 
 	}
 
 	if resp.StatusCode >= 400 {
-		var eb apiErrorBody
+		var eb wire.Error
 		if json.Unmarshal(data, &eb) == nil && eb.Error.Message != "" {
 			return errors.New(eb.Error.Message)
 		}
@@ -125,156 +119,4 @@ func printJSON(v any) error {
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	return enc.Encode(v)
-}
-
-// These mirror internal/api's JSON response shapes just closely
-// enough for the CLI to render them, a separate, intentionally decoupled
-// copy, since the CLI is a thin HTTP client (SPEC.md §1) and must not
-// import internal/api or internal/core directly.
-
-type peerView struct {
-	ID              string    `json:"id"`
-	ShortID         string    `json:"short_id"`
-	Name            string    `json:"name"`
-	RemoteName      string    `json:"remote_name"`
-	Enabled         bool      `json:"enabled"`
-	State           string    `json:"state"`
-	LastError       string    `json:"last_error"`
-	LastConnectedAt time.Time `json:"last_connected_at"`
-	ConnectedSince  time.Time `json:"connected_since"`
-}
-
-type pendingPeerView struct {
-	ID        string    `json:"id"`
-	PeerKey   string    `json:"peer_key"`
-	ShortID   string    `json:"short_id"`
-	Name      string    `json:"name"`
-	FirstSeen time.Time `json:"first_seen"`
-}
-
-type approvalView struct {
-	ID        string    `json:"id"`
-	Kind      string    `json:"kind"`
-	PeerKey   string    `json:"peer_key"`
-	PeerName  string    `json:"peer_name"`
-	ShareID   string    `json:"share_id"`
-	ShareName string    `json:"share_name"`
-	CreatedAt time.Time `json:"created_at"`
-}
-
-type shareAccessView struct {
-	PeerKey  string `json:"peer_key"`
-	PeerName string `json:"peer_name"`
-	Access   string `json:"access"`
-}
-
-type shareView struct {
-	ID               string            `json:"id"`
-	Name             string            `json:"name"`
-	Path             string            `json:"path"`
-	Permission       string            `json:"permission"`
-	ApprovalRequired bool              `json:"approval_required"`
-	Access           []shareAccessView `json:"access"`
-}
-
-type remoteShareView struct {
-	PeerKey          string `json:"peer_key"`
-	PeerName         string `json:"peer_name"`
-	ShareID          string `json:"share_id"`
-	Name             string `json:"name"`
-	Permission       string `json:"permission"`
-	ApprovalRequired bool   `json:"approval_required"`
-	Access           string `json:"access"`
-}
-
-type warningView struct {
-	ShareID  string    `json:"share_id"`
-	RelPath  string    `json:"rel_path"`
-	At       time.Time `json:"at"`
-	Reverted bool      `json:"reverted"`
-	Reason   string    `json:"reason"`
-}
-
-type subscriptionView struct {
-	ID        string        `json:"id"`
-	PeerKey   string        `json:"peer_key"`
-	PeerName  string        `json:"peer_name"`
-	ShareID   string        `json:"share_id"`
-	ShareName string        `json:"share_name"`
-	LocalPath string        `json:"local_path"`
-	Mode      string        `json:"mode"`
-	Paused    bool          `json:"paused"`
-	Access    string        `json:"access"`
-	Connected bool          `json:"connected"`
-	Warnings  []warningView `json:"warnings"`
-}
-
-type safetyView struct {
-	HoldDeletePercent  int    `json:"hold_delete_percent"`
-	HoldDeleteMin      int    `json:"hold_delete_min"`
-	TrashRetentionDays int    `json:"trash_retention_days"`
-	TrashMaxSize       string `json:"trash_max_size"`
-}
-
-type holdView struct {
-	ShareID     string    `json:"share_id"`
-	ShareName   string    `json:"share_name"`
-	PeerKey     string    `json:"peer_key"`
-	PeerName    string    `json:"peer_name"`
-	Reason      string    `json:"reason"`
-	Problem     string    `json:"problem"`
-	Remedy      string    `json:"remedy"`
-	Deletes     int       `json:"deletes"`
-	Live        int       `json:"live"`
-	Since       time.Time `json:"since"`
-	Confirmed   bool      `json:"confirmed"`
-	Confirmable bool      `json:"confirmable"`
-}
-
-type rejectedView struct {
-	PeerKey  string    `json:"peer_key"`
-	PeerName string    `json:"peer_name"`
-	At       time.Time `json:"at"`
-	Reason   string    `json:"reason"`
-}
-
-type trashView struct {
-	ShareID       string           `json:"share_id"`
-	Events        []trashEventView `json:"events"`
-	Size          int64            `json:"size"`
-	Limit         int64            `json:"limit"`
-	RetentionDays int              `json:"retention_days"`
-}
-
-type trashEventView struct {
-	ID     string          `json:"id"`
-	At     time.Time       `json:"at"`
-	Label  string          `json:"label"`
-	Source string          `json:"source"`
-	Size   int64           `json:"size"`
-	Items  []trashItemView `json:"items"`
-}
-
-type trashItemView struct {
-	RelPath string `json:"rel_path"`
-	Kind    string `json:"kind"`
-	Size    int64  `json:"size"`
-}
-
-type statusView struct {
-	NodeName  string `json:"node_name"`
-	NodeToken string `json:"node_token"`
-	ShortID   string `json:"short_id"`
-	PeerKey   string `json:"peer_key"`
-
-	StartedAt     time.Time `json:"started_at"`
-	UptimeSeconds float64   `json:"uptime_seconds"`
-
-	Peers         []peerView         `json:"peers"`
-	Shares        []shareView        `json:"shares"`
-	RemoteShares  []remoteShareView  `json:"remote_shares"`
-	Subscriptions []subscriptionView `json:"subscriptions"`
-	Holds         []holdView         `json:"holds"`
-	Rejected      []rejectedView     `json:"rejected_connections"`
-	Network       map[string]any     `json:"network"`
 }

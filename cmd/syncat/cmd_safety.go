@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"time"
 
+	"github.com/nickmarrone/syncat/internal/api/wire"
 	"github.com/nickmarrone/syncat/internal/config"
 )
 
@@ -50,7 +51,7 @@ func cmdShareSafety(paths *config.Paths, args []string) error {
 	}
 	// PATCH with an empty body changes nothing and returns the current
 	// settings, so one request serves both the show and the change.
-	var s safetyView
+	var s wire.Safety
 	if err := c.do(context.Background(), http.MethodPatch, "/api/shares/"+url.PathEscape(ref)+"/safety", patch, &s); err != nil {
 		return err
 	}
@@ -78,7 +79,7 @@ func cmdShareConfirmDeletes(paths *config.Paths, args []string) error {
 	if err != nil {
 		return err
 	}
-	var h holdView
+	var h wire.Hold
 	if err := c.do(context.Background(), http.MethodPost, "/api/shares/"+url.PathEscape(positional[0])+"/holds/confirm", map[string]string{"peer": *peer}, &h); err != nil {
 		return err
 	}
@@ -86,7 +87,7 @@ func cmdShareConfirmDeletes(paths *config.Paths, args []string) error {
 	return nil
 }
 
-func shareLabel(h holdView) string {
+func shareLabel(h wire.Hold) string {
 	if h.ShareName != "" {
 		return h.ShareName
 	}
@@ -95,7 +96,7 @@ func shareLabel(h holdView) string {
 
 // describeHold renders one hold as a line of `syncat status`, with what
 // to do about it.
-func describeHold(h holdView) string {
+func describeHold(h wire.Hold) string {
 	held := "on hold"
 	confirm := fmt.Sprintf("syncat share confirm-deletes %s", shareLabel(h))
 	if h.PeerKey != "" {

@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nickmarrone/syncat/internal/api/wire"
 	"github.com/nickmarrone/syncat/internal/config"
 	"github.com/nickmarrone/syncat/internal/core"
 	"github.com/nickmarrone/syncat/internal/protocol"
@@ -127,7 +128,7 @@ func TestAuthNoToken(t *testing.T) {
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("no token: status = %d, want 401; body: %s", w.Code, w.Body.String())
 	}
-	var eb errorBody
+	var eb wire.Error
 	decodeJSONBody(t, w, &eb)
 	if eb.Error.Code != "unauthorized" {
 		t.Errorf("error code = %q, want unauthorized", eb.Error.Code)
@@ -383,7 +384,7 @@ func TestStatusMarshals(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
 	}
-	var body statusResponse
+	var body wire.Status
 	decodeJSONBody(t, w, &body)
 	if body.NodeName != "test-node" {
 		t.Errorf("node_name = %q, want test-node", body.NodeName)
@@ -417,7 +418,7 @@ func TestPeersAddListDelete(t *testing.T) {
 	if w.Code != http.StatusCreated {
 		t.Fatalf("add peer: status = %d, want 201; body: %s", w.Code, w.Body.String())
 	}
-	var peer peerDTO
+	var peer wire.Peer
 	decodeJSONBody(t, w, &peer)
 	if peer.Name != "bob" || peer.ID == "" {
 		t.Fatalf("unexpected peer body: %+v", peer)
@@ -428,7 +429,7 @@ func TestPeersAddListDelete(t *testing.T) {
 		t.Fatalf("list peers: status = %d, want 200", w.Code)
 	}
 	var listResp struct {
-		Peers []peerDTO `json:"peers"`
+		Peers []wire.Peer `json:"peers"`
 	}
 	decodeJSONBody(t, w, &listResp)
 	if len(listResp.Peers) != 1 || listResp.Peers[0].ID != peer.ID {
@@ -477,7 +478,7 @@ func TestApprovalsEmpty(t *testing.T) {
 		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
 	}
 	var resp struct {
-		Approvals []approvalDTO `json:"approvals"`
+		Approvals []wire.Approval `json:"approvals"`
 	}
 	decodeJSONBody(t, w, &resp)
 	if len(resp.Approvals) != 0 {
@@ -502,7 +503,7 @@ func TestShareApprovalListAndDecision(t *testing.T) {
 
 	w := doRequest(t, srv, http.MethodGet, "/api/approvals", testToken, nil)
 	var resp struct {
-		Approvals []approvalDTO `json:"approvals"`
+		Approvals []wire.Approval `json:"approvals"`
 	}
 	decodeJSONBody(t, w, &resp)
 	if len(resp.Approvals) != 1 || resp.Approvals[0].Kind != core.ApprovalShare || resp.Approvals[0].ShareID != shareID || resp.Approvals[0].PeerKey != peerID {
@@ -530,7 +531,7 @@ func TestSharesRoundTrip(t *testing.T) {
 	if w.Code != http.StatusCreated {
 		t.Fatalf("add share: status = %d, want 201; body: %s", w.Code, w.Body.String())
 	}
-	var share shareDTO
+	var share wire.Share
 	decodeJSONBody(t, w, &share)
 	if share.Name != "docs" || share.Path != shareDir || share.Permission != "read-only" {
 		t.Fatalf("unexpected share body: %+v", share)
@@ -542,7 +543,7 @@ func TestSharesRoundTrip(t *testing.T) {
 		t.Fatalf("list shares: status = %d, want 200", w.Code)
 	}
 	var listResp struct {
-		Shares []shareDTO `json:"shares"`
+		Shares []wire.Share `json:"shares"`
 	}
 	decodeJSONBody(t, w, &listResp)
 	if len(listResp.Shares) != 1 || listResp.Shares[0].ID != share.ID {
@@ -556,7 +557,7 @@ func TestSharesRoundTrip(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("patch share: status = %d, want 200; body: %s", w.Code, w.Body.String())
 	}
-	var patched shareDTO
+	var patched wire.Share
 	decodeJSONBody(t, w, &patched)
 	if patched.Name != "documents" || patched.Permission != "read-write" || !patched.ApprovalRequired {
 		t.Fatalf("unexpected patched share: %+v", patched)
@@ -614,7 +615,7 @@ func TestSharesPatchByNameAndPrefix(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("patch by name: status = %d, want 200; body: %s", w.Code, w.Body.String())
 	}
-	var patched shareDTO
+	var patched wire.Share
 	decodeJSONBody(t, w, &patched)
 	if patched.ID != id || patched.Name != "documents" {
 		t.Fatalf("patched share = %+v, want %s renamed to documents", patched, id)
@@ -647,7 +648,7 @@ func TestRemoteSharesEmpty(t *testing.T) {
 		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
 	}
 	var resp struct {
-		RemoteShares []remoteShareDTO `json:"remote_shares"`
+		RemoteShares []wire.RemoteShare `json:"remote_shares"`
 	}
 	decodeJSONBody(t, w, &resp)
 	if len(resp.RemoteShares) != 0 {
@@ -669,7 +670,7 @@ func TestSubscriptionsAddPatchDelete(t *testing.T) {
 	if w.Code != http.StatusCreated {
 		t.Fatalf("add peer: status = %d, want 201; body: %s", w.Code, w.Body.String())
 	}
-	var peer peerDTO
+	var peer wire.Peer
 	decodeJSONBody(t, w, &peer)
 
 	w = doRequest(t, srv, http.MethodPost, "/api/subscriptions", testToken, map[string]any{
@@ -678,7 +679,7 @@ func TestSubscriptionsAddPatchDelete(t *testing.T) {
 	if w.Code != http.StatusCreated {
 		t.Fatalf("add subscription: status = %d, want 201; body: %s", w.Code, w.Body.String())
 	}
-	var sub subscriptionDTO
+	var sub wire.Subscription
 	decodeJSONBody(t, w, &sub)
 	if sub.ID != peer.ID+":bb22" || sub.Mode != "mirror" {
 		t.Fatalf("unexpected subscription body: %+v", sub)
@@ -689,7 +690,7 @@ func TestSubscriptionsAddPatchDelete(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("patch subscription: status = %d, want 200; body: %s", w.Code, w.Body.String())
 	}
-	var patched subscriptionDTO
+	var patched wire.Subscription
 	decodeJSONBody(t, w, &patched)
 	if !patched.Paused {
 		t.Fatalf("subscription not paused: %+v", patched)
@@ -730,7 +731,7 @@ func TestSubscriptionsPatchByName(t *testing.T) {
 	if w.Code != http.StatusCreated {
 		t.Fatalf("add peer: status = %d, want 201; body: %s", w.Code, w.Body.String())
 	}
-	var peer peerDTO
+	var peer wire.Peer
 	decodeJSONBody(t, w, &peer)
 	w = doRequest(t, srv, http.MethodPost, "/api/subscriptions", testToken, map[string]any{
 		"peer": peer.ID, "share_id": "bb22cc33", "local_path": filepath.Join(t.TempDir(), "sub"), "mode": "mirror",
@@ -743,7 +744,7 @@ func TestSubscriptionsPatchByName(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("patch by peer name and share prefix: status = %d, want 200; body: %s", w.Code, w.Body.String())
 	}
-	var patched subscriptionDTO
+	var patched wire.Subscription
 	decodeJSONBody(t, w, &patched)
 	if patched.ID != peer.ID+":bb22cc33" || !patched.Paused {
 		t.Fatalf("patched subscription = %+v, want %s:bb22cc33 paused", patched, peer.ID)
@@ -778,7 +779,7 @@ func TestTrashListEmpty(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
 	}
-	var resp trashDTO
+	var resp wire.Trash
 	decodeJSONBody(t, w, &resp)
 	if len(resp.Events) != 0 || resp.RetentionDays != config.DefaultTrashRetentionDays {
 		t.Fatalf("trash = %+v, want no events and the default retention", resp)
@@ -824,7 +825,7 @@ func TestTrashListAndUndoRoundTrip(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("list: status = %d, want 200; body: %s", w.Code, w.Body.String())
 	}
-	var resp trashDTO
+	var resp wire.Trash
 	decodeJSONBody(t, w, &resp)
 	if len(resp.Events) != 1 || resp.Events[0].Label != "from laptop" || len(resp.Events[0].Items) != 1 ||
 		resp.Events[0].Items[0].RelPath != "foo.txt" || resp.Events[0].Items[0].Kind != "deleted" || resp.Size != 5 {
@@ -883,7 +884,7 @@ func TestSubscriptionsList(t *testing.T) {
 		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
 	}
 	var empty struct {
-		Subscriptions []subscriptionDTO `json:"subscriptions"`
+		Subscriptions []wire.Subscription `json:"subscriptions"`
 	}
 	decodeJSONBody(t, w, &empty)
 	if len(empty.Subscriptions) != 0 {
@@ -894,7 +895,7 @@ func TestSubscriptionsList(t *testing.T) {
 	if w.Code != http.StatusCreated {
 		t.Fatalf("add peer: status = %d, want 201; body: %s", w.Code, w.Body.String())
 	}
-	var peer peerDTO
+	var peer wire.Peer
 	decodeJSONBody(t, w, &peer)
 
 	localDir := filepath.Join(t.TempDir(), "sub")
@@ -907,7 +908,7 @@ func TestSubscriptionsList(t *testing.T) {
 
 	w = doRequest(t, srv, http.MethodGet, "/api/subscriptions", testToken, nil)
 	var resp struct {
-		Subscriptions []subscriptionDTO `json:"subscriptions"`
+		Subscriptions []wire.Subscription `json:"subscriptions"`
 	}
 	decodeJSONBody(t, w, &resp)
 	if len(resp.Subscriptions) != 1 {
