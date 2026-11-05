@@ -1,9 +1,13 @@
 package sync
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
+	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 )
 
 // This file is the security boundary for every relpath a peer sends us over
@@ -146,5 +150,45 @@ func JoinSharePath(shareRoot, relpath string) (string, error) {
 	if full != cleanRoot && !strings.HasPrefix(full, cleanRoot+string(filepath.Separator)) {
 		return "", fmt.Errorf("sync: relpath %q escapes share root %q", relpath, shareRoot)
 	}
+	if err := checkNoSymlinkParents(cleanRoot, elems); err != nil {
+		return "", fmt.Errorf("sync: relpath %q: %w", relpath, err)
+	}
 	return full, nil
+}
+
+// ErrSymlinkInPath is returned by JoinSharePath when a directory between
+// the share root and the named entry is a symlink.
+var ErrSymlinkInPath = errors.New("a parent directory is a symlink")
+
+// checkNoSymlinkParents refuses a path whose existing parent directories
+// (below root, not counting the last element) include a symlink. Symlinks
+// are never synced (SPEC.md §5), so a symlinked directory inside a share
+// is the user's own, and following it would let a peer's write or delete
+// land wherever it points, outside the share. The last element may itself
+// be a symlink: every caller Lstats, renames over, or removes it, none of
+// which follow it.
+//
+// The walk stops at the first missing component, since nothing below a
+// missing directory can be a symlink yet. The apply path also writes
+// through an os.Root (see apply.go), so a symlink swapped in after this
+// check still cannot carry a write out of the share.
+func checkNoSymlinkParents(root string, elems []string) error {
+	cur := root
+	for _, elem := range elems[:len(elems)-1] {
+		cur = filepath.Join(cur, elem)
+		fi, err := os.Lstat(cur)
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+				return nil
+			}
+			return fmt.Errorf("check %s: %w", cur, err)
+		}
+		if fi.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("%w: %s", ErrSymlinkInPath, cur)
+		}
+		if !fi.IsDir() {
+			return nil
+		}
+	}
+	return nil
 }

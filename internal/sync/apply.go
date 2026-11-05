@@ -8,9 +8,13 @@ package sync
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -202,8 +206,14 @@ func (s *Session) applyDelete(ctx context.Context, cfg ShareConfig, relpath stri
 	if err != nil {
 		return false, fmt.Errorf("sync: delete %s: %w", relpath, err)
 	}
+	root, err := os.OpenRoot(cfg.Root)
+	if err != nil {
+		return false, fmt.Errorf("sync: delete %s: open share root: %w", relpath, err)
+	}
+	defer root.Close()
+	rel := filepath.FromSlash(relpath)
 
-	fi, statErr := os.Lstat(absPath)
+	fi, statErr := root.Lstat(rel)
 	if statErr != nil {
 		if os.IsNotExist(statErr) {
 			return true, nil
@@ -213,9 +223,9 @@ func (s *Session) applyDelete(ctx context.Context, cfg ShareConfig, relpath stri
 
 	if fi.IsDir() {
 		// Directory deletes apply only when empty after children sync
-		// (SPEC.md §5); os.Remove itself refuses a non-empty directory,
+		// (SPEC.md §5); Remove itself refuses a non-empty directory,
 		// which is exactly the check we want.
-		if err := os.Remove(absPath); err != nil {
+		if err := root.Remove(rel); err != nil {
 			s.logf("keeping non-empty directory %s/%s (remote deleted it): %v", cfg.ShareID, relpath, err)
 			return false, nil
 		}
@@ -232,7 +242,7 @@ func (s *Session) applyDelete(ctx context.Context, cfg ShareConfig, relpath stri
 		return false, fmt.Errorf("sync: delete %s: trash: %w", relpath, err)
 	}
 
-	if err := os.Remove(absPath); err != nil && !os.IsNotExist(err) {
+	if err := root.Remove(rel); err != nil && !os.IsNotExist(err) {
 		return false, fmt.Errorf("sync: delete %s: %w", relpath, err)
 	}
 	return true, nil
@@ -298,18 +308,22 @@ func (s *Session) applyConflictCopy(ctx context.Context, cfg ShareConfig, a Acti
 		// needed, the bytes are already known-good local content, and (no
 		// network involved) it either fully succeeds or leaves nothing
 		// changed.
-		srcAbs, err := JoinSharePath(cfg.Root, a.RelPath)
-		if err != nil {
+		if _, err := JoinSharePath(cfg.Root, a.RelPath); err != nil {
 			return nil, fmt.Errorf("sync: conflict copy %s: %w", a.RelPath, err)
 		}
-		dstAbs, err := JoinSharePath(cfg.Root, a.ConflictRelPath)
-		if err != nil {
+		if _, err := JoinSharePath(cfg.Root, a.ConflictRelPath); err != nil {
 			return nil, fmt.Errorf("sync: conflict copy %s: %w", a.RelPath, err)
 		}
-		if err := os.MkdirAll(filepath.Dir(dstAbs), 0o700); err != nil {
+		root, err := os.OpenRoot(cfg.Root)
+		if err != nil {
+			return nil, fmt.Errorf("sync: conflict copy %s: open share root: %w", a.RelPath, err)
+		}
+		defer root.Close()
+		srcRel, dstRel := filepath.FromSlash(a.RelPath), filepath.FromSlash(a.ConflictRelPath)
+		if err := root.MkdirAll(filepath.Dir(dstRel), 0o700); err != nil {
 			return nil, fmt.Errorf("sync: conflict copy %s: mkdir: %w", a.RelPath, err)
 		}
-		if err := os.Rename(srcAbs, dstAbs); err != nil {
+		if err := root.Rename(srcRel, dstRel); err != nil {
 			return nil, fmt.Errorf("sync: conflict copy %s: preserve loser at %s: %w", a.RelPath, a.ConflictRelPath, err)
 		}
 
@@ -357,26 +371,39 @@ func (s *Session) applyConflictCopy(ctx context.Context, cfg ShareConfig, a Acti
 // path, including a panic, via a single deferred cleanup keyed off a
 // "committed" flag.
 func (s *Session) pullAndInstall(ctx context.Context, shareID, root, wireRelPath, destRelPath string, info protocol.FileInfo, wireVersion protocol.VersionVector) error {
+	if info.Type == protocol.FileTypeSymlink {
+		// Reconcile already drops these; refuse here too so no future
+		// caller can install one (SPEC.md §5: symlinks are not synced).
+		return fmt.Errorf("sync: install %s: symlinks are not synced", destRelPath)
+	}
 	destAbs, err := JoinSharePath(root, destRelPath)
 	if err != nil {
 		return fmt.Errorf("sync: install %s: %w", destRelPath, err)
 	}
-	if err := os.MkdirAll(filepath.Dir(destAbs), 0o700); err != nil {
+	// Every write below goes through shareRoot, which refuses to resolve
+	// a path out of the share even if a symlink appears after
+	// JoinSharePath checked the parents.
+	shareRoot, err := os.OpenRoot(root)
+	if err != nil {
+		return fmt.Errorf("sync: install %s: open share root: %w", destRelPath, err)
+	}
+	defer shareRoot.Close()
+	destRel := filepath.FromSlash(destRelPath)
+	if err := shareRoot.MkdirAll(filepath.Dir(destRel), 0o700); err != nil {
 		return fmt.Errorf("sync: install %s: mkdir: %w", destRelPath, err)
 	}
 
 	if info.Type == protocol.FileTypeDir {
-		if err := os.MkdirAll(destAbs, 0o700); err != nil {
+		if err := shareRoot.MkdirAll(destRel, 0o700); err != nil {
 			return fmt.Errorf("sync: install dir %s: %w", destRelPath, err)
 		}
 		return nil
 	}
 
-	tmp, err := os.CreateTemp(filepath.Dir(destAbs), TempFilePrefix+"*")
+	tmp, tmpRel, err := createTempIn(shareRoot, filepath.Dir(destRel))
 	if err != nil {
 		return fmt.Errorf("sync: install %s: create temp file: %w", destRelPath, err)
 	}
-	tmpPath := tmp.Name()
 	committed := false
 	defer func() {
 		// Runs on every return path, including a panic unwinding through
@@ -384,7 +411,7 @@ func (s *Session) pullAndInstall(ctx context.Context, shareID, root, wireRelPath
 		// apply.
 		_ = tmp.Close()
 		if !committed {
-			_ = os.Remove(tmpPath)
+			_ = shareRoot.Remove(tmpRel)
 		}
 	}()
 
@@ -402,60 +429,53 @@ func (s *Session) pullAndInstall(ctx context.Context, shareID, root, wireRelPath
 		return fmt.Errorf("sync: install %s: sha256 mismatch: got %x, peer advertised %x", destRelPath, sum, info.SHA256)
 	}
 
-	if info.Type == protocol.FileTypeSymlink {
-		if err := s.installSymlink(ctx, shareID, destRelPath, destAbs, tmpPath); err != nil {
-			return err
-		}
-		committed = true
-		return nil
-	}
-
-	if err := s.finalizeFile(ctx, shareID, destRelPath, destAbs, tmp, info); err != nil {
+	if err := s.finalizeFile(ctx, shareRoot, destRelPath, destAbs, destRel, tmp, tmpRel, info); err != nil {
 		return err
 	}
 	committed = true
 	return nil
 }
 
-// installSymlink completes pullAndInstall for a symlink: the pulled bytes
-// in tmpPath are the link's target string (see serveSymlink), so read
-// them, clear whatever currently occupies destAbs via the trash hook, and
-// create the link. tmpPath itself is left for pullAndInstall's deferred
-// cleanup to remove.
-func (s *Session) installSymlink(ctx context.Context, shareID, destRelPath, destAbs, tmpPath string) error {
-	target, err := os.ReadFile(tmpPath)
-	if err != nil {
-		return fmt.Errorf("sync: install symlink %s: read target: %w", destRelPath, err)
+// createTempIn creates a new, empty TempFilePrefix file in dir (relative
+// to root), the os.Root equivalent of os.CreateTemp, and returns it with
+// its root-relative name.
+func createTempIn(root *os.Root, dir string) (*os.File, string, error) {
+	var buf [8]byte
+	for range 100 {
+		if _, err := rand.Read(buf[:]); err != nil {
+			return nil, "", err
+		}
+		name := filepath.Join(dir, TempFilePrefix+hex.EncodeToString(buf[:]))
+		f, err := root.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+		if err == nil {
+			return f, name, nil
+		}
+		if !errors.Is(err, fs.ErrExist) {
+			return nil, "", err
+		}
 	}
-	if err := s.replaceWithTrashHook(ctx, shareID, destRelPath, destAbs); err != nil {
-		return err
-	}
-	if err := os.Symlink(string(target), destAbs); err != nil {
-		return fmt.Errorf("sync: install symlink %s: %w", destRelPath, err)
-	}
-	return nil
+	return nil, "", errors.New("could not pick an unused temp file name")
 }
 
 // finalizeFile completes pullAndInstall for a regular file whose verified
-// content is in tmp: fsync and close it, set its mode and mtime from info,
-// trash whatever currently occupies destAbs, and rename it into place
-// (steps 3 and 4 of pullAndInstall's sequence). On success tmp's path no
-// longer exists, it *is* destAbs now.
-func (s *Session) finalizeFile(ctx context.Context, shareID, destRelPath, destAbs string, tmp *os.File, info protocol.FileInfo) error {
-	tmpPath := tmp.Name()
+// content is in tmp (at tmpRel under root): fsync and close it, set its
+// mode and mtime from info, trash whatever currently occupies destAbs, and
+// rename it into place at destRel (steps 3 and 4 of pullAndInstall's
+// sequence). On success tmpRel no longer exists, it *is* destRel now.
+func (s *Session) finalizeFile(ctx context.Context, root *os.Root, destRelPath, destAbs, destRel string, tmp *os.File, tmpRel string, info protocol.FileInfo) error {
 	if err := tmp.Sync(); err != nil {
 		return fmt.Errorf("sync: install %s: fsync: %w", destRelPath, err)
+	}
+	if info.Mode != 0 {
+		if err := tmp.Chmod(os.FileMode(info.Mode)); err != nil {
+			return fmt.Errorf("sync: install %s: chmod: %w", destRelPath, err)
+		}
 	}
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("sync: install %s: close: %w", destRelPath, err)
 	}
-	if info.Mode != 0 {
-		if err := os.Chmod(tmpPath, os.FileMode(info.Mode)); err != nil {
-			return fmt.Errorf("sync: install %s: chmod: %w", destRelPath, err)
-		}
-	}
 	mtime := time.Unix(0, info.MTimeNS)
-	if err := os.Chtimes(tmpPath, mtime, mtime); err != nil {
+	if err := root.Chtimes(tmpRel, mtime, mtime); err != nil {
 		return fmt.Errorf("sync: install %s: chtimes: %w", destRelPath, err)
 	}
 
@@ -471,25 +491,8 @@ func (s *Session) finalizeFile(ctx context.Context, shareID, destRelPath, destAb
 		return fmt.Errorf("sync: install %s: trash: %w", destRelPath, err)
 	}
 
-	if err := os.Rename(tmpPath, destAbs); err != nil {
+	if err := root.Rename(tmpRel, destRel); err != nil {
 		return fmt.Errorf("sync: install %s: rename into place: %w", destRelPath, err)
-	}
-	return nil
-}
-
-// replaceWithTrashHook removes an existing destAbs (if any) via the same
-// trash hook as the regular file path, ahead of an os.Symlink call, which
-// unlike os.Rename cannot itself overwrite an existing path.
-func (s *Session) replaceWithTrashHook(ctx context.Context, shareID, relpath, destAbs string) error {
-	if _, err := os.Lstat(destAbs); err == nil {
-		if err := s.trashHook(ctx, relpath, destAbs, TrashOverwritten); err != nil {
-			return fmt.Errorf("sync: install symlink %s: trash: %w", relpath, err)
-		}
-		if err := os.Remove(destAbs); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("sync: install symlink %s: remove existing: %w", relpath, err)
-		}
-	} else if !os.IsNotExist(err) {
-		return fmt.Errorf("sync: install symlink %s: stat existing: %w", relpath, err)
 	}
 	return nil
 }
@@ -497,9 +500,8 @@ func (s *Session) replaceWithTrashHook(ctx context.Context, shareID, relpath, de
 // trashHook is the single, obvious slot "move old content to the trash
 // before overwrite/delete" plugs into. It's called immediately before every
 // destructive operation that discards existing destination content on a
-// peer's behalf: applyDelete's os.Remove, and pullAndInstall's overwrite
-// (both the rename-into-place path and the symlink-replace path via
-// replaceWithTrashHook). destAbs may or may not currently exist;
+// peer's behalf: applyDelete's remove, and finalizeFile's rename into
+// place. destAbs may or may not currently exist;
 // TrashEvent.Put no-ops when it doesn't. kind is TrashDeleted or
 // TrashOverwritten.
 //

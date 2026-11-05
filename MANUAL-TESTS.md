@@ -240,6 +240,10 @@ machine — verify these across two real machines.
 - [ ] Filenames with spaces, unicode, and emoji.
 - [ ] A symlink in a shared directory is skipped with a warning, and does
       not break the scan. (Deferred feature, but must degrade cleanly.)
+- [ ] On the subscriber, replace a synced subdirectory with a symlink to a
+      directory outside the share, then add a file there on the offerer.
+      Nothing appears outside the share, and the symlink is left alone.
+      (In-process: `TestIntegration_PullDoesNotWriteThroughSymlinkedDir`.)
 
 ## 6b. `.syncatignore`
 
