@@ -181,14 +181,16 @@ type patchShareRequest struct {
 }
 
 func (s *Server) handleSharesPatch(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
 	var req patchShareRequest
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-
-	if findShareDTO(s.node.Status(), id) == nil {
-		writeError(w, http.StatusNotFound, "not_found", "share "+id+" is not configured")
+	// {id} is a share ref (an id, a name, or a unique id prefix), the same
+	// as for DELETE. It is resolved once, up front, so every change below
+	// and the share reported back name the same share.
+	id, err := s.node.ResolveLocalShare(r.PathValue("id"))
+	if err != nil {
+		writeMutationError(w, err)
 		return
 	}
 
@@ -305,6 +307,9 @@ func (s *Server) handleSubscriptionsPatch(w http.ResponseWriter, r *http.Request
 	if !decodeJSON(w, r, &req) {
 		return
 	}
+	// Both halves are refs, the same as for DELETE, so a lookup by exact
+	// id has to wait until they are resolved.
+	peerKey, shareID = s.node.ResolveSubscription(peerKey, shareID)
 	if findSubscriptionDTO(s.node.Status(), peerKey, shareID) == nil {
 		writeError(w, http.StatusNotFound, "not_found", "subscription "+r.PathValue("id")+" is not configured")
 		return

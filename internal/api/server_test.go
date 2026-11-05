@@ -601,6 +601,35 @@ func TestSharesPatchUnknownID(t *testing.T) {
 	}
 }
 
+// PATCH takes the same share refs as DELETE: `syncat share set docs
+// --name x` sends the name, not the id.
+func TestSharesPatchByNameAndPrefix(t *testing.T) {
+	srv, node, _ := newTestServer(t)
+	id, err := node.AddShare(t.TempDir(), "docs", config.PermissionReadWrite, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w := doRequest(t, srv, http.MethodPatch, "/api/shares/docs", testToken, map[string]any{"name": "documents"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("patch by name: status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+	var patched shareDTO
+	decodeJSONBody(t, w, &patched)
+	if patched.ID != id || patched.Name != "documents" {
+		t.Fatalf("patched share = %+v, want %s renamed to documents", patched, id)
+	}
+
+	w = doRequest(t, srv, http.MethodPatch, "/api/shares/"+id[:6], testToken, map[string]any{"permission": "ro"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("patch by id prefix: status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+	decodeJSONBody(t, w, &patched)
+	if patched.ID != id || patched.Permission != "read-only" {
+		t.Fatalf("patched share = %+v, want %s made read-only", patched, id)
+	}
+}
+
 func TestSharesDeleteUnknownID(t *testing.T) {
 	srv, _, _ := newTestServer(t)
 	w := doRequest(t, srv, http.MethodDelete, "/api/shares/doesnotexist", testToken, nil)
@@ -690,6 +719,34 @@ func TestSubscriptionsAddBadMode(t *testing.T) {
 	})
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400; body: %s", w.Code, w.Body.String())
+	}
+}
+
+// `syncat subscription pause PEER SHARE` sends whatever the user typed,
+// so PATCH has to resolve names and prefixes the way DELETE does.
+func TestSubscriptionsPatchByName(t *testing.T) {
+	srv, _, _ := newTestServer(t)
+	w := doRequest(t, srv, http.MethodPost, "/api/peers", testToken, map[string]string{"token": fakePeerToken(t, "bob"), "name": "bob"})
+	if w.Code != http.StatusCreated {
+		t.Fatalf("add peer: status = %d, want 201; body: %s", w.Code, w.Body.String())
+	}
+	var peer peerDTO
+	decodeJSONBody(t, w, &peer)
+	w = doRequest(t, srv, http.MethodPost, "/api/subscriptions", testToken, map[string]any{
+		"peer": peer.ID, "share_id": "bb22cc33", "local_path": filepath.Join(t.TempDir(), "sub"), "mode": "mirror",
+	})
+	if w.Code != http.StatusCreated {
+		t.Fatalf("add subscription: status = %d, want 201; body: %s", w.Code, w.Body.String())
+	}
+
+	w = doRequest(t, srv, http.MethodPatch, "/api/subscriptions/bob:bb22", testToken, map[string]any{"paused": true})
+	if w.Code != http.StatusOK {
+		t.Fatalf("patch by peer name and share prefix: status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+	var patched subscriptionDTO
+	decodeJSONBody(t, w, &patched)
+	if patched.ID != peer.ID+":bb22cc33" || !patched.Paused {
+		t.Fatalf("patched subscription = %+v, want %s:bb22cc33 paused", patched, peer.ID)
 	}
 }
 
