@@ -1,8 +1,7 @@
 # The required gate: formatting, vet, the whole Go suite under the race
 # detector, and the cgo-free build that ships (SPEC.md §12). -short skips
-# every test that reaches Tailscale's public DERP relays. CI must not load
-# those shared servers, so those tests and scripts/run-net-tests.sh run
-# only by hand.
+# every test that reaches Tailscale's public DERP relays; network.yml runs
+# those, kept light.
 name: ci
 
 on:

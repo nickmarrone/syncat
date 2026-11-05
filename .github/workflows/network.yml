@@ -1,0 +1,55 @@
+# Tests that need the real network: the Go tests skipped under -short, then
+# the built binary driven by scripts/e2e.sh and the fast tier of
+# scripts/run-net-tests.sh. tailcat needs no tailnet or credentials, so
+# these run on a stock runner.
+#
+# They go through Tailscale's free public DERP relays, so keep the load
+# light: small files only, once per PR change (not again on merge, not on a
+# schedule, not for docs-only changes). The soak tier is left out on
+# purpose. Scenarios 22 and 23 each push 256 MiB that may be relayed, so
+# --soak stays a by-hand run on a developer machine.
+name: network
+
+on:
+  pull_request:
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+  workflow_dispatch:
+
+concurrency:
+  group: network-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  network:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: keep test state under the runner's temp dir
+        run: echo "TMPDIR=$RUNNER_TEMP" >> "$GITHUB_ENV"
+
+      - name: go test (real DERP)
+        run: go test -race ./internal/transport/... ./internal/config/...
+
+      - name: e2e happy path
+        run: scripts/e2e.sh
+
+      - name: network scenarios (fast tier)
+        run: scripts/run-net-tests.sh
+
+      - name: upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: syncat-test-logs
+          path: ${{ runner.temp }}/syncat-test
+          retention-days: 14
