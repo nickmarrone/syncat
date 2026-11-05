@@ -194,34 +194,20 @@ func (s *Server) handleSharesPatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Name != nil {
-		if err := s.node.RenameShare(id, *req.Name); err != nil {
-			writeMutationError(w, err)
-			return
-		}
-	}
+	// Every field is one config change: saved and announced once, and
+	// applied in full or not at all.
+	change := core.ShareChange{Name: req.Name, ApprovalRequired: req.ApprovalRequired, Access: req.Access}
 	if req.Permission != nil {
 		perm, err := normalizePermission(*req.Permission)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 			return
 		}
-		if err := s.node.SetSharePermission(id, perm); err != nil {
-			writeMutationError(w, err)
-			return
-		}
+		change.Permission = &perm
 	}
-	if req.ApprovalRequired != nil {
-		if err := s.node.SetShareApprovalRequired(id, *req.ApprovalRequired); err != nil {
-			writeMutationError(w, err)
-			return
-		}
-	}
-	for peerKey, access := range req.Access {
-		if err := s.node.SetShareAccess(id, peerKey, access); err != nil {
-			writeMutationError(w, err)
-			return
-		}
+	if err := s.node.UpdateShare(id, change); err != nil {
+		writeMutationError(w, err)
+		return
 	}
 
 	share := findShareDTO(s.node.Status(), id)
