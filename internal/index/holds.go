@@ -11,7 +11,7 @@ import (
 
 // Hold records that a share, or one peer's link to it, is on hold: a change
 // looked like a disaster (see GLOSSARY.md), so it was neither recorded nor
-// exchanged. internal/core decides when to place, confirm, and clear one;
+// exchanged. internal/hold decides when to place, confirm, and clear one;
 // this package only makes it survive a restart, because a hold that a
 // restart quietly forgot would let the very change it stopped go through on
 // the next scan.

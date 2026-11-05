@@ -107,11 +107,8 @@ func describeHold(h holdView) string {
 		confirm += " --peer " + name
 	}
 	since := h.Since.Local().Format(time.DateTime)
-	switch h.Reason {
-	case "root-unavailable":
-		return fmt.Sprintf("%s: %s since %s: the folder is missing or unreadable (restore it, or remove the share)", shareLabel(h), held, since)
-	case "reserved-dir-taken":
-		return fmt.Sprintf("%s: %s since %s: the folder has a .syncat directory syncat didn't create (move it away)", shareLabel(h), held, since)
+	if !h.Confirmable {
+		return fmt.Sprintf("%s: %s since %s: %s (%s)", shareLabel(h), held, since, h.Problem, h.Remedy)
 	}
-	return fmt.Sprintf("%s: %s since %s: %d of %d files would be deleted (fix the folder, or run `%s`)", shareLabel(h), held, since, h.Deletes, h.Live, confirm)
+	return fmt.Sprintf("%s: %s since %s: %s (%s: `%s`)", shareLabel(h), held, since, h.Problem, h.Remedy, confirm)
 }

@@ -222,6 +222,8 @@ type holdView struct {
 	PeerKey     string    `json:"peer_key"`
 	PeerName    string    `json:"peer_name"`
 	Reason      string    `json:"reason"`
+	Problem     string    `json:"problem"`
+	Remedy      string    `json:"remedy"`
 	Deletes     int       `json:"deletes"`
 	Live        int       `json:"live"`
 	Since       time.Time `json:"since"`

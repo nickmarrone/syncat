@@ -1056,14 +1056,10 @@ function describeHold(h) {
   const share = h.share_name || h.share_id;
   const from = h.peer_key ? 'Changes from ' + peerLabel(h.peer_key, h.peer_name) + ' to ' : '';
   const subject = from ? from + '"' + share + '" are' : '"' + share + '" is';
-  if (h.reason === 'root-unavailable') {
-    return subject + ' on hold: the folder is missing or unreadable. Restore it, or remove the share.';
-  }
-  if (h.reason === 'reserved-dir-taken') {
-    return subject + ' on hold: the folder has a .syncat directory that syncat did not create. Move it away.';
-  }
-  return subject + ' on hold: ' + h.deletes + ' of ' + h.live +
-    ' files would be deleted. Nothing is synced until you fix the folder or let the deletes through.';
+  // problem and remedy come from the daemon, so a new kind of hold needs
+  // no change here.
+  const remedy = h.remedy ? ' ' + h.remedy.charAt(0).toUpperCase() + h.remedy.slice(1) + '.' : '';
+  return subject + ' on hold: ' + h.problem + '.' + remedy;
 }
 
 /** One banner per hold, on every page: a held share syncs nothing at

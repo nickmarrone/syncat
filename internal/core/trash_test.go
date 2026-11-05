@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/nickmarrone/syncat/internal/config"
+	"github.com/nickmarrone/syncat/internal/hold"
 )
 
 // A folder that already has a .syncat/ syncat didn't make can't be shared,
@@ -44,7 +45,7 @@ func TestForeignReservedDirBlocksShare(t *testing.T) {
 		t.Fatal("RescanShare succeeded with a foreign .syncat")
 	}
 	h := onlyHold(t, node)
-	if h.Reason != HoldReservedDirTaken || h.Confirmable {
+	if h.Reason != hold.ReservedDirTaken || h.Confirmable() {
 		t.Errorf("hold = %+v, want an unconfirmable reserved-dir-taken hold", h)
 	}
 

@@ -232,9 +232,7 @@ func (n *Node) rescanShare(ctx context.Context, shareID string) error {
 	// into a trash we don't control. Someone else's .syncat/ holds the
 	// share until it is moved out of the way.
 	if err := syncsvc.EnsureReservedDir(sw.root); errors.Is(err, syncsvc.ErrReservedDirTaken) {
-		if err := n.placeHold(index.Hold{ShareID: shareID, Reason: HoldReservedDirTaken, Since: n.clock.Now()}); err != nil {
-			n.logger.Printf("core: hold share %s: %v", shareID, err)
-		}
+		n.holds.ScanFailed(shareID, sw.root, nil, err)
 		return fmt.Errorf("core: rescan %s: %w", shareID, err)
 	}
 
@@ -249,13 +247,19 @@ func (n *Node) rescanShare(ctx context.Context, shareID string) error {
 	}
 	result, err := sw.currentScanner().Scan(ctx, shareID, existing)
 	if err != nil {
-		n.holdForScanError(shareID, sw.root, existing)
+		n.holds.ScanFailed(shareID, sw.root, existing, err)
 		return fmt.Errorf("core: rescan %s: scan: %w", shareID, err)
 	}
-	if n.holdForScan(shareID, result, existing) {
+	apply, released := n.holds.Scan(shareID, existing, result)
+	if released {
+		// The peers' passes the hold stopped run once this scan is in the
+		// index, so they reconcile against the folder as it is now.
+		defer n.reconcileShareOnSessions(shareID)
+	}
+	if !apply {
 		// Dropped, not applied: the index keeps describing the share as it
 		// was, so nothing reaches peers until the hold clears or is
-		// confirmed. See holds.go.
+		// confirmed. See internal/hold.
 		return nil
 	}
 

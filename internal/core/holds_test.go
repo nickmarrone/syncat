@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/nickmarrone/syncat/internal/config"
+	"github.com/nickmarrone/syncat/internal/hold"
 )
 
 // writeNumberedFiles writes count small files named f00.txt, f01.txt, ...
@@ -64,7 +65,7 @@ func TestLocalBulkDeleteIsHeldUntilFolderIsFixed(t *testing.T) {
 		t.Fatalf("RescanShare: %v", err)
 	}
 	h := onlyHold(t, node)
-	if h.Reason != HoldBulkDelete || h.Deletes != 20 || h.Live != 30 || h.PeerKey != "" {
+	if h.Reason != hold.BulkDelete || h.Deletes != 20 || h.Live != 30 || h.PeerKey != "" {
 		t.Errorf("hold = %+v, want a local bulk-delete of 20 of 30", h)
 	}
 	if got := liveIndexed(t, node, shareID); got != 30 {
@@ -77,7 +78,7 @@ func TestLocalBulkDeleteIsHeldUntilFolderIsFixed(t *testing.T) {
 	if err := node.RescanShare(ctx, shareID); err != nil {
 		t.Fatal(err)
 	}
-	if h := onlyHold(t, node); h.Reason != HoldBulkDelete || h.Deletes != 5 {
+	if h := onlyHold(t, node); h.Reason != hold.BulkDelete || h.Deletes != 5 {
 		t.Errorf("hold after a partial fix = %+v, want bulk-delete of 5", h)
 	}
 
@@ -117,125 +118,6 @@ func TestConfirmLetsLocalBulkDeleteThrough(t *testing.T) {
 	}
 }
 
-func TestSmallDeletesAreNotHeld(t *testing.T) {
-	ctx := context.Background()
-	node := newTestNode(t, "node")
-	dir := t.TempDir()
-	writeNumberedFiles(t, dir, 10)
-	shareID, err := node.AddShare(dir, "docs", config.PermissionReadWrite, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// 8 of 10 is over the percentage but under the default minimum of 20.
-	removeNumberedFiles(t, dir, 8)
-	if err := node.RescanShare(ctx, shareID); err != nil {
-		t.Fatal(err)
-	}
-	if holds := node.Holds(); len(holds) != 0 {
-		t.Errorf("Holds() = %+v, want none", holds)
-	}
-	if got := liveIndexed(t, node, shareID); got != 2 {
-		t.Errorf("index has %d live files, want 2", got)
-	}
-}
-
-func TestEverythingVanishingIsHeldInASmallShare(t *testing.T) {
-	ctx := context.Background()
-	node := newTestNode(t, "node")
-	dir := t.TempDir()
-	writeNumberedFiles(t, dir, 3)
-	shareID, err := node.AddShare(dir, "docs", config.PermissionReadWrite, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	removeNumberedFiles(t, dir, 3)
-	if err := node.RescanShare(ctx, shareID); err != nil {
-		t.Fatal(err)
-	}
-	if h := onlyHold(t, node); h.Reason != HoldEverythingVanished {
-		t.Errorf("reason = %q, want %q", h.Reason, HoldEverythingVanished)
-	}
-}
-
-// Restoring part of what vanished is not fixing the folder: the remaining
-// deletes are under the thresholds, but they are the same disaster, so the
-// hold stays until nothing would be deleted.
-func TestPartialRestoreKeepsHold(t *testing.T) {
-	ctx := context.Background()
-	node := newTestNode(t, "node")
-	dir := t.TempDir()
-	writeNumberedFiles(t, dir, 3)
-	shareID, err := node.AddShare(dir, "docs", config.PermissionReadWrite, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	removeNumberedFiles(t, dir, 3)
-	if err := node.RescanShare(ctx, shareID); err != nil {
-		t.Fatal(err)
-	}
-	onlyHold(t, node)
-
-	writeNumberedFiles(t, dir, 1)
-	if err := node.RescanShare(ctx, shareID); err != nil {
-		t.Fatal(err)
-	}
-	h := onlyHold(t, node)
-	if h.Reason != HoldEverythingVanished || h.Deletes != 2 || h.Live != 3 {
-		t.Errorf("hold after restoring one file = %+v, want everything-vanished with 2 of 3 still missing", h)
-	}
-	if got := liveIndexed(t, node, shareID); got != 3 {
-		t.Errorf("index has %d live files, want all 3 kept", got)
-	}
-
-	writeNumberedFiles(t, dir, 3)
-	if err := node.RescanShare(ctx, shareID); err != nil {
-		t.Fatal(err)
-	}
-	if holds := node.Holds(); len(holds) != 0 {
-		t.Errorf("Holds() after restoring everything = %+v, want none", holds)
-	}
-}
-
-// A missing root that comes back with files still missing stays held, now
-// as a hold the user can confirm.
-func TestRootReturningPartlyKeepsHold(t *testing.T) {
-	ctx := context.Background()
-	node := newTestNode(t, "node")
-	dir := filepath.Join(t.TempDir(), "share")
-	if err := os.Mkdir(dir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	writeNumberedFiles(t, dir, 5)
-	shareID, err := node.AddShare(dir, "docs", config.PermissionReadWrite, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.RemoveAll(dir); err != nil {
-		t.Fatal(err)
-	}
-	if err := node.RescanShare(ctx, shareID); err == nil {
-		t.Fatal("RescanShare of a missing root succeeded, want an error")
-	}
-
-	if err := os.Mkdir(dir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	writeNumberedFiles(t, dir, 4)
-	if err := node.RescanShare(ctx, shareID); err != nil {
-		t.Fatal(err)
-	}
-	h := onlyHold(t, node)
-	if h.Reason != HoldEverythingVanished || !h.Confirmable || h.Deletes != 1 {
-		t.Errorf("hold = %+v, want a confirmable everything-vanished hold with 1 missing", h)
-	}
-	if _, err := node.ConfirmHold(ctx, "docs", ""); err != nil {
-		t.Fatalf("ConfirmHold: %v", err)
-	}
-	if got := liveIndexed(t, node, shareID); got != 4 {
-		t.Errorf("index has %d live files after confirming, want 4", got)
-	}
-}
-
 func TestMissingRootIsHeldAndCannotBeConfirmed(t *testing.T) {
 	ctx := context.Background()
 	node := newTestNode(t, "node")
@@ -255,7 +137,7 @@ func TestMissingRootIsHeldAndCannotBeConfirmed(t *testing.T) {
 		t.Fatal("RescanShare of a missing root succeeded, want an error")
 	}
 	h := onlyHold(t, node)
-	if h.Reason != HoldRootUnavailable || h.Confirmable {
+	if h.Reason != hold.RootUnavailable || h.Confirmable() {
 		t.Errorf("hold = %+v, want an unconfirmable root-unavailable hold", h)
 	}
 	if _, err := node.ConfirmHold(ctx, "docs", ""); err == nil {
@@ -282,41 +164,18 @@ func TestHoldThresholdsAreConfigurable(t *testing.T) {
 	if err := node.RescanShare(ctx, shareID); err != nil {
 		t.Fatal(err)
 	}
-	if h := onlyHold(t, node); h.Reason != HoldBulkDelete || h.Deletes != 4 {
+	if h := onlyHold(t, node); h.Reason != hold.BulkDelete || h.Deletes != 4 {
 		t.Errorf("hold = %+v, want bulk-delete of 4", h)
 	}
 }
 
-func TestHoldSurvivesRestart(t *testing.T) {
-	ctx := context.Background()
-	node := newTestNode(t, "node")
-	dir := t.TempDir()
-	writeNumberedFiles(t, dir, 30)
-	shareID, err := node.AddShare(dir, "docs", config.PermissionReadWrite, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	removeNumberedFiles(t, dir, 25)
-	if err := node.RescanShare(ctx, shareID); err != nil {
-		t.Fatal(err)
-	}
-	onlyHold(t, node)
-
-	reloaded, err := loadHolds(ctx, node.store)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if h, ok := reloaded[holdKey{shareID, ""}]; !ok || h.Reason != HoldBulkDelete || h.Deletes != 25 {
-		t.Errorf("hold read back from the store = %+v (found %v), want the bulk-delete", h, ok)
-	}
-}
-
-// A peer's bulk delete is held on the receiving side, even when the
-// sending side's own guard let it through, and confirming applies it.
-func TestPeerBulkDeleteIsHeldOnReceiver(t *testing.T) {
-	ctx := context.Background()
-	nodeA := newTestNode(t, "nodeA")
-	nodeB := newTestNode(t, "nodeB")
+// heldPeerDelete sets up nodeB subscribed to nodeA's 25-file share "docs"
+// and has nodeA delete 22 of them, which nodeA lets through and nodeB holds.
+// It returns once nodeB holds it.
+func heldPeerDelete(t *testing.T) (nodeA, nodeB *Node, shareID, localDir string) {
+	t.Helper()
+	nodeA = newTestNode(t, "nodeA")
+	nodeB = newTestNode(t, "nodeB")
 
 	shareDir := t.TempDir()
 	writeNumberedFiles(t, shareDir, 25)
@@ -336,26 +195,33 @@ func TestPeerBulkDeleteIsHeldOnReceiver(t *testing.T) {
 	}
 	waitFor(t, 5*time.Second, func() bool { return peerConnected(nodeA) && peerConnected(nodeB) })
 
-	localDir := t.TempDir()
+	localDir = t.TempDir()
 	if err := nodeB.AddSubscription(nodeA.PeerKey(), shareID, localDir, config.ModeMirror); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, 5*time.Second, func() bool { return countFiles(localDir) == 25 })
 
 	removeNumberedFiles(t, shareDir, 22)
-	if err := nodeA.RescanShare(ctx, shareID); err != nil {
+	if err := nodeA.RescanShare(context.Background(), shareID); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, 5*time.Second, func() bool { return len(nodeB.Holds()) == 1 })
+	return nodeA, nodeB, shareID, localDir
+}
+
+// A peer's bulk delete is held on the receiving side, even when the
+// sending side's own guard let it through, and confirming applies it.
+func TestPeerBulkDeleteIsHeldOnReceiver(t *testing.T) {
+	nodeA, nodeB, _, localDir := heldPeerDelete(t)
 	h := onlyHold(t, nodeB)
-	if h.PeerKey != nodeA.PeerKey() || h.Reason != HoldBulkDelete || h.Deletes != 22 {
+	if h.PeerKey != nodeA.PeerKey() || h.Reason != hold.BulkDelete || h.Deletes != 22 {
 		t.Errorf("hold on B = %+v, want bulk-delete of 22 from nodeA", h)
 	}
 	if got := countFiles(localDir); got != 25 {
 		t.Errorf("B has %d files while held, want all 25", got)
 	}
 
-	if _, err := nodeB.ConfirmHold(ctx, "docs", "nodeA"); err != nil {
+	if _, err := nodeB.ConfirmHold(context.Background(), "docs", "nodeA"); err != nil {
 		t.Fatalf("ConfirmHold: %v", err)
 	}
 	waitFor(t, 5*time.Second, func() bool { return countFiles(localDir) == 3 })

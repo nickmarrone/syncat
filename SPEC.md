@@ -307,7 +307,8 @@ every peer's changes into it.
   not deleted. A missing root or a foreign `.syncat/` cannot be confirmed; a root
   that returns with files still missing stays held as everything-vanished, which can.
 - Holds are stored in the index, so a restart doesn't forget them. They show in
-  `syncat status`, `GET /api/holds`, and as a banner on every page of the web UI.
+  `syncat status`, `GET /api/holds`, and as a banner on every page of the web UI,
+  each with the daemon's own description of the problem and the remedy.
 
 ## 8. REST API & CLI
 
