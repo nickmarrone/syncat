@@ -310,7 +310,10 @@ every peer's changes into it.
   `syncat status`, `GET /api/holds`, and as a banner on every page of the web UI,
   each with the daemon's own description of the problem and the remedy.
 - Removing a share, subscription, or peer forgets its holds, since nothing would
-  ever scan or sync that link again. Startup does the same for any left behind.
+  ever scan or sync that link again. So does denying or revoking a peer's
+  access to a share, or requiring approval for a share the peer was never
+  granted. If the peer is let back in, its next change is checked afresh.
+  Startup does the same for any left behind.
 
 ## 8. REST API & CLI
 

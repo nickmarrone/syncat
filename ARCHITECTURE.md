@@ -537,8 +537,9 @@ or know about sessions; core asks it questions and acts on the answers.
   under the thresholds is not enough.
 - `Guard.Confirm` marks a hold so the next change it would have held applies.
   The caller runs that scan or pass.
-- `Guard.Retain` forgets holds whose share, subscription, or peer is gone. Core
-  calls it after every config change and at startup.
+- `Guard.Retain` forgets holds whose share, subscription, or peer is gone, or
+  whose peer no longer has access to the share. Core calls it after every
+  config change and at startup.
 - Every held link is kept in memory and in the index's `holds` table, so the
   checks never query the database and a restart keeps them.
 - `Hold.Problem` and `Hold.Remedy` are the words the CLI and web UI show, so
