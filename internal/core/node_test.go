@@ -41,6 +41,13 @@ func newPipeAddr(t *testing.T) string {
 // TestBackoffRetryAndRecover) are deterministic.
 func newTestNode(t *testing.T, name string) *Node {
 	t.Helper()
+	return newTestNodeWithTransport(t, name, transport.NewPipeTransport(newPipeAddr(t)))
+}
+
+// newTestNodeWithTransport is newTestNode with the carrier chosen by the
+// caller, for tests that need one behaving differently from a plain pipe.
+func newTestNodeWithTransport(t *testing.T, name string, tr transport.Transport) *Node {
+	t.Helper()
 	dir := t.TempDir()
 	paths, err := config.ResolvePaths(filepath.Join(dir, "config"), filepath.Join(dir, "data"))
 	if err != nil {
@@ -55,8 +62,6 @@ func newTestNode(t *testing.T, name string) *Node {
 	}
 	cfg := config.Default()
 	cfg.NodeName = name
-
-	tr := transport.NewPipeTransport(newPipeAddr(t))
 
 	n, err := Open(context.Background(), Options{
 		Paths:         paths,
@@ -859,6 +864,42 @@ func TestAddPeerRejectsOwnToken(t *testing.T) {
 	}
 	if subs := n.Status().Subscriptions; len(subs) != 0 {
 		t.Errorf("Status().Subscriptions = %d entries, want 0", len(subs))
+	}
+}
+
+// refusingTransport is a pipe that rejects every address, standing in for a
+// carrier handed one it could never dial.
+type refusingTransport struct {
+	transport.Transport
+}
+
+func (refusingTransport) ValidateAddr(string) error {
+	return errors.New("carrier cannot dial this address")
+}
+
+// TestAddPeerRejectsUndialableAddress pins that AddPeer asks the carrier
+// whether a pasted token's address is usable at all, and refuses the peer
+// when it is not.
+//
+// What this prevents is a silent failure rather than a loud one: an address
+// the carrier cannot dial is otherwise stored happily, and the only symptom
+// is a peer that never connects while runSupervisor redials it on backoff
+// forever, with nothing anywhere naming the cause. The live case is a token
+// from a node predating tailcat 0.3.0; see TailcatTransport.ValidateAddr.
+func TestAddPeerRejectsUndialableAddress(t *testing.T) {
+	n := newTestNodeWithTransport(t, "picky",
+		refusingTransport{transport.NewPipeTransport(newPipeAddr(t))})
+	other := newTestNode(t, "other")
+
+	if _, err := n.AddPeer("other", peerToken(t, other)); err == nil {
+		t.Fatal("AddPeer accepted a token the carrier says it cannot dial")
+	} else if !strings.Contains(err.Error(), "carrier cannot dial this address") {
+		t.Errorf("AddPeer error = %q, want it to carry the carrier's reason", err)
+	}
+
+	// A refused peer must leave nothing behind to redial or display.
+	if peers := n.Status().Peers; len(peers) != 0 {
+		t.Errorf("Status().Peers = %d entries after the rejected AddPeer, want 0", len(peers))
 	}
 }
 
