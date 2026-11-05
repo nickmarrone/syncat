@@ -326,6 +326,12 @@ func TestRevokingAccessForgetsThePeersHold(t *testing.T) {
 	if _, err := nodeB.SetSafety(shareID, config.Safety{HoldDeletePercent: 100, HoldDeleteMin: 1000}); err != nil {
 		t.Fatal(err)
 	}
+	// And the offerer's is tightened to hold any delete. B's watcher can
+	// rescan while the files are still being removed, which splits the
+	// delete into batches that would each pass the default thresholds.
+	if _, err := nodeA.SetSafety(shareID, config.Safety{HoldDeletePercent: 1, HoldDeleteMin: 1}); err != nil {
+		t.Fatal(err)
+	}
 
 	removeNumberedFiles(t, localDir, 22)
 	if err := nodeB.RescanShare(context.Background(), shareID); err != nil {
