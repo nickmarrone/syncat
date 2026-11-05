@@ -408,7 +408,7 @@ erDiagram
 | `change_journal` | One row for each change to `files`, in order. Peers replay it for incremental updates. |
 | `peer_cursors` | How far each peer's index stream has progressed, in each direction. |
 | `snapshot_staging` | Snapshot batches received but not yet committed. |
-| `pending_transfers` | Reserved for resumable transfers. Nothing uses it yet. |
+| `pending_transfers` | Reserved for resumable transfers (SPEC.md §11). Nothing uses it yet. |
 
 **Details.**
 
