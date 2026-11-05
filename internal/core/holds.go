@@ -19,8 +19,9 @@ import (
 //   - rescanShare asks it before a local scan result is applied;
 //   - every session asks the closure shareGuardFunc builds before it
 //     applies a peer's changes;
-//   - mutateConfig has it forget the holds of whatever a config change
-//     removed, and Open does the same at startup;
+//   - every config change's effects (applyConfigChange) have it forget
+//     the holds of whatever the change removed, and Open does the same at
+//     startup;
 //   - the API lists holds and confirms them through the methods below.
 
 // holdOptions is what n's hold guard needs from the node.

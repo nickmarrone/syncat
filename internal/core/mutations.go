@@ -4,10 +4,12 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
+	"slices"
+	"strings"
 
 	"github.com/nickmarrone/syncat/internal/config"
-	"github.com/nickmarrone/syncat/internal/hold"
 	"github.com/nickmarrone/syncat/internal/protocol"
 	syncsvc "github.com/nickmarrone/syncat/internal/sync"
 )
@@ -15,12 +17,12 @@ import (
 // This file is Node's config-mutation API: everything the REST layer
 // (internal/api) and the CLI call to change what this node peers with,
 // offers, and subscribes to. Every entry point resolves its human-typed
-// references (see resolve.go), mutates a clone of the config under cfgMu,
-// persists it, and only then applies the live effects: watchers started
-// or stopped, sessions re-synced, with cfgMu released.
+// references (see resolve.go) and edits the config through mutateConfig.
+// None of them applies a live effect: effects.go derives those from the
+// change itself.
 //
-// Lock ordering: config mutations always clone-mutate-swap under cfgMu;
-// live effects (which take peerConn.mu) are applied after cfgMu is
+// Lock ordering: mutateMu, then cfgMu. A change is swapped in under cfgMu;
+// its live effects (which take peerConn.mu) are applied after cfgMu is
 // released, so cfgMu is never held while acquiring a peerConn's lock.
 
 // --- config mutation helpers ---------------------------------------------
@@ -47,30 +49,32 @@ func cloneConfig(cfg *config.Config) *config.Config {
 }
 
 // mutateConfig applies fn to a clone of the current config, persists the
-// clone (config.Save, which also validates), and, only on success,
-// swaps it in as the live config. Callers apply live effects (starting/
-// stopping watchers and sessions) after mutateConfig returns successfully,
-// outside cfgMu, matching every mutation method in this file.
+// clone (config.Save, which also validates), and, only on success, swaps
+// it in as the live config and applies its live effects (see effects.go).
+// fn only edits the config; it must not touch anything running.
 //
-// The one live effect it applies itself is forgetting holds: whatever the
-// change removed (a share, a subscription, a peer) can never be scanned or
-// synced again, so a hold on it could never clear. Doing that here, for
-// every mutation, means no removal path can leave one behind.
+// mutateMu is held throughout, so one change's effects are applied before
+// the next change is made, in the order the changes were made. Nothing an
+// effect runs may call mutateConfig itself; work that must is handed to a
+// tracked goroutine (see finishSubscribeRequest).
 func (n *Node) mutateConfig(fn func(cfg *config.Config) error) (*config.Config, error) {
-	newCfg, keep, err := n.swapConfig(fn)
+	n.mutateMu.Lock()
+	defer n.mutateMu.Unlock()
+	oldCfg, newCfg, err := n.swapConfig(fn)
 	if err != nil {
 		return nil, err
 	}
-	n.holds.Retain(keep)
+	n.applyConfigChange(oldCfg, newCfg)
 	return newCfg, nil
 }
 
-// swapConfig is mutateConfig under cfgMu. It also returns which hold links
-// the new config still has, read while the lock is held.
-func (n *Node) swapConfig(fn func(cfg *config.Config) error) (*config.Config, func(hold.Link) bool, error) {
+// swapConfig is mutateConfig's config half, under cfgMu. Neither config it
+// returns is ever modified again: every change works on a clone.
+func (n *Node) swapConfig(fn func(cfg *config.Config) error) (oldCfg, newCfg *config.Config, err error) {
 	n.cfgMu.Lock()
 	defer n.cfgMu.Unlock()
-	newCfg := cloneConfig(n.cfg)
+	oldCfg = n.cfg
+	newCfg = cloneConfig(oldCfg)
 	if err := fn(newCfg); err != nil {
 		return nil, nil, err
 	}
@@ -78,7 +82,7 @@ func (n *Node) swapConfig(fn func(cfg *config.Config) error) (*config.Config, fu
 		return nil, nil, fmt.Errorf("save config: %w", err)
 	}
 	n.cfg = newCfg
-	return newCfg, configuredLinks(newCfg), nil
+	return oldCfg, newCfg, nil
 }
 
 func findPeerIndex(cfg *config.Config, peerKeyHex string) int {
@@ -110,8 +114,8 @@ func findSubscriptionIndex(cfg *config.Config, peerKeyHex, shareID string) int {
 
 // --- peer mutations --------------------------------------------------------
 
-// AddPeer adds a peer by its pasted sc1 token (SPEC.md §2), persists it,
-// and starts dialing it immediately. It returns the peer's canonical
+// AddPeer adds a peer by its pasted sc1 token (SPEC.md §2) and persists
+// it; its effect starts dialing it. It returns the peer's canonical
 // identifier (its full Ed25519 public key, hex-encoded). Every other
 // peer-scoped method in this package's API takes that same identifier.
 func (n *Node) AddPeer(name, token string) (string, error) {
@@ -142,20 +146,17 @@ func (n *Node) AddPeer(name, token string) (string, error) {
 	}); err != nil {
 		return "", fmt.Errorf("core: add peer: %w", err)
 	}
-
-	if err := n.activatePeer(p, peerKeyHex); err != nil {
-		return "", fmt.Errorf("core: add peer: %w", err)
-	}
 	return peerKeyHex, nil
 }
 
-func (n *Node) activatePeer(p config.Peer, peerKeyHex string) error {
+// activatePeer registers a peer added at runtime and starts dialing it.
+func (n *Node) activatePeer(p config.Peer) error {
 	pc, err := newPeerConn(n, p)
 	if err != nil {
 		return err
 	}
 	n.peersMu.Lock()
-	n.peers[peerKeyHex] = pc
+	n.peers[pc.peerKeyHex] = pc
 	n.peersMu.Unlock()
 	n.goTracked(pc.runSupervisor)
 	n.debugf("core: added peer %q (%s)", p.Name, pc.peerShort)
@@ -164,7 +165,8 @@ func (n *Node) activatePeer(p config.Peer, peerKeyHex string) error {
 
 // RemovePeer removes a configured peer and every trace of it from the rest
 // of the config: subscriptions to its shares, and its entries in our own
-// shares' access lists. It also closes any active connection to it.
+// shares' access lists. Its effects close any connection to it and stop
+// watching those subscriptions.
 //
 // The subscriptions go because a subscription names the peer that offers
 // the share (config.Subscription.Peer): once that peer is gone there is no
@@ -223,23 +225,11 @@ func (n *Node) RemovePeer(peerRef string) error {
 		return fmt.Errorf("core: remove peer: %w", err)
 	}
 
-	// No need to neuter these on the peer's live session the way
-	// RemoveSubscription does: cancelling pc below tears the whole session
-	// down anyway.
 	for _, s := range droppedSubs {
-		n.stopShareWatch(s.ShareID)
 		n.logger.Printf("core: remove peer %s: dropped subscription to share %s (local copy left at %s)", peerKeyHex, s.ShareID, s.LocalPath)
 	}
 	for _, shareID := range droppedAccess {
 		n.logger.Printf("core: remove peer %s: revoked its access to share %s", peerKeyHex, shareID)
-	}
-
-	n.peersMu.Lock()
-	pc := n.peers[peerKeyHex]
-	delete(n.peers, peerKeyHex)
-	n.peersMu.Unlock()
-	if pc != nil {
-		pc.cancel()
 	}
 	n.debugf("core: removed peer %s (dropped %d subscription(s), revoked access to %d share(s))", peerKeyHex, len(droppedSubs), len(droppedAccess))
 	return nil
@@ -249,8 +239,8 @@ func (n *Node) RemovePeer(peerRef string) error {
 
 // AddShare offers a new local directory as a share (SPEC.md §3/§6):
 // validates path (including the CheckSharePath overlap rule), generates a
-// share id, persists it, starts watching it, and announces it to every
-// connected peer.
+// share id, and persists it. Its effects start watching it and announce it
+// to every connected peer.
 func (n *Node) AddShare(path, name, permission string, approvalRequired bool) (string, error) {
 	if permission != config.PermissionReadOnly && permission != config.PermissionReadWrite {
 		return "", fmt.Errorf("core: add share: invalid permission %q", permission)
@@ -278,20 +268,13 @@ func (n *Node) AddShare(path, name, permission string, approvalRequired bool) (s
 	}); err != nil {
 		return "", fmt.Errorf("core: add share: %w", err)
 	}
-
-	if _, err := n.startShareWatch(id, path); err != nil {
-		n.logger.Printf("core: add share: start watcher for %s: %v", id, err)
-	} else if err := n.rescanShare(n.ctx, id); err != nil {
-		n.logger.Printf("core: add share: initial scan for %s: %v", id, err)
-	}
-	n.broadcastShareList()
 	n.debugf("core: added share %q (%s) at %s [%s, approval=%v]", name, id, path, permission, approvalRequired)
 	return id, nil
 }
 
-// RemoveShare stops offering a share: persists the removal, stops its
-// watcher, neuters it on any live sessions (see the package doc comment),
-// and announces the updated share list.
+// RemoveShare stops offering a share. Its effects stop its watcher,
+// neuter it on any live sessions (see the package doc comment), and
+// announce the updated share list.
 func (n *Node) RemoveShare(shareRef string) error {
 	shareID, err := n.resolveLocalShareRef(shareRef)
 	if err != nil {
@@ -307,188 +290,134 @@ func (n *Node) RemoveShare(shareRef string) error {
 	}); err != nil {
 		return fmt.Errorf("core: remove share: %w", err)
 	}
-
-	n.stopShareWatch(shareID)
-	n.neuterShareOnSessions(shareID)
-	n.broadcastShareList()
 	n.debugf("core: removed share %s", shareID)
 	return nil
 }
 
-// RenameShare updates a share's display name.
-func (n *Node) RenameShare(shareRef, name string) error {
-	shareID, err := n.resolveLocalShareRef(shareRef)
-	if err != nil {
-		return fmt.Errorf("core: rename share: %w", err)
-	}
-	if _, err := n.mutateConfig(func(cfg *config.Config) error {
-		i := findShareIndex(cfg, shareID)
-		if i < 0 {
-			return mutationErrorf(MutationNotFound, "share %s is not configured", shareID)
-		}
-		cfg.Shares[i].Name = name
-		return nil
-	}); err != nil {
-		return fmt.Errorf("core: rename share: %w", err)
-	}
-	n.broadcastShareList()
-	n.debugf("core: renamed share %s to %q", shareID, name)
-	return nil
+// ShareChange is a set of edits to one share this node offers. A nil
+// field, or a peer missing from Access, is left as it is.
+type ShareChange struct {
+	Name             *string
+	Permission       *string // config.PermissionReadOnly or PermissionReadWrite
+	ApprovalRequired *bool
+	// Access maps a peer ref to the access to record for it: pending,
+	// granted, denied, or revoked (SPEC.md §6).
+	Access map[string]string
 }
 
-// SetSharePermission changes a share's permission (SPEC.md §6), updating
-// the Direction every currently-connected, currently-granted session for
-// this share uses from this point on.
-func (n *Node) SetSharePermission(shareRef, permission string) error {
-	if permission != config.PermissionReadOnly && permission != config.PermissionReadWrite {
-		return fmt.Errorf("core: set share permission: invalid permission %q", permission)
-	}
-	shareID, err := n.resolveLocalShareRef(shareRef)
-	if err != nil {
-		return fmt.Errorf("core: set share permission: %w", err)
-	}
-	if _, err := n.mutateConfig(func(cfg *config.Config) error {
-		i := findShareIndex(cfg, shareID)
-		if i < 0 {
-			return mutationErrorf(MutationNotFound, "share %s is not configured", shareID)
-		}
-		cfg.Shares[i].Permission = permission
-		return nil
-	}); err != nil {
-		return fmt.Errorf("core: set share permission: %w", err)
-	}
+// UpdateShare applies every edit in ch to one share as a single config
+// change, so it is saved and announced once, and either all of it applies
+// or none of it does. Its effects carry a new permission onto the sessions
+// syncing the share, and an access decision onto that peer's session:
+// granting or neutering the share there and telling the peer.
+func (n *Node) UpdateShare(shareRef string, ch ShareChange) error {
+	return n.updateShare("update share", shareRef, ch)
+}
 
-	n.sharesMu.Lock()
-	sw := n.shareWatches[shareID]
-	n.sharesMu.Unlock()
-	root := ""
-	if sw != nil {
-		root = sw.root
-	}
-	direction := syncsvc.DirectionFor(permission, "")
-	for _, pc := range n.snapshotPeers() {
-		pc.reconfigureShare(shareID, root, direction)
-	}
-	n.broadcastShareList()
-	n.debugf("core: share %s permission set to %s", shareID, permission)
-	return nil
+// RenameShare updates a share's display name.
+func (n *Node) RenameShare(shareRef, name string) error {
+	return n.updateShare("rename share", shareRef, ShareChange{Name: &name})
+}
+
+// SetSharePermission changes a share's permission (SPEC.md §6), and with
+// it the Direction every session syncing the share uses from now on.
+func (n *Node) SetSharePermission(shareRef, permission string) error {
+	return n.updateShare("set share permission", shareRef, ShareChange{Permission: &permission})
 }
 
 // SetShareApprovalRequired toggles a share's approval_required flag. It
 // applies to subsequent requests; existing explicit decisions are retained.
 func (n *Node) SetShareApprovalRequired(shareRef string, required bool) error {
+	return n.updateShare("set share approval required", shareRef, ShareChange{ApprovalRequired: &required})
+}
+
+// SetShareAccess records pending access, or grants, denies, or revokes one
+// peer's access to a share (SPEC.md §6).
+func (n *Node) SetShareAccess(shareRef, peerRef, access string) error {
+	return n.updateShare("set share access", shareRef, ShareChange{Access: map[string]string{peerRef: access}})
+}
+
+func (n *Node) updateShare(op, shareRef string, ch ShareChange) error {
+	if ch.Permission != nil && *ch.Permission != config.PermissionReadOnly && *ch.Permission != config.PermissionReadWrite {
+		return mutationErrorf(MutationInvalid, "core: %s: invalid permission %q", op, *ch.Permission)
+	}
+	// Peer refs are resolved best-effort, not strictly: an access entry may
+	// legitimately name a key this node has no peer for (a peer removed
+	// while its grant lingered), and refusing those would make the stale
+	// entry impossible to revoke.
+	access := make(map[string]string, len(ch.Access))
+	for peerRef, a := range ch.Access {
+		switch a {
+		case protocol.AccessPending, protocol.AccessGranted, protocol.AccessDenied, protocol.AccessRevoked:
+		default:
+			return mutationErrorf(MutationInvalid, "core: %s: invalid access %q", op, a)
+		}
+		peerKeyHex := peerRef
+		if pc, err := n.resolvePeerRef(peerRef); err == nil {
+			peerKeyHex = pc.peerKeyHex
+		}
+		access[peerKeyHex] = a
+	}
 	shareID, err := n.resolveLocalShareRef(shareRef)
 	if err != nil {
-		return fmt.Errorf("core: set share approval required: %w", err)
+		return fmt.Errorf("core: %s: %w", op, err)
 	}
+
 	if _, err := n.mutateConfig(func(cfg *config.Config) error {
 		i := findShareIndex(cfg, shareID)
 		if i < 0 {
 			return mutationErrorf(MutationNotFound, "share %s is not configured", shareID)
 		}
-		cfg.Shares[i].ApprovalRequired = required
+		s := &cfg.Shares[i]
+		if ch.Name != nil {
+			s.Name = *ch.Name
+		}
+		if ch.Permission != nil {
+			s.Permission = *ch.Permission
+		}
+		if ch.ApprovalRequired != nil {
+			s.ApprovalRequired = *ch.ApprovalRequired
+		}
+		if len(access) > 0 && s.Access == nil {
+			s.Access = map[string]string{}
+		}
+		maps.Copy(s.Access, access)
 		return nil
 	}); err != nil {
-		return fmt.Errorf("core: set share approval required: %w", err)
+		return fmt.Errorf("core: %s: %w", op, err)
 	}
-	n.broadcastShareList()
-	n.debugf("core: share %s approval_required set to %v", shareID, required)
+	n.debugf("core: share %s updated: %s", shareID, describeShareChange(ch, access))
 	return nil
 }
 
-// SetShareAccess records pending access, or grants, denies, or revokes one peer's access to a share
-// (SPEC.md §6), persisting the decision and, if the peer is connected,
-// pushing AccessUpdate and adding/neutering the share on that session
-// immediately.
-func (n *Node) SetShareAccess(shareRef, peerRef, access string) error {
-	switch access {
-	case protocol.AccessPending, protocol.AccessGranted, protocol.AccessDenied, protocol.AccessRevoked:
-	default:
-		return fmt.Errorf("core: set share access: invalid access %q", access)
+// describeShareChange is ch for the debug log, with peer refs resolved.
+func describeShareChange(ch ShareChange, access map[string]string) string {
+	var parts []string
+	if ch.Name != nil {
+		parts = append(parts, fmt.Sprintf("name %q", *ch.Name))
 	}
-	shareID, err := n.resolveLocalShareRef(shareRef)
-	if err != nil {
-		return fmt.Errorf("core: set share access: %w", err)
+	if ch.Permission != nil {
+		parts = append(parts, "permission "+*ch.Permission)
 	}
-	// The peer ref is resolved best-effort, not strictly: an access entry
-	// may legitimately name a key this node has no peer for (a peer removed
-	// while its grant lingered), and refusing those would make the stale
-	// entry impossible to revoke.
-	peerKeyHex := peerRef
-	if pc, err := n.resolvePeerRef(peerRef); err == nil {
-		peerKeyHex = pc.peerKeyHex
+	if ch.ApprovalRequired != nil {
+		parts = append(parts, fmt.Sprintf("approval_required %v", *ch.ApprovalRequired))
 	}
-
-	var share config.Share
-	if _, err := n.mutateConfig(func(cfg *config.Config) error {
-		i := findShareIndex(cfg, shareID)
-		if i < 0 {
-			return mutationErrorf(MutationNotFound, "share %s is not configured", shareID)
-		}
-		if cfg.Shares[i].Access == nil {
-			cfg.Shares[i].Access = map[string]string{}
-		}
-		cfg.Shares[i].Access[peerKeyHex] = access
-		share = cfg.Shares[i]
-		return nil
-	}); err != nil {
-		return fmt.Errorf("core: set share access: %w", err)
+	for _, key := range slices.Sorted(maps.Keys(access)) {
+		parts = append(parts, fmt.Sprintf("access for peer %s %s", key, access[key]))
 	}
-	// Before the live-effect early returns below: the decision is persisted
-	// at this point regardless of whether the peer happens to be connected
-	// to receive the AccessUpdate, and it is the decision that matters here.
-	n.debugf("core: share %s access for peer %s set to %s", shareID, peerKeyHex, access)
-
-	pc := n.lookupPeer(peerKeyHex)
-	if pc == nil {
-		return nil
+	if len(parts) == 0 {
+		return "nothing"
 	}
-	sess := pc.currentSession()
-	if sess == nil {
-		return nil
-	}
-
-	// Apply authorization locally before reporting it remotely. In
-	// particular, a grant must make the share available before the peer can
-	// react to AccessUpdate, while every non-grant must fail closed first.
-	if access == protocol.AccessGranted {
-		pc.grantShare(sess, shareID, share.Path, syncsvc.DirectionFor(share.Permission, ""))
-	} else {
-		pc.neuterShare(shareID)
-	}
-	if err := sess.Writer().WriteLatestMessage("access-update\x00"+shareID, protocol.MsgAccessUpdate, protocol.AccessUpdate{ShareID: shareID, Access: access}); err != nil {
-		n.logger.Printf("core: send access update for %s to %s: %v", shareID, peerKeyHex, err)
-	}
-	// An access decision changes what this peer's ShareList looks like, and
-	// SPEC.md §4 says ShareList is sent on connect *and on change*. The
-	// AccessUpdate above doesn't cover it: the subscriber files that against
-	// a subscription it already has, while the access it shows for an
-	// offered share comes from the ShareList and nowhere else. Without this,
-	// a share we just granted keeps reading as "no access" on the peer's
-	// side, and a grant made before the peer ever subscribes reaches it
-	// with nothing at all until the next reconnect.
-	n.sendShareList(sess, peerKeyHex)
-	if access == protocol.AccessGranted {
-		if err := sess.SyncShare(n.ctx, shareID); err != nil {
-			n.logger.Printf("core: sync share %s to %s: %v", shareID, peerKeyHex, err)
-		}
-		// The offerer half of the same gap finishAccessUpdate closes on the
-		// subscriber side: a read-write share means work can be owed in this
-		// direction too, and a reconnect is the moment to look.
-		if err := sess.ReconcileShare(n.ctx, shareID); err != nil {
-			n.logger.Printf("core: reconcile share %s for %s on connect: %v", shareID, peerKeyHex, err)
-		}
-	}
-	return nil
+	return strings.Join(parts, ", ")
 }
 
 // --- subscription mutations -------------------------------------------------
 
 // AddSubscription subscribes to a peer's share (SPEC.md §1/§6): validates
 // the peer and share ids and the local path (CheckSubscriptionPath),
-// creates the local path if needed, persists the subscription, starts
-// watching the local copy, and, if already connected to the peer, sends
-// SubscribeRequest immediately.
+// creates the local path if needed, and persists the subscription. Its
+// effects start watching the local copy and, if already connected to the
+// peer, send SubscribeRequest immediately.
 //
 // peerRef and shareRef are references in the sense of matchRef: a
 // canonical id, a display name, or a unique id prefix. Both are resolved
@@ -537,23 +466,13 @@ func (n *Node) AddSubscription(peerRef, shareRef, localPath, mode string) error 
 	}); err != nil {
 		return fmt.Errorf("core: add subscription: %w", err)
 	}
-
-	if _, err := n.startShareWatch(shareID, localPath); err != nil {
-		n.logger.Printf("core: add subscription: start watcher for %s: %v", shareID, err)
-	}
-
-	if sess := pc.currentSession(); sess != nil {
-		if err := sess.Writer().WriteMessage(protocol.MsgSubscribeRequest, protocol.SubscribeRequest{ShareID: shareID}); err != nil {
-			n.logger.Printf("core: send subscribe request %s to %s: %v", shareID, peerKeyHex, err)
-		}
-	}
 	n.debugf("core: added subscription to share %s from peer %s at %s [%s]", shareID, peerKeyHex, localPath, mode)
 	return nil
 }
 
-// RemoveSubscription stops syncing a subscription: persists the removal,
-// stops its watcher, and neuters it on the offering peer's live session
-// (see the package doc comment).
+// RemoveSubscription stops syncing a subscription. Its effects stop its
+// watcher and neuter it on the offering peer's live session (see the
+// package doc comment).
 func (n *Node) RemoveSubscription(peerRef, shareRef string) error {
 	peerKeyHex, shareID := n.resolveSubscriptionRef(peerRef, shareRef)
 	if _, err := n.mutateConfig(func(cfg *config.Config) error {
@@ -566,55 +485,30 @@ func (n *Node) RemoveSubscription(peerRef, shareRef string) error {
 	}); err != nil {
 		return fmt.Errorf("core: remove subscription: %w", err)
 	}
-
-	n.stopShareWatch(shareID)
-	if pc := n.lookupPeer(peerKeyHex); pc != nil {
-		pc.neuterShare(shareID)
-	}
 	n.debugf("core: removed subscription to share %s from peer %s (local copy left on disk)", shareID, peerKeyHex)
 	return nil
 }
 
-// PauseSubscription pauses or resumes a subscription: paused stops the
+// PauseSubscription pauses or resumes a subscription. Pausing stops the
 // local watcher and neuters the share on the live session; resuming
 // restarts the watcher and re-requests access.
 func (n *Node) PauseSubscription(peerRef, shareRef string, paused bool) error {
 	peerKeyHex, shareID := n.resolveSubscriptionRef(peerRef, shareRef)
-	var sub config.Subscription
 	if _, err := n.mutateConfig(func(cfg *config.Config) error {
 		idx := findSubscriptionIndex(cfg, peerKeyHex, shareID)
 		if idx < 0 {
 			return mutationErrorf(MutationNotFound, "subscription to peer %s share %s is not configured", peerKeyHex, shareID)
 		}
 		cfg.Subscriptions[idx].Paused = paused
-		sub = cfg.Subscriptions[idx]
 		return nil
 	}); err != nil {
 		return fmt.Errorf("core: pause subscription: %w", err)
 	}
-
-	pc := n.lookupPeer(peerKeyHex)
-
 	if paused {
-		n.stopShareWatch(shareID)
-		if pc != nil {
-			pc.neuterShare(shareID)
-		}
 		n.debugf("core: paused subscription to share %s from peer %s", shareID, peerKeyHex)
-		return nil
+	} else {
+		n.debugf("core: resumed subscription to share %s from peer %s", shareID, peerKeyHex)
 	}
-
-	if _, err := n.startShareWatch(shareID, sub.LocalPath); err != nil {
-		n.logger.Printf("core: resume subscription: start watcher for %s: %v", shareID, err)
-	}
-	if pc != nil {
-		if sess := pc.currentSession(); sess != nil {
-			if err := sess.Writer().WriteMessage(protocol.MsgSubscribeRequest, protocol.SubscribeRequest{ShareID: shareID}); err != nil {
-				n.logger.Printf("core: send subscribe request %s to %s: %v", shareID, peerKeyHex, err)
-			}
-		}
-	}
-	n.debugf("core: resumed subscription to share %s from peer %s", shareID, peerKeyHex)
 	return nil
 }
 
@@ -675,23 +569,15 @@ func (n *Node) Safety(shareRef string) (config.Safety, error) {
 
 // --- node mutation -----------------------------------------------------------
 
-// RenameNode changes this node's display name, persisting it and
-// recomputing the cached sc1 token (which embeds the name as a
-// "suggested display name" in SPEC.md §2).
+// RenameNode changes this node's display name. Its effect recomputes the
+// cached sc1 token, which embeds the name as a "suggested display name"
+// (SPEC.md §2).
 func (n *Node) RenameNode(name string) error {
 	if _, err := n.mutateConfig(func(cfg *config.Config) error {
 		cfg.NodeName = name
 		return nil
 	}); err != nil {
 		return fmt.Errorf("core: rename node: %w", err)
-	}
-
-	if addr, err := n.transport.LocalAddress(); err == nil {
-		if tok, err := config.EncodeToken(addr, n.identity.Public(), name); err == nil {
-			n.tokenMu.Lock()
-			n.token = tok
-			n.tokenMu.Unlock()
-		}
 	}
 	n.debugf("core: node renamed to %q", name)
 	return nil
