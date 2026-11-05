@@ -179,6 +179,21 @@ func (n *Node) resolveSubscriptionRef(peerRef, shareRef string) (peerKeyHex, sha
 	return peerKeyHex, shareID
 }
 
+// ResolveLocalShare returns the id of the share this node offers that ref
+// names, for a caller that needs the id itself: an API handler that reports
+// the share back after changing it, say. The mutation methods resolve refs
+// themselves, so there is no need to call this first.
+func (n *Node) ResolveLocalShare(ref string) (string, error) {
+	return n.resolveLocalShareRef(ref)
+}
+
+// ResolveSubscription returns the peer key and share id that peerRef and
+// shareRef name, resolved the same best-effort way the subscription
+// mutation methods resolve them (see resolveSubscriptionRef).
+func (n *Node) ResolveSubscription(peerRef, shareRef string) (peerKeyHex, shareID string) {
+	return n.resolveSubscriptionRef(peerRef, shareRef)
+}
+
 // resolveLocalShareRef resolves a share ref against the shares this node
 // offers.
 func (n *Node) resolveLocalShareRef(ref string) (string, error) {
