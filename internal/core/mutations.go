@@ -423,7 +423,7 @@ func describeShareChange(ch ShareChange, access map[string]string) string {
 
 // --- subscription mutations -------------------------------------------------
 
-// AddSubscription subscribes to a peer's share (SPEC.md §1/§6): validates
+// AddSubscriptionResolved subscribes to a peer's share (SPEC.md §1/§6): validates
 // the peer and share ids and the local path (CheckSubscriptionPath),
 // creates the local path if needed, and persists the subscription. Its
 // effects start watching the local copy and, if already connected to the
@@ -437,27 +437,30 @@ func describeShareChange(ch ShareChange, access map[string]string) string {
 // nil here, and requestSubscriptions never matches it on any later
 // reconnect), so it sits in config looking configured while no bytes ever
 // move.
-func (n *Node) AddSubscription(peerRef, shareRef, localPath, mode string) error {
+//
+// It returns the peer key and share id the refs resolved to, so callers can
+// find the new subscription without re-resolving.
+func (n *Node) AddSubscriptionResolved(peerRef, shareRef, localPath, mode string) (peerKeyHex, shareID string, err error) {
 	if mode != config.ModeMirror && mode != config.ModeReceiveOnly {
-		return fmt.Errorf("core: add subscription: invalid mode %q", mode)
+		return "", "", fmt.Errorf("core: add subscription: invalid mode %q", mode)
 	}
 	pc, err := n.resolvePeerRef(peerRef)
 	if err != nil {
-		return mutationError(MutationInvalid, fmt.Errorf("core: add subscription: %w", err))
+		return "", "", mutationError(MutationInvalid, fmt.Errorf("core: add subscription: %w", err))
 	}
-	peerKeyHex := pc.peerKeyHex
-	shareID, err := n.resolveOfferedShareRef(pc, shareRef)
+	peerKeyHex = pc.peerKeyHex
+	shareID, err = n.resolveOfferedShareRef(pc, shareRef)
 	if err != nil {
-		return mutationError(MutationInvalid, fmt.Errorf("core: add subscription: %w", err))
+		return "", "", mutationError(MutationInvalid, fmt.Errorf("core: add subscription: %w", err))
 	}
 	if err := os.MkdirAll(localPath, 0o700); err != nil {
-		return fmt.Errorf("core: add subscription: create local path: %w", err)
+		return "", "", fmt.Errorf("core: add subscription: create local path: %w", err)
 	}
 	if err := syncsvc.EnsureReservedDir(localPath); errors.Is(err, syncsvc.ErrReservedDirTaken) {
-		return mutationError(MutationConflict, fmt.Errorf("core: add subscription: %w; move it away first", err))
+		return "", "", mutationError(MutationConflict, fmt.Errorf("core: add subscription: %w; move it away first", err))
 	}
 
-	if _, err := n.mutateConfig(func(cfg *config.Config) error {
+	if _, err = n.mutateConfig(func(cfg *config.Config) error {
 		if err := cfg.CheckSubscriptionPath(localPath); err != nil {
 			if errors.Is(err, config.ErrPathOverlap) {
 				return mutationError(MutationConflict, err)
@@ -474,10 +477,16 @@ func (n *Node) AddSubscription(peerRef, shareRef, localPath, mode string) error 
 		})
 		return nil
 	}); err != nil {
-		return fmt.Errorf("core: add subscription: %w", err)
+		return "", "", fmt.Errorf("core: add subscription: %w", err)
 	}
 	n.debugf("core: added subscription to share %s from peer %s at %s [%s]", shareID, peerKeyHex, localPath, mode)
-	return nil
+	return peerKeyHex, shareID, nil
+}
+
+// AddSubscription is AddSubscriptionResolved without the resolved keys.
+func (n *Node) AddSubscription(peerRef, shareRef, localPath, mode string) error {
+	_, _, err := n.AddSubscriptionResolved(peerRef, shareRef, localPath, mode)
+	return err
 }
 
 // RemoveSubscription stops syncing a subscription. Its effects stop its

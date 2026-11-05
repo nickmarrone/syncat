@@ -267,11 +267,14 @@ func (s *Server) handleSubscriptionsAdd(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
-	if err := s.node.AddSubscription(req.Peer, req.ShareID, req.LocalPath, mode); err != nil {
+	peerKey, shareID, err := s.node.AddSubscriptionResolved(req.Peer, req.ShareID, req.LocalPath, mode)
+	if err != nil {
 		writeMutationError(w, err)
 		return
 	}
-	sub := findSubscriptionDTO(s.node.Status(), req.Peer, req.ShareID)
+	// Look the subscription up by the keys core resolved: req.Peer and
+	// req.ShareID may be names or id prefixes.
+	sub := findSubscriptionDTO(s.node.Status(), peerKey, shareID)
 	if sub == nil {
 		writeError(w, http.StatusInternalServerError, "internal", "subscription added but not found afterward")
 		return

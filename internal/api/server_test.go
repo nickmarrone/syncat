@@ -713,6 +713,41 @@ func TestSubscriptionsAddPatchDelete(t *testing.T) {
 	}
 }
 
+// `syncat subscription add alice docs DIR` sends whatever the user typed.
+// The handler must look the new subscription up by the keys core resolved,
+// not by the raw refs (#42).
+func TestSubscriptionsAddByPeerNameAndPrefix(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		ref  func(peerID string) string
+	}{
+		{"name", func(string) string { return "bob" }},
+		{"id prefix", func(id string) string { return id[:8] }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, _, _ := newTestServer(t)
+			w := doRequest(t, srv, http.MethodPost, "/api/peers", testToken, map[string]string{"token": fakePeerToken(t, "bob"), "name": "bob"})
+			if w.Code != http.StatusCreated {
+				t.Fatalf("add peer: status = %d, want 201; body: %s", w.Code, w.Body.String())
+			}
+			var peer wire.Peer
+			decodeJSONBody(t, w, &peer)
+
+			w = doRequest(t, srv, http.MethodPost, "/api/subscriptions", testToken, map[string]any{
+				"peer": tc.ref(peer.ID), "share_id": "bb22cc33", "local_path": filepath.Join(t.TempDir(), "sub"), "mode": "mirror",
+			})
+			if w.Code != http.StatusCreated {
+				t.Fatalf("add subscription by %s: status = %d, want 201; body: %s", tc.name, w.Code, w.Body.String())
+			}
+			var sub wire.Subscription
+			decodeJSONBody(t, w, &sub)
+			if sub.ID != peer.ID+":bb22cc33" || sub.Mode != "mirror" {
+				t.Fatalf("subscription = %+v, want id %s:bb22cc33 mirror", sub, peer.ID)
+			}
+		})
+	}
+}
+
 func TestSubscriptionsAddBadMode(t *testing.T) {
 	srv, _, _ := newTestServer(t)
 	w := doRequest(t, srv, http.MethodPost, "/api/subscriptions", testToken, map[string]any{
