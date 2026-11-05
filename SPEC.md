@@ -212,8 +212,13 @@ sha256, version_json, deleted, updated_at)` plus `peer_files(...)` mirroring the
 - The file is re-read at the start of every scan, so an edit takes effect on the next
   rescan with no restart. An unreadable or malformed one keeps the previously compiled
   rules (never "ignore nothing"); individual bad lines are skipped and logged.
-- Symlinks are **not followed**; the symlink entry itself (target string) syncs on
-  Unix and is skipped with a warning on Windows.
+- Symlinks are **not synced and not followed**. The scanner skips each one with a
+  warning; a peer's entry of type `symlink` is rejected, live or as a tombstone; and
+  no apply step writes, renames, or deletes through a symlinked directory, so a link
+  inside a share can never carry a peer's change outside it. A symlink the trash kept
+  is restored to disk but not indexed. `symlink` stays in `FileInfo.type` so syncing
+  them can be added later (relative targets inside the share only) without a
+  protocol change.
 
 ### Versioning & conflict detection
 - Per-file **version vector**: map of `node-short-id → counter` (short id = first

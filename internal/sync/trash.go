@@ -669,51 +669,60 @@ func (tr *Trash) Restore(ctx context.Context, store *index.Store, nodeID, shareI
 			errs = append(errs, ctx.Err())
 			break
 		}
-		row, err := tr.restoreOne(ctx, store, nodeID, shareID, root, eventDir, it, replaced)
+		row, indexed, err := tr.restoreOne(ctx, store, nodeID, shareID, root, eventDir, it, replaced)
 		if err != nil {
 			errs = append(errs, err)
 			continue
 		}
-		rows = append(rows, row)
+		if indexed {
+			rows = append(rows, row)
+		}
 	}
 	pruneEmptyEvent(root, eventID)
 	return rows, errors.Join(errs...)
 }
 
-func (tr *Trash) restoreOne(ctx context.Context, store *index.Store, nodeID, shareID, root, eventDir string, it TrashItem, replaced *TrashEvent) (index.FileRow, error) {
+// restoreOne moves one item back into the share and, unless it is a
+// symlink, records it in the index. A symlink goes back on disk only:
+// symlinks are never synced (SPEC.md §5), so indexing one would offer it
+// to peers. indexed reports whether row was written.
+func (tr *Trash) restoreOne(ctx context.Context, store *index.Store, nodeID, shareID, root, eventDir string, it TrashItem, replaced *TrashEvent) (row index.FileRow, indexed bool, err error) {
 	src, err := JoinSharePath(eventDir, it.stored)
 	if err != nil {
-		return index.FileRow{}, fmt.Errorf("sync: trash: restore %s: %w", it.RelPath, err)
+		return index.FileRow{}, false, fmt.Errorf("sync: trash: restore %s: %w", it.RelPath, err)
 	}
 	dest, err := JoinSharePath(root, it.RelPath)
 	if err != nil {
-		return index.FileRow{}, fmt.Errorf("sync: trash: restore %s: %w", it.RelPath, err)
+		return index.FileRow{}, false, fmt.Errorf("sync: trash: restore %s: %w", it.RelPath, err)
 	}
 	if fi, err := os.Lstat(dest); err == nil {
 		if fi.IsDir() {
-			return index.FileRow{}, fmt.Errorf("sync: trash: restore %s: %w", it.RelPath, ErrRestoreDestExists)
+			return index.FileRow{}, false, fmt.Errorf("sync: trash: restore %s: %w", it.RelPath, ErrRestoreDestExists)
 		}
 		if err := replaced.Put(ctx, it.RelPath, dest, TrashOverwritten); err != nil {
-			return index.FileRow{}, fmt.Errorf("sync: trash: restore %s: keep the file it replaces: %w", it.RelPath, err)
+			return index.FileRow{}, false, fmt.Errorf("sync: trash: restore %s: keep the file it replaces: %w", it.RelPath, err)
 		}
 	} else if !os.IsNotExist(err) {
-		return index.FileRow{}, fmt.Errorf("sync: trash: restore %s: stat destination: %w", it.RelPath, err)
+		return index.FileRow{}, false, fmt.Errorf("sync: trash: restore %s: stat destination: %w", it.RelPath, err)
 	}
 	if err := os.MkdirAll(filepath.Dir(dest), 0o700); err != nil {
-		return index.FileRow{}, fmt.Errorf("sync: trash: restore %s: mkdir: %w", it.RelPath, err)
+		return index.FileRow{}, false, fmt.Errorf("sync: trash: restore %s: mkdir: %w", it.RelPath, err)
 	}
 	if err := tr.moveOrCopy(src, dest); err != nil {
-		return index.FileRow{}, fmt.Errorf("sync: trash: restore %s: %w", it.RelPath, err)
+		return index.FileRow{}, false, fmt.Errorf("sync: trash: restore %s: %w", it.RelPath, err)
 	}
 
-	row, err := buildRestoredRow(ctx, store, nodeID, shareID, it.RelPath, dest)
+	if fi, err := os.Lstat(dest); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		return index.FileRow{}, false, nil
+	}
+	row, err = buildRestoredRow(ctx, store, nodeID, shareID, it.RelPath, dest)
 	if err != nil {
-		return index.FileRow{}, err
+		return index.FileRow{}, false, err
 	}
 	if err := store.PutFile(ctx, row); err != nil {
-		return index.FileRow{}, fmt.Errorf("sync: trash: restore %s: put index row: %w", it.RelPath, err)
+		return index.FileRow{}, false, fmt.Errorf("sync: trash: restore %s: put index row: %w", it.RelPath, err)
 	}
-	return row, nil
+	return row, true, nil
 }
 
 // buildRestoredRow stats/hashes the just-restored file at destAbs and
@@ -733,31 +742,24 @@ func buildRestoredRow(ctx context.Context, store *index.Store, nodeID, shareID, 
 		return index.FileRow{}, fmt.Errorf("sync: trash: restore %s: read current version: %w", relpath, err)
 	}
 
-	typ := protocol.FileTypeFile
+	if !fi.Mode().IsRegular() {
+		return index.FileRow{}, fmt.Errorf("sync: trash: restore %s: not a regular file", relpath)
+	}
 	h := sha256.New()
-	if fi.Mode()&os.ModeSymlink != 0 {
-		typ = protocol.FileTypeSymlink
-		target, err := os.Readlink(destAbs)
-		if err != nil {
-			return index.FileRow{}, fmt.Errorf("sync: trash: restore %s: readlink: %w", relpath, err)
-		}
-		h.Write([]byte(target))
-	} else {
-		f, err := os.Open(destAbs)
-		if err != nil {
-			return index.FileRow{}, fmt.Errorf("sync: trash: restore %s: read: %w", relpath, err)
-		}
-		_, err = io.Copy(h, f)
-		f.Close()
-		if err != nil {
-			return index.FileRow{}, fmt.Errorf("sync: trash: restore %s: read: %w", relpath, err)
-		}
+	f, err := os.Open(destAbs)
+	if err != nil {
+		return index.FileRow{}, fmt.Errorf("sync: trash: restore %s: read: %w", relpath, err)
+	}
+	_, err = io.Copy(h, f)
+	f.Close()
+	if err != nil {
+		return index.FileRow{}, fmt.Errorf("sync: trash: restore %s: read: %w", relpath, err)
 	}
 
 	return index.FileRow{
 		ShareID:   shareID,
 		RelPath:   relpath,
-		Type:      typ,
+		Type:      protocol.FileTypeFile,
 		Size:      fi.Size(),
 		MTimeNS:   fi.ModTime().UnixNano(),
 		Mode:      uint32(fi.Mode().Perm()),

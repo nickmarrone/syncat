@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -414,8 +415,7 @@ func (s *Session) handleFileRequest(ctx context.Context, req protocol.FileReques
 	}
 	response.setVersion(row.Version)
 
-	absPath, err := JoinSharePath(cfg.Root, req.RelPath)
-	if err != nil {
+	if _, err := JoinSharePath(cfg.Root, req.RelPath); err != nil {
 		// Should be unreachable in practice: an invalid relpath can't have
 		// made it into the index (ValidateRelPath gates every wire path
 		// before it becomes an Action, see reconcile.go/path.go). Treat
@@ -434,20 +434,17 @@ func (s *Session) handleFileRequest(ctx context.Context, req protocol.FileReques
 	}
 
 	if row.Type == protocol.FileTypeSymlink {
-		if err := s.streamSymlink(ctx, absPath, row, response); err != nil {
-			if errors.Is(err, context.Canceled) {
-				return
-			}
-			code := protocol.ErrCodeTransferFailed
-			if errors.Is(err, errFileChangedDuringTransfer) {
-				code = protocol.ErrCodeVersionChanged
-			}
-			response.fail(code, err.Error())
-		}
+		// Symlinks are never synced (SPEC.md §5) and the scanner never
+		// indexes one, so a row like this predates that rule. Refuse it
+		// rather than send where the link points.
+		response.fail(protocol.ErrCodeFileNotFound, "symlinks are not synced")
 		return
 	}
 
-	f, err := os.Open(absPath)
+	// Open through an os.Root so a file swapped for a symlink since it
+	// was indexed cannot stream content from outside the share before
+	// the end-of-transfer hash check notices.
+	f, err := openInShare(cfg.Root, req.RelPath)
 	if err != nil {
 		response.fail(protocol.ErrCodeFileNotFound, "open: "+err.Error())
 		return
@@ -523,44 +520,17 @@ func (s *Session) streamFile(ctx context.Context, f *os.File, row index.FileRow,
 	return nil
 }
 
-// streamSymlink sends a symlink's target path as its "content" (SPEC.md §5).
-// Unlike a regular file, the target is one atomic, small read, so it can be
-// fully verified against the indexed size and hash before any frame is queued.
-// Lstat on both sides also detects replacement during the read without
-// following the link outside the share.
-func (s *Session) streamSymlink(ctx context.Context, absPath string, row index.FileRow, response *transferResponse) error {
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	default:
-	}
-	before, err := os.Lstat(absPath)
+// openInShare opens the share-relative relpath for reading through an
+// os.Root on shareRoot, so no symlink on the way (or at the end) can
+// resolve it to a file outside the share. relpath must already have passed
+// JoinSharePath.
+func openInShare(shareRoot, relpath string) (*os.File, error) {
+	root, err := os.OpenRoot(shareRoot)
 	if err != nil {
-		return fmt.Errorf("lstat before readlink: %w", err)
+		return nil, err
 	}
-	if before.Mode()&os.ModeSymlink == 0 {
-		return errFileChangedDuringTransfer
-	}
-	target, err := os.Readlink(absPath)
-	if err != nil {
-		return fmt.Errorf("readlink: %w", err)
-	}
-	data := []byte(target)
-	after, err := os.Lstat(absPath)
-	if err != nil {
-		return fmt.Errorf("lstat after readlink: %w", err)
-	}
-	sum := sha256.Sum256(data)
-	if !os.SameFile(before, after) || before.Size() != after.Size() || before.ModTime() != after.ModTime() || int64(len(data)) != row.Size || !bytes.Equal(sum[:], row.SHA256) {
-		return errFileChangedDuringTransfer
-	}
-	if err := response.send(data); err != nil {
-		return fmt.Errorf("write symlink target: %w", err)
-	}
-	if err := response.finish(); err != nil {
-		return fmt.Errorf("write symlink eof: %w", err)
-	}
-	return nil
+	defer root.Close()
+	return root.Open(filepath.FromSlash(relpath))
 }
 
 func (s *Session) registerServe(id string, cancel context.CancelFunc) bool {

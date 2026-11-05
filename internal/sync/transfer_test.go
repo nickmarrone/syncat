@@ -53,66 +53,21 @@ func symlinkServeSession(t *testing.T, target, indexedTarget string) (*Session, 
 	return s, protocol.NewReader(far), req
 }
 
-func TestSymlinkServeRejectsTargetDifferentFromIndex(t *testing.T) {
-	s, reader, req := symlinkServeSession(t, "new-target", "old-target")
-	done := make(chan struct{})
-	go func() {
-		s.handleFileRequest(context.Background(), req)
-		close(done)
-	}()
-	typ, payload, err := reader.ReadFrame()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if typ != protocol.MsgError {
-		t.Fatalf("response type = %s, want Error", typ)
-	}
-	var got protocol.Error
-	if err := protocol.DecodeAndValidateMessage(payload, &got); err != nil {
-		t.Fatal(err)
-	}
-	if got.Code != protocol.ErrCodeVersionChanged || got.TransferID != req.TransferID {
-		t.Fatalf("error = %+v, want version_changed for transfer", got)
-	}
-	<-done
-}
-
-func TestSymlinkServeEmitsVerifiedTargetAndEOF(t *testing.T) {
+// Nothing indexes a symlink any more (SPEC.md §5), but if a row claims
+// one, the holder refuses it rather than sending the link's target.
+func TestServeRefusesSymlinkRow(t *testing.T) {
 	s, reader, req := symlinkServeSession(t, "same-target", "same-target")
 	done := make(chan struct{})
 	go func() {
 		s.handleFileRequest(context.Background(), req)
 		close(done)
 	}()
-
-	typ, payload, err := reader.ReadFrame()
+	typ, _, err := reader.ReadFrame()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if typ != protocol.MsgFileChunk {
-		t.Fatalf("first response type = %s, want FileChunk", typ)
-	}
-	hdr, data, err := protocol.DecodeFileChunk(payload)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(data) != "same-target" || hdr.EOF || hdr.Offset != 0 {
-		t.Fatalf("target chunk = (%+v, %q)", hdr, data)
-	}
-
-	typ, payload, err = reader.ReadFrame()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if typ != protocol.MsgFileChunk {
-		t.Fatalf("second response type = %s, want FileChunk", typ)
-	}
-	hdr, data, err = protocol.DecodeFileChunk(payload)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !hdr.EOF || hdr.Offset != int64(len("same-target")) || len(data) != 0 {
-		t.Fatalf("EOF chunk = (%+v, %q)", hdr, data)
+	if typ != protocol.MsgError {
+		t.Fatalf("response type = %s, want Error", typ)
 	}
 	<-done
 }

@@ -401,7 +401,7 @@ type Clock func() time.Time
 // filenames generated; if nil, time.Now is used.
 //
 // Every remote FileInfo is validated with ValidateRelPath before use; an
-// entry with an invalid relpath is dropped (reported as ActionNone with an
+// entry with an invalid relpath, or one claiming to be a symlink, is dropped (reported as ActionNone with an
 // explanatory Reason) rather than acted on, so a hostile or buggy peer's
 // IndexUpdate can never smuggle a traversal attempt into an Action for a
 // caller to (mis)trust. Local rows come from this node's own index and are
@@ -442,7 +442,7 @@ func Reconcile(local, remote []protocol.FileInfo, nodeID string, dir Direction, 
 		// whose ValidateRelPath check runs first. Never mask that signal
 		// with "ignored" just because the path also matched a rule: a
 		// traversal attempt should be visible as a traversal attempt.
-		malformed := hasRemote && ValidateRelPath(r.RelPath) != nil
+		malformed := hasRemote && (ValidateRelPath(r.RelPath) != nil || r.Type == protocol.FileTypeSymlink)
 		if !malformed && ignore != nil && ignore(p, isDirEntry(l, hasLocal, r, hasRemote)) {
 			// Decided here rather than inside reconcileOne so that a
 			// single branch covers every outcome the algebra could have
@@ -487,6 +487,13 @@ func reconcileOne(relpath string, l protocol.FileInfo, hasLocal bool, r protocol
 	if hasRemote {
 		if err := ValidateRelPath(r.RelPath); err != nil {
 			return Action{Kind: ActionNone, RelPath: relpath, Reason: "rejected: invalid remote relpath: " + err.Error()}
+		}
+		// Symlinks are never synced (SPEC.md §5): our own scanner skips
+		// them, so only a hostile or buggy peer sends one. Acting on it,
+		// live or as a tombstone, could plant a link that later writes
+		// follow out of the share, or delete a file of the same name.
+		if r.Type == protocol.FileTypeSymlink {
+			return Action{Kind: ActionNone, RelPath: relpath, Reason: "rejected: remote entry is a symlink, and symlinks are not synced"}
 		}
 	}
 
