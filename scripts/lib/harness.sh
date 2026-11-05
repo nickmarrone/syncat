@@ -500,6 +500,52 @@ conflict_copy_names_match() {
 
 sha_of() { sha256sum "$1" 2>/dev/null | cut -d' ' -f1; }
 
+# file_count DIR echoes how many entries DIR holds, ignoring syncat's own
+# reserved .syncat/ directory (ls -A would count it).
+file_count() { find "$1" -mindepth 1 -maxdepth 1 ! -name .syncat 2>/dev/null | wc -l | tr -d ' '; }
+file_count_is() { [ "$(file_count "$1")" = "$2" ]; }
+
+# hold_count NAME SHARE_ID [PEER_KEY] echoes how many holds NAME reports on
+# that share, optionally only the one on its link with PEER_KEY. An empty
+# PEER_KEY on a hold means NAME's own copy is held.
+hold_count() {
+	nx "$1" status --json 2>/dev/null |
+		jq -r --arg s "$2" --arg p "${3:-}" '[.holds[]? | select(.share_id==$s) | select($p=="" or .peer_key==$p)] | length'
+}
+has_hold() { [ "$(hold_count "$@")" -gt 0 ] 2>/dev/null; }
+no_hold() { [ "$(hold_count "$@")" = "0" ]; }
+
+# remote_share_access NAME SHARE_ID is NAME's access to a peer's share:
+# none, pending, granted, denied, or revoked.
+remote_share_access() {
+	nx "$1" remote ls --json 2>/dev/null | jq -r --arg id "$2" '.[]? | select(.share_id==$id) | .access // empty'
+}
+remote_share_access_is() { [ "$(remote_share_access "$1" "$2")" = "$3" ]; }
+
+# approval_id NAME PATTERN echoes the first pending approval on NAME whose
+# id matches PATTERN (ids are peer-<key> or share-<share id>-<key>).
+approval_id() {
+	nx "$1" approvals 2>/dev/null | awk -F'\t' -v pat="$2" '$1 ~ pat { print $1; exit }'
+}
+approval_pending() { [ -n "$(approval_id "$1" "$2")" ]; }
+no_approval_pending() { [ -z "$(approval_id "$1" "$2")" ]; }
+
+# subscription_warned NAME SHARE_ID RELPATH succeeds once NAME's
+# subscription to SHARE_ID carries a warning about RELPATH (a local edit a
+# read-only or receive-only subscription refused to send).
+subscription_warned() {
+	[ -n "$(nx "$1" status --json 2>/dev/null | jq -r --arg s "$2" --arg r "$3" \
+		'.subscriptions[]? | select(.share_id==$s) | .warnings[]? | select(.rel_path==$r) | .rel_path')" ]
+}
+
+# trash_kind NAME SHARE_ID RELPATH echoes the kind (deleted, overwritten,
+# ...) of the newest trashed copy of RELPATH, or nothing.
+trash_kind() {
+	nx "$1" trash ls --json "$2" 2>/dev/null |
+		jq -r --arg r "$3" '[.events[]?.items[]? | select(.rel_path==$r)][0].kind // empty'
+}
+trash_kind_is() { [ "$(trash_kind "$1" "$2" "$3")" = "$4" ]; }
+
 # --- assertions ------------------------------------------------------------
 
 # assert_clean_peer is run at the end of every scenario. A peer reported as
