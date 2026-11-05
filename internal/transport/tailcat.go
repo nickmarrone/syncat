@@ -27,21 +27,24 @@ const drainTimeout = 5 * time.Second
 // TailcatTransport is the production [Transport], carrying the syncat
 // protocol stream over a tailcat WireGuard tunnel relayed through DERP.
 //
-// Only port [SyncatPort] is ever served: [tailcat.Server.OnTCP] returns a
-// handler for that port alone (everything else gets a RST), and
-// [tailcat.Server.ServedTCPPorts] independently restricts the packet
-// filter to the same port for defense in depth. Both are set before Start,
-// as tailcat requires.
+// Only port [SyncatPort] is ever served: Start listens on that port alone
+// with [tailcat.Server.Listen], and [tailcat.Server.ServedTCPPorts] is set
+// to an empty, non-nil list, so the packet filter admits only listened-on
+// ports and drops everything else before it reaches the TCP stack. OnTCP is
+// left nil, so even a packet the filter let through to another port would
+// get a RST.
 type TailcatTransport struct {
 	key  *tailcat.PrivateKey // node identity; Public.RegionID is baked in (see config.LoadOrCreateTailcatKey)
 	logf func(string, ...any)
 
-	mu     sync.Mutex
-	server tailcatServer
-	state  tailcatTransportState
+	mu       sync.Mutex
+	server   tailcatServer
+	listener net.Listener  // set once started; closed by Close
+	accepted chan struct{} // closed when the accept loop exits
+	state    tailcatTransportState
 	// newServer is replaceable in tests so startup can be paused at the
 	// exact lifecycle boundaries without contacting DERP.
-	newServer func(func(net.Conn)) tailcatServer
+	newServer func() tailcatServer
 
 	clientsMu sync.Mutex
 	clients   map[string]*peerClient // keyed by peer addr (tailcat.Addr string); reused across dials
@@ -61,7 +64,7 @@ type peerClient struct {
 }
 
 type tailcatServer interface {
-	Start() error
+	Listen(ctx context.Context, network, address string) (net.Listener, error)
 	DrainTCP(context.Context) error
 	Close() error
 	TailcatAddr() tailcat.Addr
@@ -97,23 +100,18 @@ func NewTailcatTransport(key *tailcat.PrivateKey, logf func(string, ...any)) *Ta
 	}
 	logf = redactingLogf(logf, string(key.Public.Addr()), fmt.Sprint(key.Public.PresharedKey))
 	t := &TailcatTransport{key: key, logf: logf}
-	t.newServer = func(onConn func(net.Conn)) tailcatServer {
-		srv := &tailcat.Server{
+	t.newServer = func() tailcatServer {
+		return &tailcat.Server{
 			Key:      t.key.Private,
 			RegionID: t.key.Public.RegionID,
 			Logf:     t.logf,
 			// A zero value makes tailcat generate a new PSK, changing this
 			// node's address and invalidating persisted pairing tokens.
 			PresharedKey: t.key.Public.PresharedKey,
+			// Non-nil but empty: the packet filter then admits only ports
+			// with an active Listen listener, i.e. SyncatPort alone.
+			ServedTCPPorts: []filter.PortRange{},
 		}
-		srv.OnTCP = func(port uint16) func(net.Conn) {
-			if port != SyncatPort {
-				return nil
-			}
-			return onConn
-		}
-		srv.ServedTCPPorts = []filter.PortRange{{First: SyncatPort, Last: SyncatPort}}
-		return srv
 	}
 	return t
 }
@@ -132,64 +130,62 @@ func (t *TailcatTransport) Start(ctx context.Context, onConn func(net.Conn)) err
 		}
 		return errors.New("transport: tailcat: Start called more than once")
 	}
-	srv := t.newServer(onConn)
+	srv := t.newServer()
 	t.server = srv
 	t.state = tailcatStateStarting
 	t.mu.Unlock()
 
-	// Server.Start does its own DERP-map fetch/region resolution using
-	// context.Background() internally (it takes no context), so it isn't
-	// directly cancelable. Run it in a goroutine and race it against ctx:
-	// on ctx expiry we return promptly. The startup goroutine observes the
-	// abandoned lifecycle state when it eventually returns and closes every
-	// resource that late startup created.
-	errCh := make(chan error, 1)
-	go func() {
-		err := srv.Start()
-		t.mu.Lock()
-		abandoned := t.state != tailcatStateStarting
-		if !abandoned {
-			if err == nil {
-				t.state = tailcatStateStarted
-			} else {
-				t.state = tailcatStateFailed
-			}
-		}
-		t.mu.Unlock()
+	// Listen starts the server, with ctx bounding the startup network work
+	// (fetching the DERP map and picking a region), and cleans up whatever
+	// a failed startup created. What follows it is local setup, so Start
+	// returns promptly on cancellation without a goroutine racing ctx.
+	ln, err := srv.Listen(ctx, "tcp", fmt.Sprintf(":%d", SyncatPort))
 
-		// Start may allocate resources before returning an error, and a
-		// canceled/closed transport may finish successfully much later. The
-		// startup goroutine is the only code that knows Start has returned,
-		// so it owns cleanup in both cases.
-		if err != nil || abandoned {
-			_ = srv.Close()
+	t.mu.Lock()
+	// Close may have run while Listen was in flight. It leaves the server
+	// alone in that window (tailcat's Server.Close must not race its own
+	// startup), so whatever Listen produced is ours to close here.
+	abandoned := t.state != tailcatStateStarting
+	switch {
+	case abandoned:
+	case err != nil:
+		t.state = tailcatStateFailed
+	default:
+		t.state = tailcatStateStarted
+		t.listener = ln
+		t.accepted = make(chan struct{})
+	}
+	accepted := t.accepted
+	t.mu.Unlock()
+
+	if err != nil || abandoned {
+		if ln != nil {
+			_ = ln.Close()
 		}
-		if err == nil && abandoned {
+		_ = srv.Close()
+		if err == nil {
 			err = errors.New("transport closed during startup")
 		}
-		errCh <- err
-	}()
+		return fmt.Errorf("transport: tailcat: start: %w", err)
+	}
 
-	select {
-	case err := <-errCh:
+	go t.acceptLoop(ln, onConn, accepted)
+	return nil
+}
+
+// acceptLoop hands each inbound connection to onConn on its own goroutine,
+// as [Transport.Start] promises, until the listener is closed.
+func (t *TailcatTransport) acceptLoop(ln net.Listener, onConn func(net.Conn), done chan<- struct{}) {
+	defer close(done)
+	for {
+		conn, err := ln.Accept()
 		if err != nil {
-			return fmt.Errorf("transport: tailcat: start: %w", err)
+			if !errors.Is(err, net.ErrClosed) {
+				t.logf("transport: tailcat: accept: %v", err)
+			}
+			return
 		}
-		return nil
-	case <-ctx.Done():
-		t.mu.Lock()
-		state := t.state
-		if state == tailcatStateStarting || state == tailcatStateStarted {
-			t.state = tailcatStateClosed
-		}
-		t.mu.Unlock()
-		// If startup won the mutex race and fully completed just before this
-		// select chose cancellation, its goroutine no longer considers itself
-		// abandoned, so this path owns the close.
-		if state == tailcatStateStarted {
-			_ = srv.Close()
-		}
-		return fmt.Errorf("transport: tailcat: start: %w", ctx.Err())
+		go onConn(conn)
 	}
 }
 
@@ -386,10 +382,17 @@ func (t *TailcatTransport) Close() error {
 	}
 	state := t.state
 	t.state = tailcatStateClosed
-	srv := t.server
+	srv, ln, accepted := t.server, t.listener, t.accepted
 	t.mu.Unlock()
 
 	var errs []error
+
+	// Stop accepting first, so no connection arrives after the drains below
+	// have started, and wait for the accept loop so it never outlives Close.
+	if ln != nil {
+		_ = ln.Close()
+		<-accepted
+	}
 
 	t.clientsMu.Lock()
 	clients := t.clients

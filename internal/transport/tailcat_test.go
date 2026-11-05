@@ -15,35 +15,98 @@ import (
 	"github.com/tailscale/tailcat"
 )
 
+// fakeTailcatServer stands in for tailcat.Server so startup can be paused at
+// exact lifecycle boundaries without contacting DERP. Its Listen behaves like
+// tailcat's: it blocks for startup, honors ctx while doing so (unless
+// ignoreCtx models the window after the DERP-map fetch, where tailcat no
+// longer consults ctx), and returns a listener for the one port.
 type fakeTailcatServer struct {
 	started   chan struct{}
 	release   chan struct{}
+	ignoreCtx bool
 	startOnce sync.Once
 	startErr  error
 	closed    atomic.Int32
+	ln        *fakeListener
 }
 
-func (s *fakeTailcatServer) Start() error {
+func (s *fakeTailcatServer) Listen(ctx context.Context, network, address string) (net.Listener, error) {
+	if network != "tcp" || address != fmt.Sprintf(":%d", SyncatPort) {
+		return nil, fmt.Errorf("fake: Listen(%q, %q), want tcp on SyncatPort only", network, address)
+	}
 	s.startOnce.Do(func() { close(s.started) })
 	if s.release != nil {
-		<-s.release
+		if s.ignoreCtx {
+			<-s.release
+		} else {
+			select {
+			case <-s.release:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
 	}
-	return s.startErr
+	if s.startErr != nil {
+		return nil, s.startErr
+	}
+	s.ln = newFakeListener()
+	return s.ln, nil
 }
 func (s *fakeTailcatServer) DrainTCP(context.Context) error { return nil }
 func (s *fakeTailcatServer) Close() error {
 	s.closed.Add(1)
+	if s.ln != nil {
+		_ = s.ln.Close()
+	}
 	return nil
 }
 func (s *fakeTailcatServer) TailcatAddr() tailcat.Addr { return "fake" }
 
+// fakeListener is a net.Listener whose connections the test hands in.
+type fakeListener struct {
+	conns     chan net.Conn
+	closed    chan struct{}
+	closeOnce sync.Once
+}
+
+func newFakeListener() *fakeListener {
+	return &fakeListener{conns: make(chan net.Conn), closed: make(chan struct{})}
+}
+
+func (l *fakeListener) Accept() (net.Conn, error) {
+	select {
+	case c := <-l.conns:
+		return c, nil
+	case <-l.closed:
+		return nil, net.ErrClosed
+	}
+}
+func (l *fakeListener) Close() error {
+	l.closeOnce.Do(func() { close(l.closed) })
+	return nil
+}
+func (l *fakeListener) Addr() net.Addr { return &net.TCPAddr{Port: int(SyncatPort)} }
+
+func (l *fakeListener) isClosed() bool {
+	select {
+	case <-l.closed:
+		return true
+	default:
+		return false
+	}
+}
+
 func transportWithFakeServer(s *fakeTailcatServer) *TailcatTransport {
 	t := NewTailcatTransport(tailcat.NewPrivateKey(), nil)
-	t.newServer = func(func(net.Conn)) tailcatServer { return s }
+	t.newServer = func() tailcatServer { return s }
 	return t
 }
 
-func TestTailcatStartCancellationClosesLateServer(t *testing.T) {
+// TestTailcatStartCancellationReturnsPromptly pins that cancelling ctx during
+// startup ends Start with the context error and leaves nothing running,
+// synchronously: Listen honors ctx, so there is no late server to clean up
+// after Start returns.
+func TestTailcatStartCancellationReturnsPromptly(t *testing.T) {
 	srv := &fakeTailcatServer{started: make(chan struct{}), release: make(chan struct{})}
 	tr := transportWithFakeServer(srv)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -54,21 +117,23 @@ func TestTailcatStartCancellationClosesLateServer(t *testing.T) {
 	if err := <-result; !errors.Is(err, context.Canceled) {
 		t.Fatalf("Start error = %v, want context cancellation", err)
 	}
-	close(srv.release)
-	deadline := time.Now().Add(time.Second)
-	for srv.closed.Load() != 1 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
 	if got := srv.closed.Load(); got != 1 {
-		t.Fatalf("late-started server closed %d times, want once", got)
+		t.Fatalf("server closed %d times by the time Start returned, want once", got)
 	}
 	if _, err := tr.LocalAddress(); err == nil {
 		t.Fatal("LocalAddress succeeded after canceled startup")
 	}
+	if err := tr.Start(context.Background(), func(net.Conn) {}); err == nil {
+		t.Fatal("second Start succeeded after canceled startup")
+	}
 }
 
+// TestTailcatCloseDuringStartCleansUpAfterStartReturns covers Close landing
+// while Listen is in a stretch that no longer consults ctx. Close must not
+// touch the server mid-startup, so Start, once Listen returns, owns closing
+// both the listener and the server, and must not report success.
 func TestTailcatCloseDuringStartCleansUpAfterStartReturns(t *testing.T) {
-	srv := &fakeTailcatServer{started: make(chan struct{}), release: make(chan struct{})}
+	srv := &fakeTailcatServer{started: make(chan struct{}), release: make(chan struct{}), ignoreCtx: true}
 	tr := transportWithFakeServer(srv)
 	result := make(chan error, 1)
 	go func() { result <- tr.Start(context.Background(), func(net.Conn) {}) }()
@@ -76,12 +141,18 @@ func TestTailcatCloseDuringStartCleansUpAfterStartReturns(t *testing.T) {
 	if err := tr.Close(); err != nil {
 		t.Fatalf("Close during Start: %v", err)
 	}
+	if got := srv.closed.Load(); got != 0 {
+		t.Fatalf("Close touched the server %d times while it was still starting, want 0", got)
+	}
 	close(srv.release)
 	if err := <-result; err == nil {
 		t.Fatal("Start succeeded after Close won the lifecycle race")
 	}
 	if got := srv.closed.Load(); got != 1 {
 		t.Fatalf("server closed %d times, want once", got)
+	}
+	if !srv.ln.isClosed() {
+		t.Fatal("listener from the abandoned startup was left open")
 	}
 }
 
@@ -102,6 +173,54 @@ func TestTailcatStartFailureClosesPartialServerAndStaysFailed(t *testing.T) {
 	}
 	if err := tr.Start(context.Background(), func(net.Conn) {}); err == nil {
 		t.Fatal("second Start succeeded after failed startup")
+	}
+}
+
+// TestTailcatAcceptLoopDeliversUntilClose pins the accept loop that replaced
+// tailcat's OnTCP hook: each accepted connection reaches onConn, on its own
+// goroutine so a slow handler cannot hold up the next one, and Close stops
+// the loop before returning.
+func TestTailcatAcceptLoopDeliversUntilClose(t *testing.T) {
+	srv := &fakeTailcatServer{started: make(chan struct{})}
+	tr := transportWithFakeServer(srv)
+
+	block := make(chan struct{})
+	got := make(chan net.Conn, 2)
+	if err := tr.Start(context.Background(), func(c net.Conn) {
+		got <- c
+		<-block // a handler that never returns on its own
+	}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer close(block)
+
+	for i := range 2 {
+		a, b := net.Pipe()
+		defer a.Close()
+		defer b.Close()
+		select {
+		case srv.ln.conns <- a:
+		case <-time.After(time.Second):
+			t.Fatalf("accept loop did not take connection %d (blocked behind a running handler?)", i)
+		}
+		select {
+		case c := <-got:
+			if c != a {
+				t.Fatalf("onConn got %v, want the accepted connection", c)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("connection %d never reached onConn", i)
+		}
+	}
+
+	if err := tr.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if !srv.ln.isClosed() {
+		t.Fatal("Close left the listener open")
+	}
+	if got := srv.closed.Load(); got != 1 {
+		t.Fatalf("server closed %d times, want once", got)
 	}
 }
 
