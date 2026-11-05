@@ -26,7 +26,7 @@ Fixed decisions:
 - **"Requires approval"** gates *peer access to a share* (not individual changes).
 - **Interface:** headless CLI daemon serving a web UI on localhost; CLI subcommands drive the same REST API.
 - **Safety:** a *hold* stops any change that looks like a disaster (missing or emptied share root, bulk delete) from being recorded or spread, on both the sending and receiving side (§7a); a *trash* inside each synced folder undoes what peers delete or overwrite (§7). syncat is **not a backup** and does not provide point-in-time recovery; users are pointed to restic or filesystem snapshots. See docs/adr/0001-trash-lives-in-the-share-hold-guards-disasters.md.
-- **Transfers:** whole-file in v1 (with resume); block-level delta specified in §11 as v2.
+- **Transfers:** whole-file in v1; an interrupted transfer restarts from byte 0. Resume and block-level delta are future work (§11).
 - **UI stack:** vanilla HTML/CSS/JS embedded via `go:embed` — single binary, no build step.
 
 ## 1. Overview
@@ -167,7 +167,7 @@ preceded by a small CBOR header (own type byte). Max frame 4 MiB.
 | `SubscribeRequest` | subscriber → offerer | `{share_id}` — request access; offerer auto-grants if `approval_required=false`, else queues for UI approval |
 | `AccessUpdate` | offerer → subscriber | `{share_id, access: granted\|denied\|revoked}` |
 | `IndexUpdate` | both (per granted share, respecting direction rules §5) | `{share_id, files: [FileInfo…], full: bool}` — full snapshot on first sync/reconnect, deltas after |
-| `FileRequest` | puller → holder | `{share_id, relpath, version, offset}` — offset enables resume |
+| `FileRequest` | puller → holder | `{share_id, relpath, version, offset}` — `offset` is reserved for resume (§11): v1 pullers send 0 and holders reject anything else with `unsupported_offset` |
 | `FileChunk` | holder → puller | header `{share_id, relpath, version, offset, eof}` + ≤1 MiB raw bytes |
 | `Ping`/`Pong` | both, 30s idle | `{}` — 90s without traffic ⇒ reconnect |
 | `Error` | both | `{code, msg}` |
@@ -183,7 +183,7 @@ active `FileRequest`s (max 4 concurrent pulls per peer).
 ### Index
 SQLite, one database per node: `files(share_id, relpath, size, mtime_ns, mode,
 sha256, version_json, deleted, updated_at)` plus `peer_files(...)` mirroring the latest
-`IndexUpdate` from each peer, and `pending_transfers` for resume state.
+`IndexUpdate` from each peer, and `pending_transfers`, a table reserved for resume state (§11) that nothing reads or writes yet.
 
 ### Scanning
 - Full scan of each share on daemon start and every `rescan_interval` (default 300s).
@@ -474,6 +474,35 @@ tasks are not part of the current implementation.
   interrupted write, migration restart, credential rotation, and stable node identity
   after a restart.
 
+### Transfer resume
+
+v1 restarts an interrupted pull from byte 0: the partial temp file is
+discarded on failure or restart, and `FileRequest.offset` must be 0
+(`scripts/net/23-restart-mid-transfer.sh` pins this). That is correct but
+wasteful for large files on flaky links. To add resume:
+
+- **Persist progress.** When a pull starts, record `{share_id, relpath,
+  version, temp_path, bytes_written}` in `pending_transfers`, and update
+  `bytes_written` as chunks are fsynced. Delete the row on install, on a
+  failed sha256 check, or when the version being pulled is superseded.
+- **Keep the temp file.** Leave a partial temp file in place across a
+  disconnect or restart instead of deleting it, and sweep orphans (no
+  matching row, or a row whose version is no longer wanted) on startup.
+- **Request from the offset.** A puller with a matching row re-hashes the
+  partial file, then sends `FileRequest{offset: bytes_written}`. The holder
+  serves from that offset only if its current version still equals the
+  requested one; otherwise it errors and the puller starts over.
+- **Verify end to end.** The whole-file sha256 check before rename is
+  unchanged, so a bad resume costs one retry from zero, never corrupt data.
+- **Negotiate.** Gate nonzero offsets behind a handshake capability or
+  protocol version, so a v1 holder's `unsupported_offset` never reaches a
+  resuming puller.
+- **Tests:** a unit test that resumes from a persisted row; a test that a
+  changed holder version forces a restart from zero; and a version of
+  scenario 23 asserting that the second attempt starts past byte 0.
+
+Block-level delta (below) later makes resume per-block.
+
 ### Block-level delta transfer (v2 — design now, build later)
 
 Written up so v1 choices don't paint us into a corner:
@@ -520,7 +549,7 @@ function they mean.)
 2. **Transport** — tailcat wrapper, dial/backoff/dedup, `net.Pipe` test transport.
 3. **Protocol** — framing, handshake with mutual Ed25519 auth, ping/pong. Two in-process nodes shake hands in a test.
 4. **Index** — SQLite schema, scanner, hashing, fsnotify, ignore rules.
-5. **Sync core** — version vectors, reconciler, whole-file transfer with resume, atomic apply, conflict copies. Integration test: two nodes, bidirectional sync incl. a conflict, over `net.Pipe`.
+5. **Sync core** — version vectors, reconciler, whole-file transfer, atomic apply, conflict copies. Integration test: two nodes, bidirectional sync incl. a conflict, over `net.Pipe`.
 6. **Modes & safety** — permissions, approval flow, receive-only/read-only direction rules, trash, holds.
 7. **API + CLI** — REST endpoints, SSE, all subcommands.
 8. **Web UI** — the views against the live API.
@@ -536,8 +565,10 @@ function they mean.)
   bidirectional sync over a nested tree, one-way read-only shares, receive-only revert
   via trash, conflict copy creation, delete-vs-modify resurrect, hostile relpath
   rejection, sha256 mismatch leaving the destination untouched, the concurrent-pull
-  limit, and restore propagating as a new change. Resume and approval grant/deny are
-  not covered, because neither is implemented (see the README).
+  limit, and restore propagating as a new change. Approval grant/deny is covered in
+  `internal/core` (`TestApprovalRequiredFailsClosed`, `TestUnknownPeerQueuedAndApproved`)
+  and `internal/api` (`TestShareApprovalListAndDecision`, `TestPeersApproveUnknownPendingPeer`).
+  Resume is not covered because it is not implemented (§11).
 - `scripts/run-net-tests.sh` — networking failure scenarios over live tailcat, one per
   file in `scripts/net/`: one-sided peering, the simultaneous-dial dedup race (§2.4),
   SIGTERM and SIGKILL restarts, offline divergence, peer removal, a live permission

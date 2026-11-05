@@ -113,6 +113,12 @@ id first so you can tell the identity actually rotated.
       stuck in `connecting`.
 - [ ] Garbage token → clear parse error, nothing persisted.
 - [ ] `syncat peer ls` shows both name and key; `syncat peer rm` works.
+- [ ] Add a peer on one side only, then run `syncat approvals` on the other.
+      The unknown node is listed as `peer-<key>`. `syncat peer approve` (or
+      `syncat approvals grant`) adds it with no token paste and the two
+      connect. Repeat with `deny`: the node leaves the list and gets no
+      session. Deny is not a block list, so it is queued again if it keeps
+      dialing.
 
 ## 3. Connection durability
 
@@ -182,6 +188,11 @@ the command succeeds.
       effect on the subscriber without a restart, stops its writes, and
       leaves its existing files alone
       (`scripts/net/07-live-permission-change.sh`).
+- [ ] **Approval-required share** (`share add --approval`). A subscribe
+      lands in the offerer's `syncat approvals` as `share-<id>-<key>`, and
+      nothing syncs until it is decided. `grant` starts sync without a
+      restart. `deny` leaves the subscriber with no access and no files.
+      Revoking a granted peer later stops sync and leaves its copy alone.
 - [ ] Changing a subscription's *mode* is refused with a message saying to
       remove and re-add. (Known limitation, but the message should say so.)
 
@@ -335,8 +346,9 @@ Read these as a stranger would. Every one should say what to do next.
 - [ ] Disk full on the receiving side mid-transfer.
 - [ ] A file that changes while it is being read for transfer.
 - [ ] Two peers offering shares with the same display name.
-- [ ] `syncat peer approve` and `syncat approvals` → honest 501-backed
-      "not implemented", not a crash.
+- [ ] `syncat peer approve` and `syncat approvals grant|deny` with an
+      unknown or already-decided ID → a clear error naming the ID, not a
+      crash.
 
 ## 12. Security surface
 
@@ -374,14 +386,12 @@ Read these as a stranger would. Every one should say what to do next.
 
 ## Known gaps — don't file these as bugs
 
-All documented in README.md's "Deferred past the MVP", listed here so
-testers recognise them on sight:
+All documented in README.md's "Current limits" or SPEC.md §11, listed here
+so testers recognise them on sight:
 
-- Peer-approval queue and per-share `approval_required` enforcement (every
-  subscribe auto-grants; approval endpoints return 501).
 - Nested `.syncatignore` — only the share root's file is read as rules.
 - Symlink syncing — detected and skipped.
-- Transfer resume — interrupted transfers restart from zero.
+- Transfer resume — interrupted transfers restart from zero (SPEC.md §11).
 - Transfer progress — no per-transfer byte counters exist, so `/api/status`
   has no `transfers` key and the dashboard has no progress bars.
 - Tombstone purging — deleted-file tombstones are kept indefinitely.
