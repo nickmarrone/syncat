@@ -1207,3 +1207,65 @@ func TestIntegration_DeltaFallsBackToSnapshotWhenJournalHoldsIgnoredPath(t *test
 		return err == nil && c.AppliedSeq == high
 	})
 }
+
+// A receive-only edit is flagged when the local change is propagated, not
+// only once the offerer's next change has already reverted it (issue #43).
+func TestIntegration_ReceiveOnlyFlagsLocalEditBeforeRevert(t *testing.T) {
+	offerer := newTestNode(t, "aaaaaaaaaaaaaaaa")
+	subscriber := newTestNode(t, "bbbbbbbbbbbbbbbb")
+
+	writeFile(t, offerer.root, "notes.txt", "v1 from offerer")
+	indexFile(t, offerer.store, offerer.id, "notes.txt", offerer.root)
+
+	dirOfferer := DirectionFor(config.PermissionReadWrite, "")
+	dirSubscriber := DirectionFor("", config.ModeReceiveOnly)
+	tr := NewTrash(nil)
+	sOfferer, sSubscriber := connectSessionsWithOptions(t, offerer, subscriber, dirOfferer, dirSubscriber, SessionOptions{}, SessionOptions{Trash: tr})
+	mustSync(t, sOfferer, testShareID)
+	mustSync(t, sSubscriber, testShareID)
+	waitForFile(t, integrationWaitTimeout, subscriber.store, testShareID, subscriber.root, "notes.txt", "v1 from offerer")
+
+	if w := sSubscriber.LocallyModifiedWarnings(); len(w) != 0 {
+		t.Fatalf("warnings before any edit = %+v, want none", w)
+	}
+
+	writeFile(t, subscriber.root, "notes.txt", "edited locally by subscriber")
+	indexFile(t, subscriber.store, subscriber.id, "notes.txt", subscriber.root)
+	mustSync(t, sSubscriber, testShareID) // what the share watcher does after a local scan
+
+	// The offerer has not changed anything: the edit must already be flagged.
+	var got *LocallyModifiedWarning
+	for _, w := range sSubscriber.LocallyModifiedWarnings() {
+		if w.RelPath == "notes.txt" {
+			w := w
+			got = &w
+		}
+	}
+	if got == nil {
+		t.Fatal("no locally-modified warning right after the local edit")
+	}
+	if got.Reverted {
+		t.Fatalf("warning is marked reverted before any revert: %+v", *got)
+	}
+
+	// Flagged, not reverted: the edit is still on disk and nothing is trashed.
+	data, err := os.ReadFile(filepath.Join(subscriber.root, "notes.txt"))
+	if err != nil || string(data) != "edited locally by subscriber" {
+		t.Fatalf("local edit = %q, %v; want it left untouched", data, err)
+	}
+	if events, err := tr.List(subscriber.root); err != nil || len(events) != 0 {
+		t.Fatalf("trash = %+v, %v; want empty before the offerer changes", events, err)
+	}
+
+	// Re-flagging must not duplicate the warning.
+	mustSync(t, sSubscriber, testShareID)
+	n := 0
+	for _, w := range sSubscriber.LocallyModifiedWarnings() {
+		if w.RelPath == "notes.txt" {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("%d warnings for notes.txt after a second pass, want 1", n)
+	}
+}

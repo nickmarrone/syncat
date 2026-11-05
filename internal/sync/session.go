@@ -886,6 +886,10 @@ func (s *Session) SyncShare(ctx context.Context, shareID string) error {
 		}
 		return s.answerSyncRequest(ctx, protocol.IndexSyncRequest{ShareID: shareID, Epoch: out.Epoch, AppliedSeq: out.AppliedSeq})
 	}
+	// SyncShare runs when the local scan picks up a change. A receive-only
+	// edit would otherwise stay unflagged until the offerer's next change
+	// had already reverted it (#43).
+	s.flagLocalEdits(ctx, cfg)
 	c, err := s.store.Cursor(ctx, s.peerID, shareID, "incoming")
 	if err != nil {
 		return err
@@ -894,6 +898,37 @@ func (s *Session) SyncShare(ctx context.Context, shareID string) error {
 		return err
 	}
 	return nil
+}
+
+// flagLocalEdits records "locally modified" warnings for a receive-only
+// share from the current local index against what the offerer last told us,
+// without applying anything: no pull, no revert, no trash, nothing sent. The
+// revert stays with reconcileLocked, on the offerer's next change (SPEC.md §5).
+func (s *Session) flagLocalEdits(ctx context.Context, cfg ShareConfig) {
+	s.reconcileMu.Lock()
+	defer s.reconcileMu.Unlock()
+	localRows, err := s.store.ListShare(ctx, cfg.ShareID, true)
+	if err != nil {
+		s.logf("list share %s: %v", cfg.ShareID, err)
+		return
+	}
+	remoteRows, err := s.store.ListPeerFiles(ctx, s.peerID, cfg.ShareID)
+	if err != nil {
+		s.logf("list peer files %s: %v", cfg.ShareID, err)
+		return
+	}
+	now := s.clock()
+	flagged := make(map[string]bool)
+	for _, a := range Reconcile(rowsToInfos(localRows), rowsToInfos(remoteRows), s.nodeID, cfg.Direction, s.clock, cfg.Ignore) {
+		if a.Kind != ActionLocallyModified {
+			continue
+		}
+		flagged[a.RelPath] = true
+		if s.recordWarning(LocallyModifiedWarning{ShareID: cfg.ShareID, RelPath: a.RelPath, At: now, Reason: a.Reason}) {
+			s.logf("locally modified, flagged only: %s/%s (%s)", cfg.ShareID, a.RelPath, a.Reason)
+		}
+	}
+	s.retainWarnings(cfg.ShareID, flagged)
 }
 
 func newSnapshotID() string { var b [16]byte; _, _ = rand.Read(b[:]); return hex.EncodeToString(b[:]) }
