@@ -989,3 +989,24 @@ func TestLogMiddlewareLogsOutcome(t *testing.T) {
 		t.Errorf("logged %q, want the failing DELETE to appear", out)
 	}
 }
+
+// A PATCH is one config change: if any part of it is refused, none of it
+// applies. It used to be up to four separate changes, so a bad access value
+// failed the request after the rename had already been saved and announced.
+func TestSharesPatchIsAllOrNothing(t *testing.T) {
+	srv, node, _ := newTestServer(t)
+	id, err := node.AddShare(t.TempDir(), "docs", config.PermissionReadWrite, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := doRequest(t, srv, http.MethodPatch, "/api/shares/docs", testToken, map[string]any{
+		"name":   "documents",
+		"access": map[string]string{"ff00": "root"},
+	})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("patch with a bad access value: status = %d, want 400; body: %s", w.Code, w.Body.String())
+	}
+	if share := findShareDTO(node.Status(), id); share == nil || share.Name != "docs" {
+		t.Fatalf("share after the refused patch = %+v, want it still named docs", share)
+	}
+}

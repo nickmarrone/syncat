@@ -29,6 +29,12 @@ holds that 0.5.0 left behind for removed shares are dropped (see below).
   UI show them as they are, so the two can no longer disagree.
 - The rules for when a change is held and when a hold ends now live in one
   package, `internal/hold`, with its own tests.
+- `PATCH /api/shares/{id}` is all or nothing. A request that changes several
+  fields is one config change, saved and announced to peers once. Before, each
+  field was its own change, so a bad access value failed the request after the
+  rename in it had already been saved.
+- A config change's effects on the running node are worked out in one place,
+  from the config before and after, rather than by each kind of change.
 
 ## Version
 
