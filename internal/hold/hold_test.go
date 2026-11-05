@@ -357,6 +357,22 @@ func TestHoldsSurviveARestart(t *testing.T) {
 	}
 }
 
+func TestRetainForgetsUnconfiguredLinks(t *testing.T) {
+	f := newFixture(t)
+	existing := files(30)
+	f.g.Scan(share, existing, scanDeleting(existing, 20))
+	f.g.Scan("share2", existing, scanDeleting(existing, 20))
+	f.g.Pass("share2", peer, rowsOf(existing), paths(22))
+
+	f.g.Retain(func(l Link) bool { return l.ShareID == "share2" && l.PeerKey == "" })
+	for _, g := range []*Guard{f.g, f.load(t)} {
+		holds := g.List()
+		if len(holds) != 1 || holds[0].ShareID != "share2" || holds[0].PeerKey != "" {
+			t.Errorf("holds after Retain = %+v, want only share2's own", holds)
+		}
+	}
+}
+
 func TestOnlyAndConfirmName(t *testing.T) {
 	f := newFixture(t)
 	if _, err := f.g.Only(share); !errors.Is(err, ErrNotHeld) {

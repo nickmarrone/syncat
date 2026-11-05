@@ -222,10 +222,14 @@ func Open(ctx context.Context, opts Options) (*Node, error) {
 		}
 	}()
 
-	// Holds load before anything can scan or sync.
+	// Holds load before anything can scan or sync. Retain then forgets any
+	// that name a share, subscription, or peer the config no longer has:
+	// nothing would ever clear them, and removals before 0.5.1 left them
+	// behind.
 	if n.holds, err = hold.Load(nodeCtx, store, n.holdOptions()); err != nil {
 		return nil, fmt.Errorf("core: open: %w", err)
 	}
+	n.holds.Retain(configuredLinks(in.cfg))
 
 	transportAttempted = true
 	if err := opts.Transport.Start(nodeCtx, n.onAccept); err != nil {
