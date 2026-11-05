@@ -1,0 +1,44 @@
+# The required gate: formatting, vet, the whole Go suite under the race
+# detector, and the cgo-free build that ships (SPEC.md §12). -short skips
+# the handful of tests that need real DERP relays; network.yml runs those.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l cmd internal)"
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test (race, short)
+        run: go test -race -short ./...
+
+      - name: build (cgo-free)
+        run: CGO_ENABLED=0 go build -o syncat ./cmd/syncat

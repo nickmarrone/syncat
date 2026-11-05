@@ -1,0 +1,71 @@
+# Tests that need the real network: the Go tests skipped under -short (they
+# use public Tailscale DERP relays), then the built binary driven by
+# scripts/e2e.sh and the fast tier of scripts/run-net-tests.sh. tailcat needs
+# no tailnet or credentials, so these run on a stock runner. They depend on
+# DERP being reachable, so they are kept out of the required ci.yml gate.
+#
+# The soak tier (--soak, scenarios 20+) takes much longer and runs only
+# weekly or on demand.
+name: network
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 9 * * 1" # Mondays 09:17 UTC, with the soak tier
+  workflow_dispatch:
+    inputs:
+      soak:
+        description: "Also run the soak tier (scenarios 20+)"
+        type: boolean
+        default: false
+
+concurrency:
+  group: network-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  go-derp:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: go test (real DERP)
+        run: go test -race ./internal/transport/... ./internal/config/...
+
+  scenarios:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      TMPDIR: ${{ runner.temp }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: e2e happy path
+        run: scripts/e2e.sh
+
+      - name: network scenarios
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ inputs.soak }}" = "true" ]; then
+            scripts/run-net-tests.sh --soak
+          else
+            scripts/run-net-tests.sh
+          fi
+
+      - name: upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: syncat-test-logs
+          path: ${{ runner.temp }}/syncat-test
+          retention-days: 14
