@@ -179,6 +179,9 @@ func (c *Config) Validate() error {
 	if c.APIAddr == "" {
 		errs = append(errs, errors.New("api_addr must not be empty"))
 	}
+	if c.RescanIntervalSeconds < 0 {
+		errs = append(errs, fmt.Errorf("rescan_interval_seconds must not be negative, got %d", c.RescanIntervalSeconds))
+	}
 
 	for i, s := range c.Shares {
 		if s.Permission != PermissionReadOnly && s.Permission != PermissionReadWrite {

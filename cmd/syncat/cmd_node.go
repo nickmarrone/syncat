@@ -743,6 +743,9 @@ var configFields = map[string]configField{
 			if err != nil {
 				return fmt.Errorf("rescan_interval_seconds must be an integer: %w", err)
 			}
+			if n < 0 {
+				return fmt.Errorf("rescan_interval_seconds must not be negative (0 means the default, %ds)", config.DefaultRescanIntervalSeconds)
+			}
 			cfg.RescanIntervalSeconds = n
 			return nil
 		},
