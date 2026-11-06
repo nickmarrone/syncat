@@ -350,9 +350,9 @@ SSH tunnel.
 - [automated] The subscribe dialog rejects bad input (an empty path, a
       relative path, a path inside one of this node's shares) with a readable
       message rather than a raw JSON error blob
-      (`TestSubscribeDialogBadInput`). A rejected subscription still leaves
-      its folder behind, see #78 (`TestSubscribeRejectedInputLeavesNoTrace`,
-      skipped until that is fixed).
+      (`TestSubscribeDialogBadInput`), and a rejected subscription creates
+      nothing on disk, neither relative to the daemon's working directory
+      nor inside a share (`TestSubscribeRejectedInputLeavesNoTrace`).
 - [automated] Node rename works and persists across a reload and a daemon
       restart (`TestRenamePersists`).
 - [automated] A hold shows a banner on every page, and "Let the deletes

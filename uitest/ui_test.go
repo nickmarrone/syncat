@@ -391,7 +391,6 @@ func TestSubscribeDialogBadInput(t *testing.T) {
 // creates nothing on disk, neither relative to the daemon's working
 // directory (the runner starts bob from the work dir) nor inside a share.
 func TestSubscribeRejectedInputLeavesNoTrace(t *testing.T) {
-	t.Skip("see #78: a rejected subscription still creates its folder")
 	alice, bob := pair(t)
 	ownDir := bob.dir(t, "trace-share")
 	bob.addShare(t, ownDir, "bob-trace")
