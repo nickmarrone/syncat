@@ -356,15 +356,21 @@ Read these as a stranger would. Every one should say what to do next.
 
 ## 12. Security surface
 
-- [ ] `curl http://127.0.0.1:8347/api/status` with no `X-Syncat-Token`
-      header → 401.
-- [ ] With a wrong token → 401.
-- [ ] From **another machine** on the LAN → refused; the listener is
-      loopback-only.
-- [ ] An unknown peer key dialling in is rejected and recorded in
-      `syncat status`'s rejected-connections list.
-- [ ] `api.token` and the key files are not world-readable.
-- [ ] Nothing sensitive (tokens, keys) is printed at default log level.
+- [automated] Every `/api/*` route returns 401 with no `X-Syncat-Token`
+      header or a wrong one, and a refused write changes nothing.
+      `/ui-token` refuses a foreign Host or Origin
+      (`scripts/net/19-api-security.sh`).
+- [automated] The listener is loopback-only: unreachable on the machine's
+      own LAN address, and `daemon --api 0.0.0.0:PORT` refuses to start
+      (`scripts/net/19-api-security.sh`).
+- [ ] From **another machine** on the LAN → refused. The script can only
+      try the machine's own LAN address, so check once from a second host.
+- [automated] An unknown peer key dialling in is rejected and recorded in
+      `syncat status`'s rejected-connections list
+      (`scripts/net/01-peering-one-sided.sh`).
+- [automated] `api.token` and the key files are owner-only, and no token
+      or key appears in a daemon log at the default level after two nodes
+      pair (`scripts/net/19-api-security.sh`).
 
 ## 13. Real data and scale
 
