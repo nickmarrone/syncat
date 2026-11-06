@@ -294,15 +294,6 @@ func isLoopbackAddr(remoteAddr string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-// handleNotImplemented returns a handler that always reports 501 with a
-// stable error shape and an explanatory message, for endpoints SPEC.md
-// §8 lists but this build deliberately defers (see routes' comments).
-func (s *Server) handleNotImplemented(message string) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		writeError(w, http.StatusNotImplemented, "not_implemented", message)
-	}
-}
-
 func (s *Server) recoverMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
