@@ -259,6 +259,8 @@ that destroys data if it regresses.
 - [ ] **Ignoring is not deleting.** Let a file sync, then add a rule for it.
       The peer's copy must still be there several minutes later — a tombstone
       would arrive within a rescan interval, so wait longer than one.
+      (`scripts/net/09-syncatignore.sh` automates the startup full scan
+      variant, not the 300s periodic one, which the daemon's timer drives.)
 - [ ] Remove that rule again. The file resumes syncing, and the peer ends up
       with this node's copy rather than staying on its stale one.
 - [ ] Ignore a path on the *receiving* side that the offerer is still
@@ -374,8 +376,10 @@ Read these as a stranger would. Every one should say what to do next.
 
 ## 13. Real data and scale
 
-- [ ] A directory with **thousands** of small files. Initial scan and sync
-      complete; note how long.
+- [automated] A directory with **thousands** of small files. Initial scan and
+      sync complete with matching sha256 manifests, then a modest subset of
+      deletes converges; timings are printed
+      (`scripts/net/24-many-files.sh`, `--soak`).
 - [automated] A large file completes with a matching sha256, without
       starving the keepalive behind its own chunks
       (`scripts/net/22-large-file.sh`, `--soak`; `SOAK_FILE_MB=2048` for a
