@@ -133,6 +133,16 @@ type Node struct {
 
 	sharesMu     sync.Mutex
 	shareWatches map[string]*shareWatch // key: share id
+	// scans holds each share's scan gate (see shareScan), keyed by share
+	// id rather than hung off shareWatch so a watch replaced mid-scan
+	// still shares one gate with the scan the old watch started. Guarded
+	// by sharesMu; entries are never removed (one small struct per share
+	// id ever watched).
+	scans map[string]*shareScan
+
+	// testBeforeScan, if set, runs inside rescanShare's critical section
+	// just before the scanner reads the tree. Tests only.
+	testBeforeScan func(shareID string)
 
 	// holds decides which scans and peers' passes may apply (see holds.go
 	// and internal/hold).
@@ -201,6 +211,7 @@ func Open(ctx context.Context, opts Options) (*Node, error) {
 		cfg:               in.cfg,
 		peers:             map[string]*peerConn{},
 		shareWatches:      map[string]*shareWatch{},
+		scans:             map[string]*shareScan{},
 		ctx:               nodeCtx,
 		cancel:            cancel,
 		startTime:         in.clock.Now(),
