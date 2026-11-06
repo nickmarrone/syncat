@@ -453,13 +453,6 @@ func (n *Node) AddSubscriptionResolved(peerRef, shareRef, localPath, mode string
 	if err != nil {
 		return "", "", mutationError(MutationInvalid, fmt.Errorf("core: add subscription: %w", err))
 	}
-	if err := os.MkdirAll(localPath, 0o700); err != nil {
-		return "", "", fmt.Errorf("core: add subscription: create local path: %w", err)
-	}
-	if err := syncsvc.EnsureReservedDir(localPath); errors.Is(err, syncsvc.ErrReservedDirTaken) {
-		return "", "", mutationError(MutationConflict, fmt.Errorf("core: add subscription: %w; move it away first", err))
-	}
-
 	if _, err = n.mutateConfig(func(cfg *config.Config) error {
 		if err := cfg.CheckSubscriptionPath(localPath); err != nil {
 			if errors.Is(err, config.ErrPathOverlap) {
@@ -471,6 +464,18 @@ func (n *Node) AddSubscriptionResolved(peerRef, shareRef, localPath, mode string
 			if s.Peer == peerKeyHex && s.ShareID == shareID {
 				return mutationErrorf(MutationConflict, "subscription to peer %s share %s already exists", peerKeyHex, shareID)
 			}
+		}
+		// Only now that the request is known to be good does anything touch
+		// the disk. Creating the folder first left a rejected request's
+		// directory and .syncat/ behind: relative to the daemon's working
+		// directory for a relative path, or inside a share for an
+		// overlapping one (#78). A failure here still leaves config as it
+		// was, since the closure's error aborts the swap.
+		if err := os.MkdirAll(localPath, 0o700); err != nil {
+			return fmt.Errorf("create local path: %w", err)
+		}
+		if err := syncsvc.EnsureReservedDir(localPath); errors.Is(err, syncsvc.ErrReservedDirTaken) {
+			return mutationError(MutationConflict, fmt.Errorf("%w; move it away first", err))
 		}
 		cfg.Subscriptions = append(cfg.Subscriptions, config.Subscription{
 			Peer: peerKeyHex, ShareID: shareID, LocalPath: localPath, Mode: mode,
