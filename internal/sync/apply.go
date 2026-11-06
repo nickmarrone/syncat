@@ -311,8 +311,18 @@ func (s *Session) applyConflictCopy(ctx context.Context, cfg ShareConfig, a Acti
 		if _, err := JoinSharePath(cfg.Root, a.RelPath); err != nil {
 			return nil, fmt.Errorf("sync: conflict copy %s: %w", a.RelPath, err)
 		}
-		if _, err := JoinSharePath(cfg.Root, a.ConflictRelPath); err != nil {
+		dstAbs, err := JoinSharePath(cfg.Root, a.ConflictRelPath)
+		if err != nil {
 			return nil, fmt.Errorf("sync: conflict copy %s: %w", a.RelPath, err)
+		}
+		// Rename replaces whatever already sits at the conflict path. That is
+		// usually an identical copy written by another node's resolution of the
+		// same conflict, but a different loser that hashed to the same short
+		// name must not vanish, so it goes to the trash first, exactly as an
+		// overwrite by a pulled file would (trashHook no-ops when nothing is
+		// there).
+		if err := s.trashHook(ctx, a.ConflictRelPath, dstAbs, TrashOverwritten); err != nil {
+			return nil, fmt.Errorf("sync: conflict copy %s: trash existing %s: %w", a.RelPath, a.ConflictRelPath, err)
 		}
 		root, err := os.OpenRoot(cfg.Root)
 		if err != nil {

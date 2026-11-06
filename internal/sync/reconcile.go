@@ -373,16 +373,19 @@ func ConflictRelPath(relpath, id string, now time.Time) string {
 }
 
 // conflictIDLen is how many bytes of the loser's sha256 name its conflict
-// copy: 8 bytes, 16 hex characters, the same width as a node ShortID, so
-// the marker keeps the shape conflictMarkerRe and every existing copy use.
-const conflictIDLen = 8
+// copy: 4 bytes, 8 hex characters. Short enough to read in a file listing;
+// two different losers would need the same mtime second *and* the same
+// 32-bit digest prefix to share a name, and even then applyConflictCopy
+// trashes whatever it would overwrite rather than losing it. conflictMarkerRe
+// matches any hex run, so older 16-character copies still strip correctly.
+const conflictIDLen = 4
 
 // loserConflictRelPath names the conflict copy for loser, the losing side
 // of a content conflict at relpath, from the losing version itself rather
 // than from whichever node happens to resolve the conflict (SPEC.md §5):
 //
 //   - the timestamp is the loser's own mtime (MTimeNS, in UTC), and
-//   - the id is the first 16 hex characters of the loser's sha256.
+//   - the id is the first 8 hex characters of the loser's sha256.
 //
 // Both travel with the loser in every IndexUpdate, so every node that
 // resolves this conflict computes the same name for the same losing
@@ -400,9 +403,10 @@ const conflictIDLen = 8
 // The id is derived from content rather than being a node id because no
 // node id identifies a version: a FileInfo records no last writer, and a
 // version vector can carry several counters. Content also gives the
-// reverse guarantee: two *different* losing contents never share a name
-// (short of a 64-bit sha256-prefix collision), so no conflict copy can
-// overwrite another.
+// reverse guarantee: two *different* losing contents share a name only if
+// their mtimes fall in the same second and their digests share a 32-bit
+// prefix, and applyConflictCopy trashes anything it would overwrite, so no
+// conflict copy is ever lost to another.
 //
 // If the loser carries too short a digest (only a malformed peer row
 // could), or the derived name would be relpath itself (a conflict copy

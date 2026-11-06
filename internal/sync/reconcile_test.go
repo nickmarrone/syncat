@@ -167,9 +167,9 @@ func TestReconcile_Concurrent_ConflictCopy_RemoteWinsByMtime(t *testing.T) {
 		t.Errorf("ConflictInfo is not the local (losing) content: %+v", a.ConflictInfo)
 	}
 	// Named from the loser (SPEC.md §5): its mtime (100ns after the epoch)
-	// and the first 8 bytes of its digest ("local-co"), not from this
-	// node's id or clock.
-	wantConflictPath := "a.sync-conflict-19700101-000000-6c6f63616c2d636f.txt"
+	// and the first 4 bytes of its digest ("loca"), not from this node's id
+	// or clock.
+	wantConflictPath := "a.sync-conflict-19700101-000000-6c6f6361.txt"
 	if a.ConflictRelPath != wantConflictPath {
 		t.Errorf("ConflictRelPath = %q, want %q", a.ConflictRelPath, wantConflictPath)
 	}

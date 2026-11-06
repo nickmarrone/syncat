@@ -230,10 +230,12 @@ sha256, version_json, deleted, updated_at)` plus `peer_files(...)` mirroring the
     beside the winner; the conflict copy is a normal new file and syncs everywhere.
     The name comes from the losing version alone, never from the node resolving
     the conflict: the timestamp is the loser's `mtime_ns` (UTC) and `<loser-id>`
-    is the first 8 bytes of the loser's sha256, hex (16 characters, the width of a
-    node short id). Every node that resolves the same conflict therefore writes
-    the same copy, so a conflict resolved by both a hub and a spoke still leaves
-    one copy; different losing contents always get different names.
+    is the first 4 bytes of the loser's sha256, hex (8 characters), e.g.
+    `report.sync-conflict-20261106-013715-2bd806c9.txt`. Every node that resolves
+    the same conflict therefore writes the same copy, so a conflict resolved by
+    both a hub and a spoke still leaves one copy. Different losing contents get
+    different names unless their mtimes share a second and their digests a 32-bit
+    prefix; if that ever happens, the copy being replaced goes to the trash.
   - Delete-vs-modify conflict: modify wins; the file is resurrected.
 - Merged vector after resolution = element-wise max + local bump.
 
