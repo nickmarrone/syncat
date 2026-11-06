@@ -87,7 +87,7 @@ func TestLoserConflictRelPathFallback(t *testing.T) {
 	clock := func() time.Time { return stamp }
 	const fallback = "f.sync-conflict-20260830-140509-deadbeefcafef00d.txt"
 
-	short := protocol.FileInfo{SHA256: []byte("short"), MTimeNS: 0}
+	short := protocol.FileInfo{SHA256: []byte("abc"), MTimeNS: 0} // fewer than conflictIDLen bytes
 	if got := loserConflictRelPath("f.txt", short, node, clock); got != fallback {
 		t.Errorf("short digest: got %q, want %q", got, fallback)
 	}
@@ -104,7 +104,7 @@ func TestLoserConflictRelPathFallback(t *testing.T) {
 	}
 }
 
-func hexPrefix(sum []byte) string { return hex.EncodeToString(sum[:8]) }
+func hexPrefix(sum []byte) string { return hex.EncodeToString(sum[:conflictIDLen]) }
 
 // TestIntegration_ThreeNodeConflictResolvedTwiceLeavesOneCopy drives the
 // #54 race end to end with real Sessions, in a fixed order so it fails
