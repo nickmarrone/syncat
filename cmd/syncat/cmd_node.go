@@ -720,7 +720,15 @@ var configFields = map[string]configField{
 		get: func(cfg *config.Config) string { return cfg.NodeName },
 	},
 	"api_addr": {
-		set: func(cfg *config.Config, value string) error { cfg.APIAddr = value; return nil },
+		set: func(cfg *config.Config, value string) error {
+			// The daemon refuses to bind, and the CLI to dial, anything
+			// but loopback; refuse it here rather than on the next start.
+			if _, err := config.NormalizeAPIAddr(value); err != nil {
+				return fmt.Errorf("api_addr: %w", err)
+			}
+			cfg.APIAddr = value
+			return nil
+		},
 		get: func(cfg *config.Config) string { return cfg.APIAddr },
 	},
 	"trash_retention_days": {
@@ -798,12 +806,20 @@ func cmdConfigSet(paths *config.Paths, args []string) error {
 		return fmt.Errorf("unknown config field %q (want one of: %s)", field, knownConfigFields())
 	}
 
-	cfg, err := config.Load(paths.ConfigFile())
+	// Read without config.Load's validation: `config set` is how a user
+	// repairs an invalid value (say, an api_addr an older version let
+	// through), so it must not refuse to open the file it is fixing.
+	// config.Save below still validates the whole result.
+	data, err := os.ReadFile(paths.ConfigFile())
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("no config found at %s (run `syncat init` first): %w", paths.ConfigFile(), err)
 		}
-		return err
+		return fmt.Errorf("config: read %s: %w", paths.ConfigFile(), err)
+	}
+	cfg, err := config.Unmarshal(data)
+	if err != nil {
+		return fmt.Errorf("config: parse %s: %w", paths.ConfigFile(), err)
 	}
 
 	if err := cf.set(cfg, value); err != nil {
