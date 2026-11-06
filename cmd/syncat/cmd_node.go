@@ -729,6 +729,9 @@ var configFields = map[string]configField{
 			if err != nil {
 				return fmt.Errorf("trash_retention_days must be an integer: %w", err)
 			}
+			if n < 0 {
+				return fmt.Errorf("trash_retention_days %d must be at least 1 (or 0 for the default, %d)", n, config.DefaultTrashRetentionDays)
+			}
 			cfg.TrashRetentionDays = n
 			return nil
 		},

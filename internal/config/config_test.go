@@ -95,6 +95,26 @@ func TestLoadRejectsInvalidConfig(t *testing.T) {
 	}
 }
 
+// A negative node-wide retention flows into every share that leaves its own
+// at 0 (SafetyFor) and would make the trash sweep expire everything; a
+// hand-edited config.json must not get it past Load either.
+func TestLoadRejectsNegativeTrashRetention(t *testing.T) {
+	cfg := Default()
+	cfg.TrashRetentionDays = -1
+	if err := cfg.Validate(); err == nil {
+		t.Error("Validate accepted trash_retention_days -1")
+	}
+
+	path := filepath.Join(t.TempDir(), "config.json")
+	doc := `{"node_name":"alice","api_addr":"127.0.0.1:8347","trash_retention_days":-1}`
+	if err := os.WriteFile(path, []byte(doc), 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Error("Load accepted trash_retention_days -1")
+	}
+}
+
 func TestApplyDefaultsFillsZeroValues(t *testing.T) {
 	cfg := &Config{
 		NodeName: "alice",
