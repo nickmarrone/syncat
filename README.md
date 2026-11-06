@@ -247,7 +247,9 @@ Filesystem snapshots (btrfs, ZFS) work just as well. The trash, in
 
 If peers edit the same file while disconnected, syncat keeps both versions.
 One becomes the ordinary filename and the other is stored alongside it as a
-file named like `report.sync-conflict-YYYYMMDD-HHMMSS-<node-id>.txt`.
+file named like `report.sync-conflict-YYYYMMDD-HHMMSS-<id>.txt`, where the
+timestamp is the losing version's modification time and `<id>` is taken from
+its content hash, so every node names the copy the same way.
 
 syncat watches directories and also rescans them periodically. It does not
 follow or synchronize symbolic links in this release.

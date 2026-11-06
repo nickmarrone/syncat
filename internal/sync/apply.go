@@ -271,9 +271,9 @@ func (s *Session) applyDelete(ctx context.Context, cfg ShareConfig, relpath stri
 // content, the next reconcile round (triggered by the peer's own delta)
 // sees a plain dominates-relationship instead of a conflict and retries it
 // as an ordinary ActionPull. If it was the losing content, the peer's own
-// independent conflict-copy resolution (it computes its own conflict path
-// concurrently, the mirror image of this one) still reaches us as an
-// ordinary remote-only file on a later round, so the two sides still
+// independent conflict-copy resolution (it names the copy from the same
+// losing version, so it computes this same conflict path) still reaches us
+// as an ordinary remote-only file on a later round, so the two sides still
 // converge to the same file set either way.
 func (s *Session) applyConflictCopy(ctx context.Context, cfg ShareConfig, a Action, now time.Time) ([]index.FileRow, error) {
 	switch {

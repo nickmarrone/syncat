@@ -226,8 +226,14 @@ sha256, version_json, deleted, updated_at)` plus `peer_files(...)` mirroring the
 - Remote version strictly dominates local ⇒ apply. Local dominates ⇒ ignore (peer will
   pull from us). Concurrent (neither dominates) ⇒ **conflict**:
   - Winner = larger `mtime_ns`, tie-break larger sha256.
-  - Loser is written to `<name>.sync-conflict-YYYYMMDD-HHMMSS-<node-short-id><ext>`
+  - Loser is written to `<name>.sync-conflict-YYYYMMDD-HHMMSS-<loser-id><ext>`
     beside the winner; the conflict copy is a normal new file and syncs everywhere.
+    The name comes from the losing version alone, never from the node resolving
+    the conflict: the timestamp is the loser's `mtime_ns` (UTC) and `<loser-id>`
+    is the first 8 bytes of the loser's sha256, hex (16 characters, the width of a
+    node short id). Every node that resolves the same conflict therefore writes
+    the same copy, so a conflict resolved by both a hub and a spoke still leaves
+    one copy; different losing contents always get different names.
   - Delete-vs-modify conflict: modify wins; the file is resurrected.
 - Merged vector after resolution = element-wise max + local bump.
 

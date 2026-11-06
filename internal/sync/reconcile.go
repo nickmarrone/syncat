@@ -12,6 +12,7 @@ package sync
 
 import (
 	"bytes"
+	"encoding/hex"
 	"path"
 	"regexp"
 	"sort"
@@ -328,7 +329,11 @@ const conflictTimeLayout = "20060102-150405"
 // ConflictRelPath returns the relpath a conflict "loser" file is written to,
 // beside the winner at relpath, per SPEC.md §5:
 //
-//	<name>.sync-conflict-YYYYMMDD-HHMMSS-<node-short-id><ext>
+//	<name>.sync-conflict-YYYYMMDD-HHMMSS-<id><ext>
+//
+// ConflictRelPath only formats the name. The reconciler picks id and now
+// through loserConflictRelPath, which derives both from the losing version
+// so that every node resolving the same conflict picks the same name.
 //
 // The timestamp is always taken in UTC (now.UTC()), so the same instant
 // produces the same filename regardless of which node's local timezone
@@ -358,13 +363,60 @@ const conflictTimeLayout = "20060102-150405"
 // before the new one is appended, so repeated conflicts on the same file
 // never grow the filename without bound: the result always carries at most
 // one marker, always the most recent.
-func ConflictRelPath(relpath, nodeShortID string, now time.Time) string {
+func ConflictRelPath(relpath, id string, now time.Time) string {
 	dir, base := path.Split(relpath)
 	base = conflictMarkerRe.ReplaceAllString(base, "")
 
 	name, ext := splitExt(base)
 	stamp := now.UTC().Format(conflictTimeLayout)
-	return dir + name + ".sync-conflict-" + stamp + "-" + nodeShortID + ext
+	return dir + name + ".sync-conflict-" + stamp + "-" + id + ext
+}
+
+// conflictIDLen is how many bytes of the loser's sha256 name its conflict
+// copy: 8 bytes, 16 hex characters, the same width as a node ShortID, so
+// the marker keeps the shape conflictMarkerRe and every existing copy use.
+const conflictIDLen = 8
+
+// loserConflictRelPath names the conflict copy for loser, the losing side
+// of a content conflict at relpath, from the losing version itself rather
+// than from whichever node happens to resolve the conflict (SPEC.md §5):
+//
+//   - the timestamp is the loser's own mtime (MTimeNS, in UTC), and
+//   - the id is the first 16 hex characters of the loser's sha256.
+//
+// Both travel with the loser in every IndexUpdate, so every node that
+// resolves this conflict computes the same name for the same losing
+// version. That keeps a fan-out share at one copy. In a three-node share
+// the hub can resolve bob-vs-carol while carol, who already received bob's
+// version through the hub, resolves the same conflict herself. When the
+// copy was named after the resolving node and its clock, the two
+// resolutions produced two differently-named copies of the same bytes, and
+// both synced everywhere (issue #54). Named after the loser, both
+// resolutions write one path with the same bytes and the loser's verbatim
+// version vector, so the two copies reconcile as equal versions (or, if
+// the vectors differ, as concurrent but identical content, which
+// reconcileIdenticalContent merges) instead of spawning another copy.
+//
+// The id is derived from content rather than being a node id because no
+// node id identifies a version: a FileInfo records no last writer, and a
+// version vector can carry several counters. Content also gives the
+// reverse guarantee: two *different* losing contents never share a name
+// (short of a 64-bit sha256-prefix collision), so no conflict copy can
+// overwrite another.
+//
+// If the loser carries too short a digest (only a malformed peer row
+// could), or the derived name would be relpath itself (a conflict copy
+// conflicting again with a loser bearing the copy's own mtime second and
+// digest prefix), it falls back to the resolving node's id and clock, so
+// the copy never lands on the winner's path.
+func loserConflictRelPath(relpath string, loser protocol.FileInfo, nodeID string, clock Clock) string {
+	if len(loser.SHA256) >= conflictIDLen {
+		id := hex.EncodeToString(loser.SHA256[:conflictIDLen])
+		if p := ConflictRelPath(relpath, id, time.Unix(0, loser.MTimeNS)); p != relpath {
+			return p
+		}
+	}
+	return ConflictRelPath(relpath, nodeID, clock())
 }
 
 // splitExt splits a filename into (name, ext) using the usual
@@ -397,8 +449,10 @@ type Clock func() time.Time
 // nodeID is this node's ShortID (config.IdentityKey.ShortID), used to bump
 // the local counter when a conflict is resolved. dir reflects the share's
 // permission (as offerer) or subscription mode (as subscriber). Build it
-// with DirectionFor. clock supplies the timestamp for any conflict
-// filenames generated; if nil, time.Now is used.
+// with DirectionFor. Conflict-copy names come from the losing version
+// itself (see loserConflictRelPath); nodeID and clock name one only in the
+// fallback case where that is impossible. If clock is nil, time.Now is
+// used.
 //
 // Every remote FileInfo is validated with ValidateRelPath before use; an
 // entry with an invalid relpath, or one claiming to be a symlink, is dropped (reported as ActionNone with an
@@ -623,7 +677,7 @@ func reconcileConcurrent(relpath string, l, r protocol.FileInfo, nodeID string, 
 	winner.Version = merged
 	winner.RelPath = relpath
 
-	conflictPath := ConflictRelPath(relpath, nodeID, clock())
+	conflictPath := loserConflictRelPath(relpath, loser, nodeID, clock)
 	loser.RelPath = conflictPath
 
 	return Action{
@@ -653,13 +707,8 @@ func reconcileConcurrent(relpath string, l, r protocol.FileInfo, nodeID string, 
 // through to reconcileConcurrent's generic conflict-copy handling:
 //
 //  1. Correctness: a conflict copy of content that's identical to the
-//     winner is a no-op at best. At worst it's actively destructive:
-//     ConflictRelPath is a deterministic function of (relpath, nodeID,
-//     second), so a second pass through this branch within the same
-//     second computes the *same* path as this node's own earlier,
-//     genuinely-different conflict copy and silently overwrites it,
-//     destroying the very losing content that copy existed to
-//     preserve.
+//     winner preserves nothing. It would only add a duplicate of the
+//     winner beside it, which then syncs everywhere as a new file.
 //  2. Liveness: without this, each side keeps re-bumping its own
 //     counter every time it reconciles the other's already-resolved
 //     result, which (unlike the merged+bump growing past the *other*

@@ -87,10 +87,13 @@ wait_for 90 "contested.txt to converge on alice and bob" files_identical "$ALICE
 wait_for 90 "contested.txt to converge on alice and carol" files_identical "$ALICE_SHARE/contested.txt" "$CAROL_SYNC/contested.txt"
 wait_for 90 "the conflict copy's name to match on alice and bob" conflict_copy_names_match "$ALICE_SHARE" "$BOB_SYNC"
 wait_for 90 "the conflict copy's name to match on alice and carol" conflict_copy_names_match "$ALICE_SHARE" "$CAROL_SYNC"
-# Deliberately not asserting exactly ONE conflict copy: with two spokes
-# conflicting through the hub, more than one node resolves the conflict and
-# each names its copy after its own node id, so several same-content copies
-# exist (the file sets still converge, checked below). See the linked issue.
+# One conflict, one losing version, one copy (SPEC.md §5), even though more
+# than one node may resolve it: the copy is named from the losing version, so
+# every resolver writes the same name (#54).
+for d in "$ALICE_SHARE" "$BOB_SYNC" "$CAROL_SYNC"; do
+	[ "$(ls "$d"/contested.sync-conflict-* | wc -l | tr -d ' ')" = "1" ] ||
+		fail "$(basename "$d") does not hold exactly one conflict copy: $(ls "$d")"
+done
 WINNER="$(cat "$ALICE_SHARE/contested.txt")"
 LOSER="$(cat "$(ls "$ALICE_SHARE"/contested.sync-conflict-*.txt | head -n1)")"
 case "$WINNER" in "bob's edit" | "carol's edit") ;; *) fail "unexpected winner: '$WINNER'" ;; esac
