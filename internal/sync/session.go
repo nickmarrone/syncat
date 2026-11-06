@@ -116,6 +116,9 @@ type Session struct {
 	// without one.
 	trash *Trash
 
+	// testAfterApply is SessionOptions.testAfterApply.
+	testAfterApply func(Action)
+
 	// warningsMu/warnings record every LocallyModifiedWarning this Session
 	// has raised (the receive-only "flagged as locally modified" UI warning in
 	// SPEC.md §1/§5). The API layer reads them back. warnIndex keys warnings by
@@ -374,6 +377,10 @@ type SessionOptions struct {
 	// read loop, but it should still hand off anything slow, because it runs
 	// while reconcileMu is held for that share.
 	OnApplied func(shareID string)
+
+	// testAfterApply, if set, runs in applyAndPersist after an action has
+	// been applied and before its rows are written. Tests only.
+	testAfterApply func(Action)
 }
 
 // ControlResult is what SessionOptions.OnControl reports about one frame.
@@ -409,34 +416,35 @@ func NewSession(conn net.Conn, store *index.Store, nodeID, peerID string, opts S
 		peerLabel = protocol.SanitizeDiagnostic(opts.PeerLabel)
 	}
 	s := &Session{
-		conn:         conn,
-		reader:       protocol.NewReader(conn),
-		writer:       protocol.NewStreamWriter(conn, 0),
-		keepalive:    protocol.NewKeepalive(clock, 0, 0),
-		store:        store,
-		nodeID:       nodeID,
-		peerID:       peerID,
-		peerLabel:    peerLabel,
-		debug:        opts.Debug,
-		trash:        opts.Trash,
-		onControl:    opts.OnControl,
-		onFrame:      opts.OnFrame,
-		onApplied:    opts.OnApplied,
-		clock:        clock.Now,
-		logger:       logger,
-		warnIndex:    make(map[string]int),
-		shares:       make(map[string]*ShareConfig),
-		snapshots:    make(map[string]protocol.IndexSnapshotBegin),
-		sentIndex:    make(map[string]sentIndexState),
-		pullSem:      make(chan struct{}, maxConcurrentPulls),
-		pullTbl:      make(map[transferKey]*pullEntry),
-		serveSem:     make(chan struct{}, maxConcurrentServes),
-		indexSem:     make(chan struct{}, maxConcurrentIndexJobs),
-		indexJobs:    make(chan string, maxPendingIndexKeys),
-		indexPending: make(map[string]func()),
-		indexRunning: make(map[string]bool),
-		serveCancel:  make(map[string]context.CancelFunc),
-		done:         make(chan struct{}),
+		conn:           conn,
+		reader:         protocol.NewReader(conn),
+		writer:         protocol.NewStreamWriter(conn, 0),
+		keepalive:      protocol.NewKeepalive(clock, 0, 0),
+		store:          store,
+		nodeID:         nodeID,
+		peerID:         peerID,
+		peerLabel:      peerLabel,
+		debug:          opts.Debug,
+		trash:          opts.Trash,
+		onControl:      opts.OnControl,
+		onFrame:        opts.OnFrame,
+		onApplied:      opts.OnApplied,
+		testAfterApply: opts.testAfterApply,
+		clock:          clock.Now,
+		logger:         logger,
+		warnIndex:      make(map[string]int),
+		shares:         make(map[string]*ShareConfig),
+		snapshots:      make(map[string]protocol.IndexSnapshotBegin),
+		sentIndex:      make(map[string]sentIndexState),
+		pullSem:        make(chan struct{}, maxConcurrentPulls),
+		pullTbl:        make(map[transferKey]*pullEntry),
+		serveSem:       make(chan struct{}, maxConcurrentServes),
+		indexSem:       make(chan struct{}, maxConcurrentIndexJobs),
+		indexJobs:      make(chan string, maxPendingIndexKeys),
+		indexPending:   make(map[string]func()),
+		indexRunning:   make(map[string]bool),
+		serveCancel:    make(map[string]context.CancelFunc),
+		done:           make(chan struct{}),
 	}
 	s.writer.SetWriteObserver(func(protocol.MsgType) { s.keepalive.RecordSent() })
 	return s
@@ -1514,8 +1522,19 @@ func formatActionCounts(counts map[ActionKind]int) string {
 // partially succeed (see applyConflictCopy's doc comment). Persist the rows
 // that did land regardless of err, so a transient failure in one half
 // never orphans a file that is already correctly on disk.
+//
+// The action and its row writes run under the share's apply lock (see
+// Trash.lockApply), so a restore from the trash can never land between
+// them: otherwise the restore's live row would be overwritten by this
+// action's older row, a tombstone for the very file just restored (#62).
 func (s *Session) applyAndPersist(ctx context.Context, cfg ShareConfig, a Action) []index.FileRow {
+	if s.trash != nil {
+		defer s.trash.lockApply(cfg.ShareID)()
+	}
 	rows, err := s.applyAction(ctx, cfg, a)
+	if s.testAfterApply != nil {
+		s.testAfterApply(a)
+	}
 	if err != nil {
 		s.logf("apply %s %s: %v", a.Kind, a.RelPath, err)
 	}

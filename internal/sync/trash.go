@@ -144,6 +144,43 @@ type Trash struct {
 	// mu serializes choosing event folder names, so two events started in
 	// the same second for the same peer never pick the same one.
 	mu sync.Mutex
+
+	// applyLocks holds one lock per share id, guarded by applyLocksMu (see
+	// lockApply). Entries are never removed: one small lock per share id
+	// ever applied to or restored in.
+	applyLocksMu sync.Mutex
+	applyLocks   map[string]*sync.RWMutex
+}
+
+// lockApply takes shareID's apply lock shared and returns its release.
+// Session.applyAndPersist holds it across one action and the index rows
+// it writes; actions of the same pass still run in parallel. Restore takes
+// the same lock exclusively, so it waits for every action already in
+// flight to finish writing its rows, and no action starts until the
+// restore has written its own. Without it, a restore that ran between a
+// pass trashing a file and writing that file's tombstone had its restored
+// row overwritten by the tombstone (#62).
+//
+// The Trash is the one object a node's API and all of its sessions share,
+// which is why the lock lives here.
+func (tr *Trash) lockApply(shareID string) (unlock func()) {
+	l := tr.applyLock(shareID)
+	l.RLock()
+	return l.RUnlock
+}
+
+func (tr *Trash) applyLock(shareID string) *sync.RWMutex {
+	tr.applyLocksMu.Lock()
+	defer tr.applyLocksMu.Unlock()
+	if tr.applyLocks == nil {
+		tr.applyLocks = make(map[string]*sync.RWMutex)
+	}
+	l, ok := tr.applyLocks[shareID]
+	if !ok {
+		l = &sync.RWMutex{}
+		tr.applyLocks[shareID] = l
+	}
+	return l
 }
 
 // NewTrash returns a Trash. clock timestamps events; time.Now is used if
@@ -625,8 +662,16 @@ func readEvent(root, id string) (TrashEventInfo, error) {
 // A directory in the way is not moved; that path fails with
 // ErrRestoreDestExists and the rest of the restore goes ahead.
 //
+// It runs exclusively with every reconcile pass's actions on shareID (see
+// lockApply), so a pass can never overwrite a restored row with the
+// tombstone or older version it was about to write.
+//
 // It returns the rows written, and an error joining every path that failed.
 func (tr *Trash) Restore(ctx context.Context, store *index.Store, nodeID, shareID, root, eventID string, relpaths []string) ([]index.FileRow, error) {
+	l := tr.applyLock(shareID)
+	l.Lock()
+	defer l.Unlock()
+
 	if strings.ContainsAny(eventID, `/\`) || eventID == "" || eventID == "." || eventID == ".." {
 		return nil, fmt.Errorf("%w: event %q", ErrTrashEntryNotFound, eventID)
 	}
