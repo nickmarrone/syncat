@@ -226,6 +226,12 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	// The node-wide retention is the fallback for every share that leaves
+	// its own at 0 (SafetyFor), so it gets the same check as Safety's.
+	if c.TrashRetentionDays < 0 {
+		errs = append(errs, fmt.Errorf("trash_retention_days %d must be at least 1", c.TrashRetentionDays))
+	}
+
 	return errors.Join(errs...)
 }
 

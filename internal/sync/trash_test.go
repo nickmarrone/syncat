@@ -569,6 +569,29 @@ func TestTrash_SweepEnforcesSizeOldestFirstKeepingNewest(t *testing.T) {
 	}
 }
 
+// A non-positive maxAge (a bad retention setting that slipped through)
+// must not read as "expire everything": that would put the cutoff at or
+// past now and empty the trash, newest event included.
+func TestTrash_SweepNonPositiveMaxAgeExpiresNothingByAge(t *testing.T) {
+	for _, maxAge := range []time.Duration{0, -24 * time.Hour} {
+		share := t.TempDir()
+		now := trashTestTime
+		old := trashAt(t, share, now.Add(-40*24*time.Hour), "old.txt", 1)
+		fresh := trashAt(t, share, now, "fresh.txt", 1)
+
+		res, err := newTestTrash(now).Sweep(share, maxAge, 1<<30)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.Purged != 0 {
+			t.Errorf("maxAge %v: purged %d, want 0", maxAge, res.Purged)
+		}
+		if ids := eventIDs(mustList(t, newTestTrash(now), share)); len(ids) != 2 || ids[0] != fresh || ids[1] != old {
+			t.Errorf("maxAge %v: left = %v, want [%s %s]", maxAge, ids, fresh, old)
+		}
+	}
+}
+
 func TestTrash_SweepOfShareWithNoTrash(t *testing.T) {
 	if res, err := newTestTrash(trashTestTime).Sweep(t.TempDir(), time.Hour, 1); err != nil || res.Purged != 0 {
 		t.Errorf("Sweep = %+v, %v", res, err)

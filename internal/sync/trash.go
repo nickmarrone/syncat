@@ -811,6 +811,9 @@ type TrashSweep struct {
 // the trash under maxBytes. Events are only ever removed whole. The newest
 // event is never removed for size, even when it alone is over the limit,
 // because a large change is exactly the one someone may want to undo.
+// A non-positive maxAge expires nothing by age: it can only come from a
+// bad retention setting, and reading it as a cutoff at or past now would
+// empty the whole trash.
 func (tr *Trash) Sweep(root string, maxAge time.Duration, maxBytes int64) (TrashSweep, error) {
 	events, err := tr.List(root)
 	if err != nil {
@@ -827,7 +830,7 @@ func (tr *Trash) Sweep(root string, maxAge time.Duration, maxBytes int64) (Trash
 	var res TrashSweep
 	var errs []error
 	for i, ev := range events {
-		expired := ev.At.Before(cutoff)
+		expired := maxAge > 0 && ev.At.Before(cutoff)
 		overSize := total > maxBytes && i < len(events)-1
 		if !expired && !overSize {
 			continue
