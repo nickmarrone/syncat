@@ -909,6 +909,14 @@ func (pc *peerConn) neuterShare(shareID string) {
 	}
 }
 
+// waitShareIdle waits for the session's in-flight sync work on shares that
+// were just neutered, so the caller can safely forget their index state.
+func (pc *peerConn) waitShareIdle() {
+	if sess := pc.currentSession(); sess != nil {
+		sess.WaitShareIdle()
+	}
+}
+
 // activeSession returns the current session if shareID is active on it,
 // or nil.
 func (pc *peerConn) activeSession(shareID string) *syncsvc.Session {
