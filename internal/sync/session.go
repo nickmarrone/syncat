@@ -1262,6 +1262,13 @@ func (s *Session) handleIndexUpdate(ctx context.Context, msg protocol.IndexUpdat
 	s.reconcileMu.Lock()
 	defer s.reconcileMu.Unlock()
 
+	// The share may have been neutered while this waited for the lock (see
+	// WaitShareIdle); recording and applying rows for it now would write
+	// into state its owner has just forgotten.
+	if cfg, ok = s.getShare(msg.ShareID); !ok || cfg.Direction.InboundBlocked {
+		return
+	}
+
 	if err := s.store.UpsertPeerFiles(ctx, s.peerID, peerRows); err != nil {
 		s.logf("upsert peer files for %s: %v", msg.ShareID, err)
 		return
@@ -1302,8 +1309,20 @@ func (s *Session) ReconcileShare(ctx context.Context, shareID string) error {
 	}
 	s.reconcileMu.Lock()
 	defer s.reconcileMu.Unlock()
+	if cfg, ok = s.getShare(shareID); !ok || cfg.Direction.InboundBlocked {
+		return nil
+	}
 	s.reconcileLocked(ctx, cfg, "reconnect")
 	return nil
+}
+
+// WaitShareIdle waits for any reconcile pass already running on this session
+// to finish. Called after a share has been neutered with AddShare, it
+// guarantees no pass is still writing that share's rows, and none that
+// start later will (they re-check the share once they hold the lock).
+func (s *Session) WaitShareIdle() {
+	s.reconcileMu.Lock()
+	s.reconcileMu.Unlock() //nolint:staticcheck // a barrier: wait for the holder, take nothing
 }
 
 // reconcileLocked is the reconcile-and-apply pass shared by handleIndexUpdate

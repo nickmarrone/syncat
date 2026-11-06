@@ -250,6 +250,15 @@ func (n *Node) rescanShare(ctx context.Context, shareID string) error {
 		n.holds.ScanFailed(shareID, sw.root, existing, err)
 		return fmt.Errorf("core: rescan %s: scan: %w", shareID, err)
 	}
+	// The watch can be stopped (and its share's index state forgotten) while
+	// the scan runs. Applying it then would resurrect rows for a folder the
+	// share no longer lives in.
+	n.sharesMu.Lock()
+	current := n.shareWatches[shareID] == sw
+	n.sharesMu.Unlock()
+	if !current {
+		return nil
+	}
 	apply, released := n.holds.Scan(shareID, existing, result)
 	if released {
 		// The peers' passes the hold stopped run once this scan is in the

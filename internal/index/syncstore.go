@@ -164,3 +164,41 @@ func (s *Store) ApplyPeerDelta(ctx context.Context, peer, share, epoch string, f
 	}
 	return tx.Commit()
 }
+
+// ForgetSubscription drops the state kept for a subscription to share via
+// peer: the mirror of the peer's files, its cursors, and any half-received
+// snapshot. With dropShare it also drops the share's own state (files,
+// change journal, epoch), which is keyed by share id alone; the caller
+// passes it only when nothing else on this node uses the share. Without
+// that, a later subscription into a different folder would read the new,
+// empty folder as the old copy with every file deleted.
+func (s *Store) ForgetSubscription(ctx context.Context, peer, share string, dropShare bool) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	stmts := []string{
+		`DELETE FROM peer_files WHERE peer_key=? AND share_id=?`,
+		`DELETE FROM peer_cursors WHERE peer_key=? AND share_id=?`,
+		`DELETE FROM snapshot_staging WHERE peer_key=? AND share_id=?`,
+		`DELETE FROM pending_transfers WHERE peer_key=? AND share_id=?`,
+	}
+	for _, q := range stmts {
+		if _, err := tx.ExecContext(ctx, q, peer, share); err != nil {
+			return err
+		}
+	}
+	if dropShare {
+		for _, q := range []string{
+			`DELETE FROM files WHERE share_id=?`,
+			`DELETE FROM change_journal WHERE share_id=?`,
+			`DELETE FROM share_state WHERE share_id=?`,
+		} {
+			if _, err := tx.ExecContext(ctx, q, share); err != nil {
+				return err
+			}
+		}
+	}
+	return tx.Commit()
+}

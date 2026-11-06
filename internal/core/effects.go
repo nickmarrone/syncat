@@ -41,6 +41,11 @@ type configChange struct {
 	subsStarted []config.Subscription // added, or resumed
 	subsStopped []config.Subscription // removed, or paused
 
+	// subsRemoved is the subscriptions gone from the config altogether
+	// (paused ones are not: pausing keeps the local index state). Their
+	// index state is forgotten, see Store.ForgetSubscription.
+	subsRemoved []config.Subscription
+
 	// announce is set when the share list every peer sees changed: a share
 	// added or removed, or its name, permission, or approval setting.
 	announce bool
@@ -127,6 +132,12 @@ func diffConfig(old, new *config.Config) configChange {
 		}
 	}
 
+	for _, s := range old.Subscriptions {
+		if findSubscriptionIndex(new, s.Peer, s.ShareID) < 0 {
+			c.subsRemoved = append(c.subsRemoved, s)
+		}
+	}
+
 	c.nodeRenamed = new.NodeName != old.NodeName
 	return c
 }
@@ -178,6 +189,21 @@ func (n *Node) applyConfigChange(old, new *config.Config) {
 	for _, id := range c.sharesRemoved {
 		n.stopShareWatch(id)
 		n.neuterShareOnSessions(id)
+	}
+	// A removed subscription forgets its index state, so subscribing again
+	// (into any folder) starts like a first subscription instead of reading
+	// the new folder as the old copy with every file deleted.
+	for _, s := range c.subsRemoved {
+		// A reconcile pass that was mid-flight when the subscription went
+		// would otherwise write rows for the old folder after they are
+		// forgotten, and the next folder would inherit them.
+		if pc := n.lookupPeer(s.Peer); pc != nil {
+			pc.waitShareIdle()
+		}
+		keepFiles := findShareIndex(new, s.ShareID) >= 0 || subscribesToShare(new, s.ShareID)
+		if err := n.store.ForgetSubscription(n.ctx, s.Peer, s.ShareID, !keepFiles); err != nil {
+			n.logger.Printf("core: forget subscription to share %s: %v", s.ShareID, err)
+		}
 	}
 	// Whatever the change removed can never be scanned or synced again, so
 	// a hold on it could never clear.
@@ -297,4 +323,14 @@ func (n *Node) refreshToken(name string) {
 	n.tokenMu.Lock()
 	n.token = tok
 	n.tokenMu.Unlock()
+}
+
+// subscribesToShare reports whether any subscription in cfg is to shareID.
+func subscribesToShare(cfg *config.Config, shareID string) bool {
+	for _, s := range cfg.Subscriptions {
+		if s.ShareID == shareID {
+			return true
+		}
+	}
+	return false
 }
