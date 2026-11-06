@@ -199,18 +199,87 @@ func (n *Node) stopShareWatch(shareID string) {
 	}
 }
 
+// shareScan is one share's scan gate: at most one scan of a share runs at
+// a time, and background triggers that arrive while one runs coalesce into
+// a single follow-up rather than queueing or running alongside it.
+//
+// Two overlapping scans would each read the same existing rows, bump them
+// to the same version, and apply in either order, so the index could end
+// up holding an older hash under a version already announced to peers,
+// and the hold guard could judge one pass against a stale view (#61).
+type shareScan struct {
+	// mu is held for the whole of one scan: list, scan, hold check, bump
+	// and apply. Propagation runs after it is released.
+	mu sync.Mutex
+
+	// stateMu guards running and dirty, which drive rescanShareAsync.
+	stateMu sync.Mutex
+	running bool // a background scan loop is active for this share
+	dirty   bool // a trigger arrived since that loop's last scan began
+}
+
+// shareScanFor returns shareID's scan gate, creating it on first use.
+func (n *Node) shareScanFor(shareID string) *shareScan {
+	n.sharesMu.Lock()
+	defer n.sharesMu.Unlock()
+	sc, ok := n.scans[shareID]
+	if !ok {
+		sc = &shareScan{}
+		n.scans[shareID] = sc
+	}
+	return sc
+}
+
 // rescanShareAsync triggers a background rescan, tracked by n.wg so Close
 // waits for it. Used by watcher callbacks (OnDirty/OnPeriodic), which
 // must never block the watcher's own goroutine.
+//
+// A trigger that arrives while this share's background scan is already
+// running only marks it dirty; the running loop then scans once more when
+// it finishes. However many triggers land during one scan, they cost one
+// follow-up, and that follow-up starts after the earlier scan has applied,
+// so it reads the index the earlier scan wrote.
 func (n *Node) rescanShareAsync(shareID string) {
-	n.goTracked(func() {
-		if n.ctx.Err() != nil {
-			return
-		}
-		if err := n.rescanShare(n.ctx, shareID); err != nil {
-			n.logger.Printf("core: rescan %s: %v", shareID, err)
+	sc := n.shareScanFor(shareID)
+	sc.stateMu.Lock()
+	if sc.running {
+		sc.dirty = true
+		sc.stateMu.Unlock()
+		return
+	}
+	sc.running = true
+	sc.stateMu.Unlock()
+
+	started := n.goTracked(func() {
+		for {
+			if n.ctx.Err() == nil {
+				// Clearing dirty once the gate is held, right before the
+				// scan reads the tree, absorbs every trigger that arrived
+				// while this loop waited for the gate: this scan sees
+				// whatever they announced.
+				err := n.runShareScan(n.ctx, sc, shareID, func() {
+					sc.stateMu.Lock()
+					sc.dirty = false
+					sc.stateMu.Unlock()
+				})
+				if err != nil {
+					n.logger.Printf("core: rescan %s: %v", shareID, err)
+				}
+			}
+			sc.stateMu.Lock()
+			if !sc.dirty || n.ctx.Err() != nil {
+				sc.running, sc.dirty = false, false
+				sc.stateMu.Unlock()
+				return
+			}
+			sc.stateMu.Unlock()
 		}
 	})
+	if !started {
+		sc.stateMu.Lock()
+		sc.running, sc.dirty = false, false
+		sc.stateMu.Unlock()
+	}
 }
 
 // rescanShare runs one full scan of shareID's directory (SPEC.md §5),
@@ -219,12 +288,39 @@ func (n *Node) rescanShareAsync(shareID string) {
 // carries no content change: see index.Scanner.Scan's doc comment),
 // persists the result, and propagates it to every session currently
 // syncing this share.
+//
+// It waits for any scan of the same share already in flight, so when it
+// returns, the index reflects the folder as it was at some point after the
+// call began. Callers that need that (startup, adding a share, confirming
+// a hold) get it without racing the watcher.
 func (n *Node) rescanShare(ctx context.Context, shareID string) error {
+	return n.runShareScan(ctx, n.shareScanFor(shareID), shareID, nil)
+}
+
+// runShareScan is rescanShare with the gate already looked up. onLocked,
+// if set, runs once the gate is held and before the scan begins.
+func (n *Node) runShareScan(ctx context.Context, sc *shareScan, shareID string, onLocked func()) error {
+	sc.mu.Lock()
+	if onLocked != nil {
+		onLocked()
+	}
+	changed, err := n.scanShareLocked(ctx, shareID)
+	sc.mu.Unlock()
+	if changed {
+		n.propagateShare(ctx, shareID)
+	}
+	return err
+}
+
+// scanShareLocked is the body of one scan; the caller holds shareID's scan
+// gate. It reports whether the scan changed content that peers must hear
+// about, which the caller propagates once the gate is released.
+func (n *Node) scanShareLocked(ctx context.Context, shareID string) (bool, error) {
 	n.sharesMu.Lock()
 	sw, ok := n.shareWatches[shareID]
 	n.sharesMu.Unlock()
 	if !ok {
-		return fmt.Errorf("core: rescan: %s has no active watch", shareID)
+		return false, fmt.Errorf("core: rescan: %s has no active watch", shareID)
 	}
 
 	// syncat's own .syncat/ must be ours before anything is synced into
@@ -233,7 +329,7 @@ func (n *Node) rescanShare(ctx context.Context, shareID string) error {
 	// share until it is moved out of the way.
 	if err := syncsvc.EnsureReservedDir(sw.root); errors.Is(err, syncsvc.ErrReservedDirTaken) {
 		n.holds.ScanFailed(shareID, sw.root, nil, err)
-		return fmt.Errorf("core: rescan %s: %w", shareID, err)
+		return false, fmt.Errorf("core: rescan %s: %w", shareID, err)
 	}
 
 	// Pick up any edit to .syncatignore before this scan reads the tree,
@@ -243,12 +339,15 @@ func (n *Node) rescanShare(ctx context.Context, shareID string) error {
 
 	existing, err := n.store.ListShareMap(ctx, shareID)
 	if err != nil {
-		return fmt.Errorf("core: rescan %s: list existing: %w", shareID, err)
+		return false, fmt.Errorf("core: rescan %s: list existing: %w", shareID, err)
+	}
+	if n.testBeforeScan != nil {
+		n.testBeforeScan(shareID)
 	}
 	result, err := sw.currentScanner().Scan(ctx, shareID, existing)
 	if err != nil {
 		n.holds.ScanFailed(shareID, sw.root, existing, err)
-		return fmt.Errorf("core: rescan %s: scan: %w", shareID, err)
+		return false, fmt.Errorf("core: rescan %s: scan: %w", shareID, err)
 	}
 	// The watch can be stopped (and its share's index state forgotten) while
 	// the scan runs. Applying it then would resurrect rows for a folder the
@@ -257,7 +356,7 @@ func (n *Node) rescanShare(ctx context.Context, shareID string) error {
 	current := n.shareWatches[shareID] == sw
 	n.sharesMu.Unlock()
 	if !current {
-		return nil
+		return false, nil
 	}
 	apply, released := n.holds.Scan(shareID, existing, result)
 	if released {
@@ -269,7 +368,7 @@ func (n *Node) rescanShare(ctx context.Context, shareID string) error {
 		// Dropped, not applied: the index keeps describing the share as it
 		// was, so nothing reaches peers until the hold clears or is
 		// confirmed. See internal/hold.
-		return nil
+		return false, nil
 	}
 
 	nodeID := n.identity.ShortID()
@@ -283,7 +382,7 @@ func (n *Node) rescanShare(ctx context.Context, shareID string) error {
 	bump(result.Deleted)
 
 	if err := n.store.ApplyScanResult(ctx, result); err != nil {
-		return fmt.Errorf("core: rescan %s: apply: %w", shareID, err)
+		return false, fmt.Errorf("core: rescan %s: apply: %w", shareID, err)
 	}
 
 	if len(result.Ignored) > 0 {
@@ -296,7 +395,7 @@ func (n *Node) rescanShare(ctx context.Context, shareID string) error {
 	}
 
 	if len(result.Added) == 0 && len(result.ContentChanged) == 0 && len(result.Deleted) == 0 {
-		return nil
+		return false, nil
 	}
 	// Only reached when the scan found a real content change, so this does
 	// not fire on the idle periodic rescan, but a busy share still rescans
@@ -307,8 +406,7 @@ func (n *Node) rescanShare(ctx context.Context, shareID string) error {
 	if n.debugEnabled() {
 		n.logger.Printf("core: rescan %s: %d added, %d changed, %d deleted; propagating", shareID, len(result.Added), len(result.ContentChanged), len(result.Deleted))
 	}
-	n.propagateShare(ctx, shareID)
-	return nil
+	return true, nil
 }
 
 // propagateShare re-sends a full IndexUpdate for shareID (Session.SyncShare
