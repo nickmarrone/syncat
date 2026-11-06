@@ -95,20 +95,10 @@ func NewServerWithAuthorities(node *core.Node, token string, logger *log.Logger,
 type LoopbackAddress struct{ BindAddress, ClientAuthority string }
 
 func NormalizeLoopbackAddress(addr string) (LoopbackAddress, error) {
-	host, port, err := net.SplitHostPort(addr)
+	authority, err := config.NormalizeAPIAddr(addr)
 	if err != nil {
-		return LoopbackAddress{}, fmt.Errorf("api: invalid listen address %q: %w", addr, err)
+		return LoopbackAddress{}, fmt.Errorf("api: %w", err)
 	}
-	if port == "" {
-		return LoopbackAddress{}, fmt.Errorf("api: invalid listen address %q: port is empty", addr)
-	}
-	if host == "" {
-		host = "127.0.0.1"
-	}
-	if !isLoopbackHost(host) {
-		return LoopbackAddress{}, fmt.Errorf("api: refusing non-loopback address %q", addr)
-	}
-	authority := net.JoinHostPort(host, port)
 	return LoopbackAddress{BindAddress: authority, ClientAuthority: authority}, nil
 }
 
@@ -264,27 +254,19 @@ func (s *Server) handleUIToken(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"token": s.token})
 }
 
-// isLoopbackHost and isLoopbackAddr are deliberately two functions with
-// slightly different semantics, matched to their two call sites:
+// isLoopbackAddr is deliberately narrower than config.IsLoopbackHost,
+// which NormalizeLoopbackAddress applies to a configured listen address:
 //
-//   - isLoopbackHost takes a bare host (already split from its port by
-//     ListenLoopback) and accepts the literal "localhost" as well as any
-//     loopback IP, because a user configuring api.addr = "localhost:8347"
-//     means loopback and should be allowed to bind.
+//   - config.IsLoopbackHost takes a bare host (already split from its
+//     port) and accepts the literal "localhost" as well as any loopback
+//     IP, because a user configuring api_addr = "localhost:8347" means
+//     loopback and should be allowed to bind.
 //
 //   - isLoopbackAddr takes a host:port as found in http.Request.RemoteAddr
 //     and accepts *only* loopback IP literals. RemoteAddr comes from the
 //     TCP connection, which is always an IP, so a name like "localhost"
 //     can never legitimately appear there; refusing it keeps the
 //     /ui-token check (a security boundary) as narrow as possible.
-func isLoopbackHost(host string) bool {
-	if host == "localhost" {
-		return true
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
-}
-
 func isLoopbackAddr(remoteAddr string) bool {
 	host, _, err := net.SplitHostPort(remoteAddr)
 	if err != nil {

@@ -178,6 +178,8 @@ func (c *Config) Validate() error {
 
 	if c.APIAddr == "" {
 		errs = append(errs, errors.New("api_addr must not be empty"))
+	} else if _, err := NormalizeAPIAddr(c.APIAddr); err != nil {
+		errs = append(errs, fmt.Errorf("api_addr: %w (fix with `syncat config set api_addr %s`)", err, DefaultAPIAddr))
 	}
 
 	for i, s := range c.Shares {
