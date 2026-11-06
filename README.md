@@ -526,4 +526,19 @@ go test -count=1 ./...
 go test -race ./...
 scripts/e2e.sh
 scripts/run-net-tests.sh
+scripts/run-ui-tests.sh
 ```
+
+`scripts/run-ui-tests.sh` runs the web UI tests. They drive the real UI in
+headless Chrome against real daemons that the net-test harness
+(`scripts/lib/harness.sh`) starts and pairs. A run takes about a minute.
+They need Google Chrome or Chromium; set `UITEST_CHROME=/path/to/chrome` to
+choose one. Without either, the script skips with a message.
+`--run 'Token|Peer'` runs only the tests that match. Daemon logs, the
+`go test` output, and a screenshot, the page text and the console log for
+each failing test go under `${TMPDIR:-/tmp}/syncat-test/ui/`.
+
+The tests are their own Go module in `uitest/`, so chromedp never shows up
+in syncat's `go.mod` or binary. A `go test ./...` at the root does not run
+them, and the GitHub workflows do not run them either. Run them locally
+before you change `internal/webui` or the API it calls.

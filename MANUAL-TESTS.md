@@ -18,6 +18,7 @@ $ go test -count=1 ./...             # includes the live-DERP tests; needs netwo
 $ bash scripts/e2e.sh                # two real daemons, happy path, ~2 min
 $ bash scripts/run-net-tests.sh      # networking failure scenarios, ~10 min
 $ bash scripts/run-net-tests.sh --soak   # ... plus the slow ones, ~30 min
+$ bash scripts/run-ui-tests.sh       # the web UI in headless Chrome, ~1 min
 ```
 
 All of these should be clean. Between them they prove, on one machine and
@@ -325,22 +326,45 @@ that destroys data if it regresses.
 
 ## 10. Web UI
 
-- [ ] Loads at the configured `api_addr`.
-- [ ] Peers, shares, and subscriptions all render and refresh. (There is no
-      transfer view — see the known gaps below.)
-- [ ] The node token shows truncated by default and expands to the full
-      wrapped token; Copy copies the whole token either way, and the card
-      never grows a horizontal scrollbar.
-- [ ] Peer rows expand and collapse, and stay as you left them across the
-      2s poll refresh. Remove peer and the offered-share list are only
-      reachable from an expanded row.
-- [ ] Adding a peer, share, and subscription through the UI produces the
-      same result as the CLI.
-- [ ] The subscribe dialog rejects bad input with a readable message rather
-      than a raw JSON error blob.
-- [ ] Node rename works and persists.
-- [ ] The UI stays sane when the daemon is stopped underneath it.
-- [ ] Loading it in two tabs doesn't produce conflicting state.
+`scripts/run-ui-tests.sh` drives the UI in headless Chrome against real
+daemons. The tests are in `uitest/ui_test.go`, and each item below names
+the one that covers it. All of them run on one machine in one browser, so
+check by hand once in the browsers you actually use (Firefox and Safari in
+particular), and once with the daemon on another machine's loopback over an
+SSH tunnel.
+
+- [automated] Loads at the configured `api_addr` and gets its token from
+      `/ui-token` there. Every test opens the UI this way.
+- [automated] Peers, shares, and subscriptions all render and refresh on
+      the 2s poll, with no reload (`TestStatusRendersAndRefreshes`). (There
+      is no transfer view — see the known gaps below.)
+- [automated] The node token shows truncated by default and expands to the
+      full wrapped token. Copy puts the whole token on the clipboard either
+      way, and the card never grows a horizontal scrollbar, at 1280px or
+      375px wide (`TestNodeToken`).
+- [automated] Peer rows expand and collapse, and stay as you left them
+      across the 2s poll refresh. Remove peer and the offered-share list are
+      only reachable from an expanded row (`TestPeerRowExpandCollapse`).
+- [automated] Adding a peer, share, and subscription through the UI writes
+      the same `config.json` entry as the CLI (`TestAddThroughUIMatchesCLI`).
+- [automated] The subscribe dialog rejects bad input (an empty path, a
+      relative path, a path inside one of this node's shares) with a readable
+      message rather than a raw JSON error blob
+      (`TestSubscribeDialogBadInput`). A rejected subscription still leaves
+      its folder behind, see #78 (`TestSubscribeRejectedInputLeavesNoTrace`,
+      skipped until that is fixed).
+- [automated] Node rename works and persists across a reload and a daemon
+      restart (`TestRenamePersists`).
+- [automated] A hold shows a banner on every page, and "Let the deletes
+      through" from the banner clears it (`TestHoldBanner`).
+- [automated] The Trash and safety panel lists what a peer deleted, and
+      Undo brings it back on both nodes (`TestTrashUndo`).
+- [automated] The UI stays sane when the daemon is stopped underneath it:
+      it says it is unreachable, keeps the last view, throws nothing, and
+      recovers by itself when the daemon comes back
+      (`TestDaemonStopAndRestart`).
+- [automated] Loading it in two tabs doesn't produce conflicting state: each
+      tab's change shows up in the other (`TestTwoTabs`).
 
 ## 11. Error messages and bad input
 
