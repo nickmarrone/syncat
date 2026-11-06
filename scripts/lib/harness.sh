@@ -606,6 +606,25 @@ assert_eq() {
 	info "ok: ${3:-value} is '$2'"
 }
 
+# peer_path_wellformed NAME PEER succeeds once NAME reports a network path
+# for PEER that satisfies the documented contract (wire.PeerPath): a boolean
+# direct, a real RFC 3339 sampled_at, and exactly one of endpoint (direct) or
+# relay (relayed), matching `direct`. It assumes nothing about WHICH kind the
+# network produced.
+peer_path_wellformed() {
+	nx "$1" status --json 2>/dev/null | jq -e --arg p "$2" '
+		.peers[]? | select(.name==$p) | .path
+		| (.direct | type) == "boolean"
+		and (((.endpoint // "") != "") != ((.relay // "") != ""))
+		and (if .direct then (.endpoint // "") != "" else (.relay // "") != "" end)
+		and ((.sampled_at // "") | test("^20[0-9]{2}-[0-9]{2}-[0-9]{2}T"))
+	' >/dev/null
+}
+
+peer_path_kind() {
+	nx "$1" status --json 2>/dev/null | jq -r --arg p "$2" '.peers[]? | select(.name==$p) | .path | if .direct then "direct" else "relayed" end'
+}
+
 # --- composite setup -------------------------------------------------------
 
 # pair_nodes A B exchanges tokens in both directions and waits for the tunnel.

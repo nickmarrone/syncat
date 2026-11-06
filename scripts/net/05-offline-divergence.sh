@@ -95,6 +95,27 @@ DIFF="$(diff <(cd "$ALICE_SHARE" && ls -1) <(cd "$BOB_SYNC" && ls -1) || true)"
 $DIFF"
 info "ok: alice and bob hold the same set of files"
 
+log "A restart with a conflict copy and a trash event pending must lose neither"
+node_restart bob
+wait_for "$CONNECT_TIMEOUT" "alice and bob to reconnect" mutually_connected alice bob
+trash_has bob "$SHARE_ID" gone.txt || fail "bob's trash event for gone.txt did not survive the restart"
+conflict_copy_present "$BOB_SYNC" || fail "bob's conflict copy vanished across the restart"
+conflict_copy_names_match "$ALICE_SHARE" "$BOB_SYNC" || fail "conflict copy names diverged after bob's restart"
+info "ok: the trash event and the conflict copy are intact after the restart"
+
+# Undo must still work from the restored state, and propagate.
+EVENT="$(nx bob trash ls --json "$SHARE_ID" | jq -r '[.events[] | select(any(.items[]; .rel_path=="gone.txt"))][0].id')"
+[ -n "$EVENT" ] && [ "$EVENT" != "null" ] || fail "no trash event on bob holds gone.txt after the restart"
+nx bob trash undo "$SHARE_ID" "$EVENT" gone.txt >/dev/null || fail "trash undo of gone.txt failed after the restart"
+wait_for "$SYNC_TIMEOUT" "the undone gone.txt to be back on bob" file_content_is "$BOB_SYNC/gone.txt" "doomed"
+wait_for "$SYNC_TIMEOUT" "the undone gone.txt to reach alice" file_content_is "$ALICE_SHARE/gone.txt" "doomed"
+
+DIFF="$(diff <(cd "$ALICE_SHARE" && ls -1) <(cd "$BOB_SYNC" && ls -1) || true)"
+[ -z "$DIFF" ] || fail "the two directories diverged after the restart and undo:
+$DIFF"
+conflict_copy_names_match "$ALICE_SHARE" "$BOB_SYNC" || fail "conflict copy names diverged after the undo"
+info "ok: both sides converged after restart + undo"
+
 assert_mutually_clean alice bob
 
 harness_pass "edits, creations, deletes and a two-sided conflict all diverged offline and converged identically"

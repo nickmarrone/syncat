@@ -80,6 +80,23 @@ wait_for "$SYNC_TIMEOUT" "a later change from alice to reach bob" \
 # after the rescan, not instantly.
 hold_for 15 "bob's copy of a newly-ignored file to survive" \
 	path_present "$BOB_SYNC/shared.txt"
+
+# The watcher path is not the only one that can emit a tombstone: the periodic
+# full rescan (300s, SPEC.md section 5's source of truth) is the other. Waiting
+# that out is too slow, but a restart runs the same synchronous full scan of
+# every share (core.Open) before dialing peers, so restart the node that wrote
+# the rule and prove the scan's verdict did not reach bob.
+log "A full rescan with the rule in place must not tombstone the file either"
+node_restart alice
+wait_for "$CONNECT_TIMEOUT" "alice and bob to reconnect" mutually_connected alice bob
+echo "tracer after rescan" >"$ALICE_SHARE/tracer-rescan.txt"
+wait_for "$SYNC_TIMEOUT" "a post-rescan change from alice to reach bob" \
+	file_content_is "$BOB_SYNC/tracer-rescan.txt" "tracer after rescan"
+hold_for 15 "bob's copy of the ignored file to survive alice's startup scan" \
+	path_present "$BOB_SYNC/shared.txt"
+file_content_is "$BOB_SYNC/shared.txt" "we both have this" ||
+	fail "bob's copy of shared.txt changed after alice's rescan"
+path_present "$ALICE_SHARE/shared.txt" || fail "alice's own ignored file vanished"
 info "ok: ignoring a synced file left the peer's copy alone"
 
 log "The reverse direction: bob ignores what alice is still sharing"

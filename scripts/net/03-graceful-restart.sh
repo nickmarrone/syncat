@@ -26,6 +26,14 @@ SHARE_ID="$(share_and_subscribe alice "$ALICE_SHARE" docs rw bob "$BOB_SYNC" mir
 echo "before restart" >"$ALICE_SHARE/before.txt"
 wait_for "$SYNC_TIMEOUT" "before.txt to reach bob" file_content_is "$BOB_SYNC/before.txt" "before restart"
 
+log "Each connected peer must report a well-formed network path"
+# The kind depends on the network (direct when hole-punching works, DERP
+# otherwise), so only the shape is asserted. The path is sampled shortly
+# after connecting, hence the wait.
+wait_for 30 "alice to report a well-formed path for bob" peer_path_wellformed alice bob
+wait_for 30 "bob to report a well-formed path for alice" peer_path_wellformed bob alice
+info "alice->bob path: $(peer_path_kind alice bob), bob->alice path: $(peer_path_kind bob alice)"
+
 SINCE_BEFORE="$(peer_connected_since alice bob)"
 info "alice's connected_since before the restart: $SINCE_BEFORE"
 
